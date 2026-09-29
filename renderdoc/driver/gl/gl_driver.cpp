@@ -2241,11 +2241,23 @@ void WrappedOpenGL::SwapBuffers(WindowingSystem winSystem, void *windowHandle)
 
   // kill any current capture that isn't application defined
   if(IsActiveCapturing(m_State) && !m_AppControlledCapture)
+  {
+    const rdcarray<IFrameCapturer *> bridgeCapturers = RenderDoc::Inst().GetVulkanBridgeCapturers();
+
+    for(IFrameCapturer *capturer : bridgeCapturers)
+      capturer->EndFrameCapture(DeviceOwnedWindow(NULL, NULL));
+
     RenderDoc::Inst().EndFrameCapture(devWnd);
+  }
 
   if(RenderDoc::Inst().ShouldTriggerCapture(m_FrameCounter) && IsBackgroundCapturing(m_State))
   {
     RenderDoc::Inst().StartFrameCapture(devWnd);
+
+    const rdcarray<IFrameCapturer *> bridgeCapturers = RenderDoc::Inst().GetVulkanBridgeCapturers();
+
+    for(IFrameCapturer *capturer : bridgeCapturers)
+      capturer->StartFrameCapture(DeviceOwnedWindow(NULL, NULL));
 
     m_AppControlledCapture = false;
     m_CapturedFrames.back().frameNumber = m_FrameCounter;

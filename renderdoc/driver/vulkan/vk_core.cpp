@@ -240,6 +240,8 @@ WrappedVulkan::WrappedVulkan()
 
 WrappedVulkan::~WrappedVulkan()
 {
+  RenderDoc::Inst().RemoveVulkanBridgeCapturer(this);
+
   // records must be deleted before resource manager shutdown
   if(m_FrameCaptureRecord)
   {
@@ -3582,11 +3584,30 @@ void WrappedVulkan::Present(DeviceOwnedWindow devWnd)
   }
 
   if(IsActiveCapturing(m_State) && !m_AppControlledCapture)
+  {
+    const rdcarray<IFrameCapturer *> bridgeCapturers = RenderDoc::Inst().GetVulkanBridgeCapturers();
+
+    // Finish the off-screen rendering instances first. The presenting instance is ended through
+    // RenderDoc so the global capture bookkeeping stays associated with the user-visible window.
+    for(IFrameCapturer *capturer : bridgeCapturers)
+      if(capturer != this)
+        capturer->EndFrameCapture(DeviceOwnedWindow(NULL, NULL));
+
     RenderDoc::Inst().EndFrameCapture(devWnd);
+  }
 
   if(RenderDoc::Inst().ShouldTriggerCapture(m_FrameCounter) && IsBackgroundCapturing(m_State))
   {
     RenderDoc::Inst().StartFrameCapture(devWnd);
+
+    const rdcarray<IFrameCapturer *> bridgeCapturers = RenderDoc::Inst().GetVulkanBridgeCapturers();
+
+    // Emulator presentation is often handled by a separate Vulkan instance (or GLES). Mirror the
+    // trigger to every other Vulkan instance so the instance containing the real draw calls is
+    // captured as well.
+    for(IFrameCapturer *capturer : bridgeCapturers)
+      if(capturer != this)
+        capturer->StartFrameCapture(DeviceOwnedWindow(NULL, NULL));
 
     m_AppControlledCapture = false;
     m_CapturedFrames.back().frameNumber = m_FrameCounter;

@@ -309,6 +309,7 @@ private:
   CaptureState m_State;
   bool m_AppControlledCapture = false;
   bool m_FirstFrameCapture = false;
+  bool m_InternalInstance = false;
 
   int32_t m_ReuseEnabled = 1;
 

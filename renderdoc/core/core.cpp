@@ -2337,6 +2337,47 @@ void RenderDoc::RemoveDeviceFrameCapturer(void *dev)
   m_DeviceFrameCapturers.erase(dev);
 }
 
+void RenderDoc::AddVulkanBridgeCapturer(IFrameCapturer *cap)
+{
+  if(IsReplayApp())
+    return;
+
+  if(cap == NULL || cap->GetFrameCaptureDriver() != RDCDriver::Vulkan)
+  {
+    RDCERR("Invalid Vulkan bridge frame capturer %#p", cap);
+    return;
+  }
+
+  SCOPED_LOCK(m_CapturerListLock);
+
+  if(!m_VulkanBridgeCapturers.contains(cap))
+  {
+    RDCLOG("Adding Vulkan bridge frame capturer %#p", cap);
+    m_VulkanBridgeCapturers.push_back(cap);
+  }
+}
+
+void RenderDoc::RemoveVulkanBridgeCapturer(IFrameCapturer *cap)
+{
+  if(IsReplayApp())
+    return;
+
+  SCOPED_LOCK(m_CapturerListLock);
+
+  auto it = std::find(m_VulkanBridgeCapturers.begin(), m_VulkanBridgeCapturers.end(), cap);
+  if(it != m_VulkanBridgeCapturers.end())
+  {
+    RDCLOG("Removing Vulkan bridge frame capturer %#p", cap);
+    m_VulkanBridgeCapturers.erase(it - m_VulkanBridgeCapturers.begin());
+  }
+}
+
+rdcarray<IFrameCapturer *> RenderDoc::GetVulkanBridgeCapturers()
+{
+  SCOPED_LOCK(m_CapturerListLock);
+  return m_VulkanBridgeCapturers;
+}
+
 void RenderDoc::AddFrameCapturer(DeviceOwnedWindow devWnd, IFrameCapturer *cap)
 {
   if(IsReplayApp())

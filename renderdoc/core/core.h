@@ -597,6 +597,13 @@ public:
   void AddDeviceFrameCapturer(void *dev, IFrameCapturer *cap);
   void RemoveDeviceFrameCapturer(void *dev);
 
+  // Some Android emulators render and present through separate Vulkan instances. Keep a distinct
+  // list of Vulkan capturers so a capture triggered by the presenting instance can be mirrored to
+  // the off-screen rendering instances.
+  void AddVulkanBridgeCapturer(IFrameCapturer *cap);
+  void RemoveVulkanBridgeCapturer(IFrameCapturer *cap);
+  rdcarray<IFrameCapturer *> GetVulkanBridgeCapturers();
+
   IFrameCapturer *MatchFrameCapturer(DeviceOwnedWindow devWnd);
 
   void StartFrameCapture(DeviceOwnedWindow devWnd);
@@ -758,6 +765,7 @@ private:
   std::map<DeviceOwnedWindow, FrameCap> m_WindowFrameCapturers;
   DeviceOwnedWindow m_ActiveWindow;
   std::map<void *, IFrameCapturer *> m_DeviceFrameCapturers;
+  rdcarray<IFrameCapturer *> m_VulkanBridgeCapturers;
 
   bool m_VendorExts[arraydim<VendorExtensions>()] = {};
 

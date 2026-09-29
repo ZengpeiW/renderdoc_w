@@ -24,18 +24,23 @@
 
 #include "BufferViewer.h"
 #include <float.h>
+#include <QDir>
 #include <QDoubleSpinBox>
+#include <QFileInfo>
 #include <QFontDatabase>
 #include <QItemSelection>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QMutexLocker>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollBar>
+#include <QSet>
 #include <QSplitter>
 #include <QTimer>
 #include <QToolTip>
 #include <QtMath>
+#include "Code/FBXExporter.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Widgets/CollapseGroupBox.h"
@@ -1644,6 +1649,332 @@ void CacheDataForIteration(QVector<CachedElData> &cache, const rdcarray<ShaderCo
   }
 }
 
+static int FindFBXElement(const BufferConfiguration &config, const QStringList &prefixes)
+{
+  for(int i = 0; i < config.columns.count(); i++)
+  {
+    QString name = QString(config.columns[i].name).trimmed().toUpper();
+    name.remove(lit(" (PER-PRIM)"));
+
+    for(const QString &prefix : prefixes)
+      if(name == prefix || name.startsWith(prefix + lit("0")) || name.startsWith(prefix + lit("_")))
+        return i;
+  }
+
+  return -1;
+}
+
+static rdcarray<int> FindFBXUVElements(const BufferConfiguration &config)
+{
+  rdcarray<int> ret;
+
+  for(int i = 0; i < config.columns.count() && ret.count() < 3; i++)
+  {
+    QString name = QString(config.columns[i].name).trimmed().toUpper();
+    name.remove(lit(" (PER-PRIM)"));
+
+    if(name.startsWith(lit("TEXCOORD")) || name == lit("TEX") || name.startsWith(lit("TEX_")) ||
+       name == lit("UV") || name.startsWith(lit("UV0")) || name.startsWith(lit("UV1")) ||
+       name.startsWith(lit("UV2")) || name.startsWith(lit("UV_")))
+      ret.push_back(i);
+  }
+
+  return ret;
+}
+
+static bool ReadFBXElement(const BufferConfiguration &config, int element, uint32_t row,
+                           uint32_t vertexIndex, QVector<double> &values)
+{
+  values.clear();
+
+  if(element < 0 || element >= config.columns.count())
+    return false;
+
+  const ShaderConstant &el = config.columns[element];
+  const BufferElementProperties &prop = config.props[element];
+  const uint32_t componentCount = qMin<uint32_t>(4U, el.type.columns);
+
+  if(element < config.genericsEnabled.count() && config.genericsEnabled[element] &&
+     element < config.generics.count())
+  {
+    for(uint32_t component = 0; component < componentCount; component++)
+    {
+      if(prop.format.compType == CompType::Float)
+        values.push_back(config.generics[element].floatValue[component]);
+      else if(prop.format.compType == CompType::SInt)
+        values.push_back(config.generics[element].intValue[component]);
+      else
+        values.push_back(config.generics[element].uintValue[component]);
+    }
+
+    return !values.isEmpty();
+  }
+
+  if(prop.buffer < 0 || prop.buffer >= config.buffers.count())
+    return false;
+
+  const BufferData *buffer = config.buffers[prop.buffer];
+  const byte *data = buffer->data();
+  const byte *end = buffer->end();
+
+  if(prop.perprimitive)
+  {
+    const uint32_t verticesPerPrimitive =
+        qMax(1U, RENDERDOC_NumVerticesPerPrimitive(config.topology));
+    data += config.perPrimitiveOffset;
+    data += config.perPrimitiveStride * (row / verticesPerPrimitive);
+  }
+  else if(prop.perinstance)
+  {
+    const uint32_t instanceRate = qMax(1, prop.instancerate);
+    data += buffer->stride * (config.curInstance / instanceRate);
+  }
+  else
+  {
+    data += buffer->stride * vertexIndex;
+  }
+
+  data += el.byteOffset;
+
+  QVariantList variants = GetVariants(prop.format, el, data, end);
+  if(variants.count() < (int)componentCount)
+    return false;
+
+  for(uint32_t component = 0; component < componentCount; component++)
+  {
+    bool valid = false;
+    const double value = variants[component].toDouble(&valid);
+    if(!valid)
+      return false;
+    values.push_back(value);
+  }
+
+  return true;
+}
+
+static void AppendFBXVector(QVector<double> &destination, const QVector<double> &source,
+                            int componentCount, double defaultW = 0.0)
+{
+  for(int component = 0; component < componentCount; component++)
+  {
+    if(component < source.count())
+      destination.push_back(source[component]);
+    else if(component == 3)
+      destination.push_back(defaultW);
+    else
+      destination.push_back(0.0);
+  }
+}
+
+static void AppendFBXPolygon(FBXMeshData &mesh, std::initializer_list<qint32> indices)
+{
+  int i = 0;
+  for(qint32 index : indices)
+  {
+    i++;
+    mesh.polygonVertexIndices.push_back(i == (int)indices.size() ? -index - 1 : index);
+  }
+}
+
+static bool AppendFBXTopology(FBXMeshData &mesh, const QVector<qint32> &segment, Topology topology)
+{
+  if(topology >= Topology::PatchList_1CPs && topology <= Topology::PatchList_32CPs)
+  {
+    const uint32_t controlPoints = PatchList_Count(topology);
+    for(int i = 0; i + (int)controlPoints <= segment.count(); i += controlPoints)
+    {
+      for(uint32_t point = 0; point < controlPoints; point++)
+      {
+        const qint32 index = segment[i + point];
+        mesh.polygonVertexIndices.push_back(point + 1 == controlPoints ? -index - 1 : index);
+      }
+    }
+    return true;
+  }
+
+  switch(topology)
+  {
+    case Topology::PointList:
+      for(qint32 index : segment)
+        AppendFBXPolygon(mesh, {index});
+      return true;
+    case Topology::LineList:
+      for(int i = 0; i + 1 < segment.count(); i += 2)
+        AppendFBXPolygon(mesh, {segment[i], segment[i + 1]});
+      return true;
+    case Topology::LineStrip:
+      for(int i = 0; i + 1 < segment.count(); i++)
+        AppendFBXPolygon(mesh, {segment[i], segment[i + 1]});
+      return true;
+    case Topology::LineLoop:
+      for(int i = 0; i + 1 < segment.count(); i++)
+        AppendFBXPolygon(mesh, {segment[i], segment[i + 1]});
+      if(segment.count() > 2)
+        AppendFBXPolygon(mesh, {segment.back(), segment.front()});
+      return true;
+    case Topology::TriangleList:
+      for(int i = 0; i + 2 < segment.count(); i += 3)
+        AppendFBXPolygon(mesh, {segment[i], segment[i + 1], segment[i + 2]});
+      return true;
+    case Topology::TriangleStrip:
+      for(int i = 0; i + 2 < segment.count(); i++)
+      {
+        if(i & 1)
+          AppendFBXPolygon(mesh, {segment[i + 1], segment[i], segment[i + 2]});
+        else
+          AppendFBXPolygon(mesh, {segment[i], segment[i + 1], segment[i + 2]});
+      }
+      return true;
+    case Topology::TriangleFan:
+      for(int i = 1; i + 1 < segment.count(); i++)
+        AppendFBXPolygon(mesh, {segment[0], segment[i], segment[i + 1]});
+      return true;
+    case Topology::LineList_Adj:
+      for(int i = 0; i + 3 < segment.count(); i += 4)
+        AppendFBXPolygon(mesh, {segment[i + 1], segment[i + 2]});
+      return true;
+    case Topology::LineStrip_Adj:
+      for(int i = 1; i + 2 < segment.count(); i++)
+        AppendFBXPolygon(mesh, {segment[i], segment[i + 1]});
+      return true;
+    case Topology::TriangleList_Adj:
+      for(int i = 0; i + 5 < segment.count(); i += 6)
+        AppendFBXPolygon(mesh, {segment[i], segment[i + 2], segment[i + 4]});
+      return true;
+    case Topology::TriangleStrip_Adj:
+      for(int i = 0; i + 4 < segment.count(); i += 2)
+      {
+        const int triangle = i / 2;
+        if(triangle & 1)
+          AppendFBXPolygon(mesh, {segment[i + 2], segment[i], segment[i + 4]});
+        else
+          AppendFBXPolygon(mesh, {segment[i], segment[i + 2], segment[i + 4]});
+      }
+      return true;
+    default: break;
+  }
+
+  return false;
+}
+
+static bool BuildFBXMesh(const BufferConfiguration &config, int positionElement, FBXMeshData &mesh,
+                         QString &error)
+{
+  if(positionElement < 0 || positionElement >= config.columns.count())
+  {
+    error = QObject::tr("Couldn't identify a position attribute in the selected mesh stage.");
+    return false;
+  }
+
+  const int normalElement = FindFBXElement(config, {lit("NORMAL"), lit("NORM")});
+  const int tangentElement = FindFBXElement(config, {lit("TANGENT"), lit("TANG")});
+  const int colorElement = FindFBXElement(config, {lit("COLOR"), lit("COL")});
+  const rdcarray<int> uvElements = FindFBXUVElements(config);
+
+  mesh.texcoords.resize(uvElements.count());
+
+  QVector<QVector<qint32>> segments;
+  segments.push_back(QVector<qint32>());
+  int nextMeshlet = 1;
+
+  for(uint32_t row = 0; row < config.numRows; row++)
+  {
+    if(nextMeshlet < config.meshletVertexPrefixCounts.count() &&
+       row == config.meshletVertexPrefixCounts[nextMeshlet])
+    {
+      if(!segments.back().isEmpty())
+        segments.push_back(QVector<qint32>());
+      nextMeshlet++;
+    }
+
+    uint32_t vertexIndex = row;
+    if(config.indices && config.indices->hasData())
+    {
+      vertexIndex = CalcIndex(config.indices, row, config.baseVertex, config.primRestart);
+      if((config.primRestart && vertexIndex == config.primRestart) || vertexIndex == ~0U)
+      {
+        if(!segments.back().isEmpty())
+          segments.push_back(QVector<qint32>());
+        continue;
+      }
+    }
+
+    QVector<double> values;
+    if(!ReadFBXElement(config, positionElement, row, vertexIndex, values))
+    {
+      if(!segments.back().isEmpty())
+        segments.push_back(QVector<qint32>());
+      continue;
+    }
+
+    const qint32 exportedIndex = mesh.positions.count() / 3;
+    AppendFBXVector(mesh.positions, values, 3);
+    segments.back().push_back(exportedIndex);
+
+    if(normalElement >= 0)
+    {
+      values.clear();
+      ReadFBXElement(config, normalElement, row, vertexIndex, values);
+      AppendFBXVector(mesh.normals, values, 3);
+    }
+
+    if(tangentElement >= 0)
+    {
+      values.clear();
+      ReadFBXElement(config, tangentElement, row, vertexIndex, values);
+      AppendFBXVector(mesh.tangents, values, 3);
+    }
+
+    if(colorElement >= 0)
+    {
+      values.clear();
+      ReadFBXElement(config, colorElement, row, vertexIndex, values);
+      AppendFBXVector(mesh.colors, values, 4, 1.0);
+    }
+
+    for(int uv = 0; uv < uvElements.count(); uv++)
+    {
+      values.clear();
+      ReadFBXElement(config, uvElements[uv], row, vertexIndex, values);
+      AppendFBXVector(mesh.texcoords[uv], values, 2);
+    }
+  }
+
+  if(mesh.positions.isEmpty())
+  {
+    error = QObject::tr("No readable vertices were found in the selected mesh stage.");
+    return false;
+  }
+
+  for(const QVector<qint32> &segment : segments)
+  {
+    if(!AppendFBXTopology(mesh, segment, config.topology))
+    {
+      error = QObject::tr("The selected primitive topology (%1) is not supported by FBX export.")
+                  .arg(ToQStr(config.topology));
+      return false;
+    }
+  }
+
+  return true;
+}
+
+struct PipelineTextureExport
+{
+  TextureSave config;
+  QString filename;
+};
+
+static QString SanitiseExportFilename(QString name)
+{
+  name.replace(QRegularExpression(lit("[<>:\"/\\\\|?*\\x00-\\x1f]")), lit("_"));
+
+  while(name.endsWith(QLatin1Char('.')) || name.endsWith(QLatin1Char(' ')))
+    name.chop(1);
+
+  return name.isEmpty() ? lit("texture") : name;
+}
+
 static void ConfigureStatusColumn(rdcarray<ShaderConstant> &columns,
                                   rdcarray<BufferElementProperties> &props)
 {
@@ -2495,9 +2826,12 @@ BufferViewer::BufferViewer(ICaptureContext &ctx, bool meshview, QWidget *parent)
   m_ExportCSV->setIcon(Icons::save());
   m_ExportBytes = new QAction(this);
   m_ExportBytes->setIcon(Icons::save());
+  m_ExportFBX = new QAction(this);
+  m_ExportFBX->setIcon(Icons::save());
 
   m_ExportMenu->addAction(m_ExportCSV);
   m_ExportMenu->addAction(m_ExportBytes);
+  m_ExportMenu->addAction(m_ExportFBX);
 
   m_DebugVert = new QAction(tr("&Debug this Vertex"), this);
   m_DebugVert->setIcon(Icons::wrench());
@@ -2522,6 +2856,8 @@ BufferViewer::BufferViewer(ICaptureContext &ctx, bool meshview, QWidget *parent)
                    [this] { exportData(BufferExport(BufferExport::CSV)); });
   QObject::connect(m_ExportBytes, &QAction::triggered,
                    [this] { exportData(BufferExport(BufferExport::RawBytes)); });
+  QObject::connect(m_ExportFBX, &QAction::triggered,
+                   [this] { exportData(BufferExport(BufferExport::FBX)); });
   QObject::connect(m_DebugVert, &QAction::triggered, this, &BufferViewer::debugVertex);
   QObject::connect(m_DebugMeshThread, &QAction::triggered, this, &BufferViewer::debugMeshThread);
   QObject::connect(m_RemoveFilter, &QAction::triggered,
@@ -6361,6 +6697,7 @@ void BufferViewer::updateExportActionNames()
 {
   QString csv = tr("Export%1 to &CSV");
   QString bytes = tr("Export%1 to &Bytes");
+  QString fbx = tr("Export%1 to &FBX with textures");
 
   bool valid = m_Ctx.IsCaptureLoaded() && m_Ctx.CurAction();
 
@@ -6377,18 +6714,22 @@ void BufferViewer::updateExportActionNames()
   {
     m_ExportCSV->setText(csv.arg(QString()));
     m_ExportBytes->setText(bytes.arg(QString()));
+    m_ExportFBX->setText(fbx.arg(QString()));
     m_ExportCSV->setEnabled(false);
     m_ExportBytes->setEnabled(false);
+    m_ExportFBX->setEnabled(false);
     return;
   }
 
   m_ExportCSV->setEnabled(true);
   m_ExportBytes->setEnabled(m_BufferID != ResourceId());
+  m_ExportFBX->setEnabled(m_MeshView);
 
   if(m_MeshView)
   {
     m_ExportCSV->setText(csv.arg(lit(" ") + m_CurView->windowTitle()));
     m_ExportBytes->setText(bytes.arg(lit(" ") + m_CurView->windowTitle()));
+    m_ExportFBX->setText(fbx.arg(lit(" ") + m_CurView->windowTitle()));
     m_ExportBytes->setEnabled(true);
   }
   else
@@ -6398,17 +6739,20 @@ void BufferViewer::updateExportActionNames()
     {
       m_ExportCSV->setText(csv.arg(QString()));
       m_ExportBytes->setText(bytes.arg(QString()));
+      m_ExportFBX->setText(fbx.arg(QString()));
     }
     // otherwise go by which is selected
     else if(m_CurFixed)
     {
       m_ExportCSV->setText(csv.arg(lit(" ") + m_FixedGroup->title()));
       m_ExportBytes->setText(bytes.arg(lit(" ") + m_FixedGroup->title()));
+      m_ExportFBX->setText(fbx.arg(QString()));
     }
     else
     {
       m_ExportCSV->setText(csv.arg(lit(" ") + m_RepeatedGroup->title()));
       m_ExportBytes->setText(bytes.arg(lit(" ") + m_RepeatedGroup->title()));
+      m_ExportFBX->setText(fbx.arg(QString()));
     }
   }
 }
@@ -6454,12 +6798,167 @@ void BufferViewer::exportData(const BufferExport &params)
     filter = tr("Binary Files (*.bin)");
     title = tr("Export buffer to bytes");
   }
+  else if(params.format == BufferExport::FBX)
+  {
+    if(!m_MeshView || !m_CurView)
+      return;
+
+    filter = tr("FBX Files (*.fbx)");
+    title = tr("Export mesh and pipeline textures");
+  }
 
   QString filename =
       RDDialog::getSaveFileName(this, title, QString(), tr("%1;;All files (*)").arg(filter));
 
   if(filename.isEmpty())
     return;
+
+  if(params.format == BufferExport::FBX)
+  {
+    QFileInfo selectedFile(filename);
+    const QString baseName = selectedFile.completeBaseName();
+    const QString exportDir = selectedFile.absoluteDir().filePath(baseName);
+    QDir outputDirectory(exportDir);
+
+    if(outputDirectory.exists() &&
+       !outputDirectory.entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty())
+    {
+      QMessageBox::StandardButton overwrite = RDDialog::question(
+          this, tr("Export folder already exists"),
+          tr("The folder '%1' already contains files. Overwrite files with matching names?")
+              .arg(exportDir),
+          QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+      if(overwrite != QMessageBox::Yes)
+        return;
+    }
+
+    if(!QDir().mkpath(exportDir))
+    {
+      RDDialog::critical(this, tr("Error exporting FBX"),
+                         tr("Couldn't create export folder '%1'.").arg(exportDir));
+      return;
+    }
+
+    const QString fbxFilename = QDir(exportDir).filePath(baseName + lit(".fbx"));
+    BufferItemModel *model = (BufferItemModel *)m_CurView->model();
+    const int positionElement = model->posColumn();
+
+    QVector<PipelineTextureExport> textureExports;
+    rdcarray<ResourceId> seenTextures;
+    QSet<QString> usedNames;
+
+    const ShaderStage graphicsStages[] = {
+        ShaderStage::Vertex, ShaderStage::Hull, ShaderStage::Domain, ShaderStage::Geometry,
+        ShaderStage::Pixel,  ShaderStage::Task, ShaderStage::Mesh,
+    };
+
+    const PipeState &pipe = m_Ctx.CurPipelineState();
+    for(ShaderStage stage : graphicsStages)
+    {
+      const ShaderReflection *reflection = pipe.GetShaderReflection(stage);
+      if(!reflection)
+        continue;
+
+      for(const UsedDescriptor &used : pipe.GetReadOnlyResources(stage, false))
+      {
+        const ResourceId id = used.descriptor.resource;
+        const TextureDescription *texture = m_Ctx.GetTexture(id);
+        if(id == ResourceId() || texture == NULL || seenTextures.contains(id))
+          continue;
+
+        seenTextures.push_back(id);
+
+        QString resourceName;
+        if(used.access.index != DescriptorAccess::NoShaderBinding &&
+           used.access.index < reflection->readOnlyResources.count())
+          resourceName = reflection->readOnlyResources[used.access.index].name;
+
+        if(resourceName.isEmpty())
+          resourceName = m_Ctx.GetResourceName(id);
+
+        QString stem = SanitiseExportFilename(
+            QFormatStr("%1_%2_%3").arg(ToQStr(stage)).arg(used.access.index).arg(resourceName));
+        stem = stem.left(96);
+        QString uniqueStem = stem;
+        int suffix = 2;
+        while(usedNames.contains(uniqueStem.toLower()))
+          uniqueStem = QFormatStr("%1_%2").arg(stem).arg(suffix++);
+        usedNames.insert(uniqueStem.toLower());
+
+        PipelineTextureExport job;
+        job.config.resourceId = id;
+        job.config.mip = used.descriptor.firstMip;
+        job.config.slice.sliceIndex = used.descriptor.firstSlice;
+        job.config.sample.sampleIndex = TextureSampleMapping::ResolveSamples;
+        const uint32_t componentCount = used.descriptor.format.compCount > 0
+                                            ? used.descriptor.format.compCount
+                                            : texture->format.compCount;
+        job.config.destType = componentCount == 4 ? FileType::PNG : FileType::JPG;
+        job.config.alpha = componentCount == 4 ? AlphaMapping::Preserve : AlphaMapping::Discard;
+        job.filename = QDir(exportDir).filePath(
+            uniqueStem + (job.config.destType == FileType::PNG ? lit(".png") : lit(".jpg")));
+        textureExports.push_back(job);
+      }
+    }
+
+    ANALYTIC_SET(Export.MeshOutput, true);
+    if(!textureExports.isEmpty())
+      ANALYTIC_SET(Export.Texture, true);
+
+    QString exportError;
+    QStringList textureErrors;
+    int exportedTextures = 0;
+
+    LambdaThread *exportThread =
+        new LambdaThread([this, model, positionElement, fbxFilename, baseName, textureExports,
+                          &exportError, &textureErrors, &exportedTextures]() {
+          FBXMeshData mesh;
+          mesh.name = baseName;
+
+          if(!BuildFBXMesh(model->getConfig(), positionElement, mesh, exportError) ||
+             !ExportASCIIFBX(fbxFilename, mesh, exportError))
+            return;
+
+          for(const PipelineTextureExport &job : textureExports)
+          {
+            ResultDetails result = {ResultCode::Succeeded};
+            m_Ctx.Replay().BlockInvoke([&job, &result](IReplayController *replay) {
+              result = replay->SaveTexture(job.config, job.filename);
+            });
+
+            if(result.OK())
+              exportedTextures++;
+            else
+              textureErrors.push_back(
+                  tr("%1: %2").arg(QFileInfo(job.filename).fileName()).arg(result.Message()));
+          }
+        });
+
+    exportThread->start();
+    ShowProgressDialog(this, tr("Exporting FBX and textures"),
+                       [exportThread]() { return !exportThread->isRunning(); });
+    exportThread->deleteLater();
+
+    if(!exportError.isEmpty())
+    {
+      RDDialog::critical(this, tr("Error exporting FBX"), exportError);
+    }
+    else if(!textureErrors.isEmpty())
+    {
+      RDDialog::warning(this, tr("FBX exported with texture errors"),
+                        tr("The FBX was exported, but %1 texture(s) failed:\n\n%2")
+                            .arg(textureErrors.count())
+                            .arg(textureErrors.join(QLatin1Char('\n'))));
+    }
+    else
+    {
+      RDDialog::information(
+          this, tr("Export complete"),
+          tr("Exported the FBX and %1 pipeline texture(s) to:\n%2").arg(exportedTextures).arg(exportDir));
+    }
+
+    return;
+  }
 
   QFile *f = new QFile(filename);
 

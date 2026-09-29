@@ -174,6 +174,7 @@ SOURCES += Code/qrenderdoc.cpp \
     Code/QRDUtils.cpp \
     Code/MiniQtHelper.cpp \
     Code/BufferFormatter.cpp \
+    Code/FBXExporter.cpp \
     Code/Resources.cpp \
     Code/RGPInterop.cpp \
     Code/pyrenderdoc/PythonContext.cpp \
@@ -263,6 +264,7 @@ HEADERS += Code/CaptureContext.h \
     Code/ReplayManager.h \
     Code/ScintillaSyntax.h \
     Code/QRDUtils.h \
+    Code/FBXExporter.h \
     Code/MiniQtHelper.h \
     Code/Resources.h \
     Code/RGPInterop.h \

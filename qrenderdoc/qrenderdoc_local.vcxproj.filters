@@ -741,6 +741,9 @@
     <ClCompile Include="Code\BufferFormatter.cpp">
       <Filter>Code</Filter>
     </ClCompile>
+    <ClCompile Include="Code\FBXExporter.cpp">
+      <Filter>Code</Filter>
+    </ClCompile>
     <ClCompile Include="$(IntDir)generated\moc_ConfigEditor.cpp">
       <Filter>Generated Files</Filter>
     </ClCompile>
@@ -1430,6 +1433,9 @@
     <CustomBuild Include="Code\QRDUtils.h">
       <Filter>Code</Filter>
     </CustomBuild>
+    <ClInclude Include="Code\FBXExporter.h">
+      <Filter>Code</Filter>
+    </ClInclude>
     <CustomBuild Include="Widgets\ThumbnailStrip.h">
       <Filter>Widgets</Filter>
     </CustomBuild>

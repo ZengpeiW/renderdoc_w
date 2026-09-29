@@ -59,6 +59,7 @@ struct BufferExport
   {
     CSV,
     RawBytes,
+    FBX,
   };
 
   ExportFormat format;
@@ -333,6 +334,7 @@ private:
 
   QAction *m_ExportCSV = NULL;
   QAction *m_ExportBytes = NULL;
+  QAction *m_ExportFBX = NULL;
   QAction *m_DebugVert = NULL;
   QAction *m_DebugMeshThread = NULL;
   QAction *m_FilterMesh = NULL;

@@ -587,6 +587,7 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
   const bool internalInstance =
       (pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->pApplicationName &&
        rdcstr(pCreateInfo->pApplicationInfo->pApplicationName) == "RenderDoc forced instance");
+  m_InternalInstance = internalInstance;
 
   VkLayerInstanceCreateInfo *layerCreateInfo = (VkLayerInstanceCreateInfo *)pCreateInfo->pNext;
 
@@ -1138,6 +1139,7 @@ void WrappedVulkan::vkDestroyInstance(VkInstance instance, const VkAllocationCal
   // the device should already have been destroyed, assuming that the
   // application is well behaved. If not, we just leak.
 
+  RenderDoc::Inst().RemoveVulkanBridgeCapturer(this);
   ObjDisp(m_Instance)->DestroyInstance(Unwrap(m_Instance), NULL);
   RenderDoc::Inst().RemoveDeviceFrameCapturer(LayerDisp(m_Instance));
 
@@ -5441,6 +5443,9 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 
   FirstFrame();
 
+  if(!m_InternalInstance)
+    RenderDoc::Inst().AddVulkanBridgeCapturer(this);
+
   return ret;
 }
 
@@ -5448,6 +5453,8 @@ void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
 {
   if(device == VK_NULL_HANDLE)
     return;
+
+  RenderDoc::Inst().RemoveVulkanBridgeCapturer(this);
 
   if(m_MemoryFreeThread)
   {
