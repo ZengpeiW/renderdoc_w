@@ -481,7 +481,7 @@ set(data
     data/glsl/debug_sample.frag
     data/hlsl/quadswizzle.hlsl
     data/sourcecodepro.ttf
-    driver/vulkan/renderdoc.json)
+    driver/vulkan/rendertest.json)
 
 set(data_objects)
 
@@ -628,6 +628,7 @@ else()
 endif()
 
 add_library(renderdoc SHARED ${renderdoc_objects})
+set_target_properties(renderdoc PROPERTIES OUTPUT_NAME "${RDOC_BASE_NAME}")
 target_compile_definitions(renderdoc ${RDOC_DEFINITIONS})
 target_include_directories(renderdoc ${RDOC_INCLUDES})
 target_link_libraries(renderdoc ${RDOC_LIBRARIES})
@@ -635,14 +636,14 @@ target_link_libraries(renderdoc ${RDOC_LIBRARIES})
 add_dependencies(renderdoc renderdoc_libentry)
 
 if(UNIX AND NOT ANDROID AND NOT APPLE)
-    set(RDOC_LINK_FLAGS "-Wl,--undefined,force_include_libentry -Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/${RDOC_BASE_NAME}.version")
+    set(RDOC_LINK_FLAGS "-Wl,--undefined,force_include_libentry -Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/renderdoc.version")
 
     if(NOT ENABLE_ASAN AND NOT ENABLE_TSAN)
         set(RDOC_LINK_FLAGS "${RDOC_LINK_FLAGS} -Wl,--no-undefined")
     endif()
 
     if(NOT RELEASE_MODE)
-        configure_file(${CMAKE_CURRENT_SOURCE_DIR}/librenderdoc.so-gdb.py ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/librenderdoc.so-gdb.py)
+        configure_file(${CMAKE_CURRENT_SOURCE_DIR}/librenderdoc.so-gdb.py ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/lib${RDOC_BASE_NAME}.so-gdb.py)
     endif()
 
     set_target_properties(renderdoc PROPERTIES LINK_FLAGS "${RDOC_LINK_FLAGS}")

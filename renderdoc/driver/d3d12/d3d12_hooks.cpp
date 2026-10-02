@@ -564,6 +564,7 @@ public:
     }
 
     LibraryHooks::RegisterLibraryHook("d3d12.dll", NULL);
+    LibraryHooks::RegisterLibraryHook("sl.interposer.dll", NULL);
 
     CreateDevice.Register("d3d12.dll", "D3D12CreateDevice", D3D12CreateDevice_hook);
     GetDebugInterface.Register("d3d12.dll", "D3D12GetDebugInterface", D3D12GetDebugInterface_hook);
@@ -575,6 +576,13 @@ public:
 
     m_RecurseSlot = Threading::AllocateTLSSlot();
     Threading::SetTLSValue(m_RecurseSlot, NULL);
+  }
+
+  void OptionsUpdated()
+  {
+#if ENABLED(RDOC_X64)
+    PatchStreamlineHooks();
+#endif
   }
 
   static HRESULT GetWrappedInterface(IUnknown *realUnk, REFIID riid, void **ppvInterface)
@@ -687,8 +695,93 @@ private:
   HookedFunction<PFN_D3D12_GET_DEBUG_INTERFACE> GetDebugInterface;
   HookedFunction<PFN_D3D12_GET_INTERFACE> GetInterface;
   HookedFunction<PFN_D3D12_CREATE_DEVICE> CreateDevice;
+  HookedFunction<PFN_D3D12_GET_INTERFACE> StreamlineGetInterface;
+  HookedFunction<PFN_D3D12_CREATE_DEVICE> StreamlineCreateDevice;
   HookedFunction<PFN_D3D12_ENABLE_EXPERIMENTAL_FEATURES> EnableExperimentalFeatures;
   HookedFunction<PFNGetD3D11On12On7Interface> GetD3D11On12On7;
+
+  bool m_StreamlinePatched = false;
+
+#if ENABLED(RDOC_X64)
+  static void **FindStreamlineTargetSlot(void *entry, byte opcode)
+  {
+    byte *code = (byte *)entry;
+
+    // Streamline exports load the real D3D12 module, then call or jump through a RIP-relative
+    // function pointer. Locate that pointer without relying on a version-specific RVA.
+    for(size_t i = 0; i + 6 <= 96; i++)
+    {
+      if(code[i] == 0xff && code[i + 1] == opcode)
+      {
+        int32_t relativeOffset = 0;
+        memcpy(&relativeOffset, code + i + 2, sizeof(relativeOffset));
+        return (void **)(code + i + 6 + relativeOffset);
+      }
+    }
+
+    return NULL;
+  }
+
+  static bool PatchStreamlineTarget(void **slot, void *replacement)
+  {
+    DWORD oldProtection = 0;
+    if(slot == NULL || *slot == NULL || !VirtualProtect(slot, sizeof(void *), PAGE_READWRITE,
+                                                        &oldProtection))
+      return false;
+
+    *slot = replacement;
+
+    DWORD dummy = 0;
+    VirtualProtect(slot, sizeof(void *), oldProtection, &dummy);
+    return true;
+  }
+
+  void PatchStreamlineHooks()
+  {
+    if(m_StreamlinePatched)
+      return;
+
+    HMODULE streamline = GetModuleHandleA("sl.interposer.dll");
+    if(streamline == NULL)
+      return;
+
+    PFN_D3D12_CREATE_DEVICE createDevice =
+        (PFN_D3D12_CREATE_DEVICE)GetProcAddress(streamline, "D3D12CreateDevice");
+    PFN_D3D12_GET_INTERFACE getInterface =
+        (PFN_D3D12_GET_INTERFACE)GetProcAddress(streamline, "D3D12GetInterface");
+
+    if(createDevice == NULL || getInterface == NULL)
+    {
+      RDCWARN("Streamline D3D12 exports were not found");
+      return;
+    }
+
+    // Force Streamline to resolve its onward D3D12 pointers while our GetProcAddress hook is active.
+    createDevice(NULL, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), NULL);
+
+    void **createSlot = FindStreamlineTargetSlot((void *)createDevice, 0x15);
+    void **interfaceSlot = FindStreamlineTargetSlot((void *)getInterface, 0x25);
+
+    if(createSlot == NULL || interfaceSlot == NULL || *createSlot == NULL || *interfaceSlot == NULL)
+    {
+      RDCWARN("Couldn't locate Streamline D3D12 onward function pointers");
+      return;
+    }
+
+    StreamlineCreateDevice.SetFuncPtr(*createSlot);
+    StreamlineGetInterface.SetFuncPtr(*interfaceSlot);
+
+    if(!PatchStreamlineTarget(createSlot, (void *)&StreamlineD3D12CreateDevice_hook) ||
+       !PatchStreamlineTarget(interfaceSlot, (void *)&StreamlineD3D12GetInterface_hook))
+    {
+      RDCWARN("Couldn't patch Streamline D3D12 onward function pointers");
+      return;
+    }
+
+    m_StreamlinePatched = true;
+    RDCLOG("Patched Streamline D3D12 onward function pointers");
+  }
+#endif
 
   // re-entrancy detection (can happen in rare cases with e.g. fraps)
   uint64_t m_RecurseSlot = 0;
@@ -916,6 +1009,24 @@ private:
                                       ppDevice);
   }
 
+  static HRESULT WINAPI StreamlineD3D12CreateDevice_hook(IUnknown *pAdapter,
+                                                         D3D_FEATURE_LEVEL MinimumFeatureLevel,
+                                                         REFIID riid, void **ppDevice)
+  {
+    RDCLOG("Intercepted Streamline D3D12CreateDevice");
+
+    PFN_D3D12_CREATE_DEVICE createFunc = d3d12hooks.StreamlineCreateDevice();
+
+    if(!createFunc)
+    {
+      RDCERR("Streamline D3D12CreateDevice hook has no original function");
+      return E_UNEXPECTED;
+    }
+
+    return d3d12hooks.Create_Internal(createFunc, NULL, pAdapter, MinimumFeatureLevel, riid,
+                                      ppDevice);
+  }
+
   static HRESULT WINAPI D3D12EnableExperimentalFeatures_hook(UINT NumFeatures, const IID *pIIDs,
                                                              void *pConfigurationStructs,
                                                              UINT *pConfigurationStructSizes)
@@ -976,8 +1087,15 @@ private:
     return E_NOINTERFACE;
   }
 
-  static HRESULT WINAPI D3D12GetInterface_hook(REFCLSID rclsid, REFIID riid, void **ppvDebug)
+  static HRESULT D3D12GetInterface_Internal(PFN_D3D12_GET_INTERFACE getInterface, REFCLSID rclsid,
+                                            REFIID riid, void **ppvDebug)
   {
+    if(!getInterface)
+    {
+      RDCERR("D3D12GetInterface hook has no original function");
+      return E_UNEXPECTED;
+    }
+
     if(riid == CLSID_D3D12StateObjectFactory)
     {
       RDCLOG("Deliberately reporting no support for state object factories");
@@ -985,7 +1103,7 @@ private:
     }
 
     IUnknown *realUnk = NULL;
-    HRESULT real = d3d12hooks.GetInterface()(rclsid, riid, (void **)&realUnk);
+    HRESULT real = getInterface(rclsid, riid, (void **)&realUnk);
 
     HRESULT hr = GetWrappedInterface(realUnk, riid, ppvDebug);
 
@@ -999,6 +1117,18 @@ private:
             ToStr(riid).c_str(), ToStr(rclsid).c_str(), SUCCEEDED(real) ? "did" : "did not", real);
 
     return E_NOINTERFACE;
+  }
+
+  static HRESULT WINAPI D3D12GetInterface_hook(REFCLSID rclsid, REFIID riid, void **ppvDebug)
+  {
+    return D3D12GetInterface_Internal(d3d12hooks.GetInterface(), rclsid, riid, ppvDebug);
+  }
+
+  static HRESULT WINAPI StreamlineD3D12GetInterface_hook(REFCLSID rclsid, REFIID riid,
+                                                         void **ppvDebug)
+  {
+    RDCLOG("Intercepted Streamline D3D12GetInterface");
+    return D3D12GetInterface_Internal(d3d12hooks.StreamlineGetInterface(), rclsid, riid, ppvDebug);
   }
 };
 

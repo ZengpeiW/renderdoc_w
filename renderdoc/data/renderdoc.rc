@@ -86,9 +86,9 @@ BEGIN
             VALUE "CompanyName", "Baldur Karlsson"
             VALUE "FileDescription", "Core DLL for RenderTest"
             VALUE "FileVersion", MAJOR_MINOR_VERSION_STRING ".0.0"
-            VALUE "InternalName", "renderdoc"
+            VALUE "InternalName", "rendertest"
             VALUE "LegalCopyright", "Copyright © 2026 Baldur Karlsson"
-            VALUE "OriginalFilename", "renderdoc.dll"
+            VALUE "OriginalFilename", "rendertest.dll"
             VALUE "ProductName", "RenderTest"
             VALUE "ProductVersion", FULL_VERSION_STRING
         END

@@ -222,8 +222,9 @@ file(WRITE
      "\n"
      "LIB_SUFFIX=${LIB_SUFFIX}\n"
      "LIB_SUBFOLDER_TRAIL_SLASH=${LIB_SUBFOLDER_TRAIL_SLASH}\n"
+     "RDOC_BASE_NAME=${RDOC_BASE_NAME}\n"
      "\n"
-     # search for -lrenderdoc here
+     # search for the renamed core library here
      "LIBS+=-L${CMAKE_LIBRARY_OUTPUT_DIRECTORY}\n"
      "\n"
      # include and link against python
@@ -423,7 +424,7 @@ add_custom_target(build-qrenderdoc ALL DEPENDS QRenderDoc DEPENDS renderdoc DEPE
 
 if(APPLE AND CMAKE_GENERATOR STREQUAL "Xcode")
     set_target_properties(build-qrenderdoc PROPERTIES XCODE_SCHEME_DEBUG_DOCUMENT_VERSIONING OFF)
-    set_target_properties(build-qrenderdoc PROPERTIES XCODE_SCHEME_EXECUTABLE ${CMAKE_BINARY_DIR}/bin/qrenderdoc.app)
+    set_target_properties(build-qrenderdoc PROPERTIES XCODE_SCHEME_EXECUTABLE ${CMAKE_BINARY_DIR}/bin/qrendertest.app)
     target_sources(build-qrenderdoc PRIVATE ${QRD_XCODE_SOURCES})
     source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${CODE_FILES})
     source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${STYLES_FILES})
@@ -432,7 +433,7 @@ if(APPLE AND CMAKE_GENERATOR STREQUAL "Xcode")
     source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${THIRDPARTY_FILES})
 endif()
 
-install (PROGRAMS ${CMAKE_BINARY_DIR}/bin/qrenderdoc DESTINATION bin)
+install (PROGRAMS ${CMAKE_BINARY_DIR}/bin/qrendertest DESTINATION bin)
 
 # Install supporting files for file associations etc
 install (FILES share/application-x-renderdoc-capture.svg DESTINATION share/icons/hicolor/scalable/mimetypes/)

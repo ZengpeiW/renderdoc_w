@@ -61,7 +61,7 @@ void CheckHook()
 
   if(datahandle == NULL)
   {
-    LOGPRINT(L"renderdocshim: can't open global data\n");
+    LOGPRINT(L"rendertestshim: can't open global data\n");
     return;
   }
 
@@ -70,14 +70,14 @@ void CheckHook()
   if(data == NULL)
   {
     CloseHandle(datahandle);
-    LOGPRINT(L"renderdocshim: can't map global data\n");
+    LOGPRINT(L"rendertestshim: can't map global data\n");
     return;
   }
 
   if(data->pathmatchstring[0] == 0 || data->pathmatchstring[1] == 0 ||
      data->pathmatchstring[2] == 0 || data->pathmatchstring[3] == 0)
   {
-    LOGPRINT(L"renderdocshim: invalid pathmatchstring: '");
+    LOGPRINT(L"rendertestshim: invalid pathmatchstring: '");
     LOGPRINT(data->pathmatchstring);
     LOGPRINT(L"'\n");
 
@@ -104,7 +104,7 @@ void CheckHook()
 
     if(find >= 0)
     {
-      LOGPRINT(L"renderdocshim: Hooking into '");
+      LOGPRINT(L"rendertestshim: Hooking into '");
       LOGPRINT(exepath);
       LOGPRINT(L"', based on '");
       LOGPRINT(data->pathmatchstring);
@@ -133,7 +133,7 @@ void CheckHook()
     }
     else
     {
-      LOGPRINT(L"renderdocshim: NOT Hooking into '");
+      LOGPRINT(L"rendertestshim: NOT Hooking into '");
       LOGPRINT(exepath);
       LOGPRINT(L"', based on '");
       LOGPRINT(data->pathmatchstring);
@@ -144,7 +144,7 @@ void CheckHook()
   }
   else
   {
-    LOGPRINT(L"renderdocshim: Failed to allocate exepath\n");
+    LOGPRINT(L"rendertestshim: Failed to allocate exepath\n");
   }
 
   UnmapViewOfFile(data);

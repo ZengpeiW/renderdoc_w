@@ -295,7 +295,7 @@ rdcstr GetReplayAppFilename()
     return exe;
   }
 
-  // if qrenderdoc.exe doesn't live in the same dir, we must be in x86/
+  // if qrendertest.exe doesn't live in the same dir, we must be in x86/
   // so look one up the tree.
   exe = path + "/../qrendertest.exe";
 

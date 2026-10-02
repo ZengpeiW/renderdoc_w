@@ -195,7 +195,7 @@
     <ClInclude Include="vk_state.h" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="renderdoc.json" />
+    <None Include="rendertest.json" />
     <None Include="vk_apple_helpers.mm" />
   </ItemGroup>
   <ItemGroup>

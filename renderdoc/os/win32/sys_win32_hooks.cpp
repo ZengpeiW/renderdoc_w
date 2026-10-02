@@ -337,7 +337,8 @@ private:
     {
       rdcstr app = strlower(StringFormat::Wide2UTF8(lpApplicationName));
 
-      if(app.contains("rendertestcmd.exe") || app.contains("qrendertest.exe"))
+      if(app.contains("rendertestcmd.exe") || app.contains("qrendertest.exe") ||
+         app.contains("steamwebhelper.exe"))
       {
         inject = false;
       }
@@ -346,7 +347,8 @@ private:
     {
       rdcstr cmd = strlower(StringFormat::Wide2UTF8(lpCommandLine));
 
-      if(cmd.contains("rendertestcmd.exe") || cmd.contains("qrendertest.exe"))
+      if(cmd.contains("rendertestcmd.exe") || cmd.contains("qrendertest.exe") ||
+         cmd.contains("steamwebhelper.exe"))
       {
         inject = false;
       }

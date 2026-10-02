@@ -22,8 +22,8 @@
     <UseNativeEnvironment>true</UseNativeEnvironment>
     <ProjectGuid>{E2B46D67-90E2-40B6-9597-72930E7845E5}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
-    <RootNamespace>renderdoc</RootNamespace>
-    <ProjectName>renderdoc</ProjectName>
+    <RootNamespace>rendertest</RootNamespace>
+    <ProjectName>rendertest</ProjectName>
   </PropertyGroup>
   <Import Project="$(SolutionDir)\util\WindowsSDKTarget.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -849,12 +849,12 @@ namespace DXCEnumerateAndCheck {
       <MinorVersion>$(VersionFile.Substring($(MinorVersionStart)).Split('
 ')[0].Split(' ')[2])</MinorVersion>
     </PropertyGroup>
-    <Message Text="Processing layer JSON file for RenderDoc $(MajorVersion).$(MinorVersion)" Importance="High" />
+    <Message Text="Processing layer JSON file for RenderTest $(MajorVersion).$(MinorVersion)" Importance="High" />
     <!-- Read the template json, replace the major/minor versions -->
     <PropertyGroup>
       <VulkanLayerName>VK_LAYER_$(ProjectName.ToUpper())_Capture</VulkanLayerName>
       <VulkanEnableVar>ENABLE_VULKAN_$(ProjectName)_CAPTURE</VulkanEnableVar>
-      <JSONContents>$([System.IO.File]::ReadAllText('$(SolutionDir)renderdoc/driver/vulkan/renderdoc.json').Replace('@RENDERDOC_VERSION_MAJOR@', '$(MajorVersion)').Replace('@RENDERDOC_VERSION_MINOR@', '$(MinorVersion)').Replace('@VULKAN_LAYER_MODULE_PATH@', '.\\$(ProjectName).dll').Replace('@VULKAN_LAYER_NAME@', $(VulkanLayerName)).Replace('@VULKAN_ENABLE_VAR@', $(VulkanEnableVar.ToUpper())))</JSONContents>
+      <JSONContents>$([System.IO.File]::ReadAllText('$(SolutionDir)renderdoc/driver/vulkan/rendertest.json').Replace('@RENDERDOC_VERSION_MAJOR@', '$(MajorVersion)').Replace('@RENDERDOC_VERSION_MINOR@', '$(MinorVersion)').Replace('@VULKAN_LAYER_MODULE_PATH@', '.\\$(ProjectName).dll').Replace('@VULKAN_LAYER_NAME@', $(VulkanLayerName)).Replace('@VULKAN_ENABLE_VAR@', $(VulkanEnableVar.ToUpper())))</JSONContents>
     </PropertyGroup>
     <!-- Write it out to the output directory -->
     <WriteLinesToFile File="$(OutDir)$(ProjectName).json" Lines="$(JSONContents)" Overwrite="true" />

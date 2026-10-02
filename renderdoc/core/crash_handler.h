@@ -128,14 +128,14 @@ public:
     si.dwFlags |= STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
-    HANDLE waitEvent = CreateEventA(NULL, TRUE, FALSE, "RENDERDOC_CRASHHANDLE");
+    HANDLE waitEvent = CreateEventA(NULL, TRUE, FALSE, "RENDERTEST_CRASHHANDLE");
 
     rdcstr dllpath;
     FileIO::GetLibraryFilename(dllpath);
 
     rdcstr cmdline = "\"";
     cmdline += get_dirname(dllpath);
-    cmdline += "/renderdoccmd.exe\" crashhandle --pipe ";
+    cmdline += "/rendertestcmd.exe\" crashhandle --pipe ";
     cmdline += m_PipeName;
 
     rdcwstr params = StringFormat::UTF82Wide(cmdline);

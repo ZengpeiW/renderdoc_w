@@ -1004,7 +1004,7 @@ Win32CallstackResolver::Win32CallstackResolver(bool interactive, byte *moduleDB,
 
       RDCWARN("Couldn't get symbols for %s", m.name.c_str());
 
-      // silently ignore renderdoc.dll, dbghelp.dll, and symsrv.dll without asking to permanently
+      // silently ignore rendertest.dll, dbghelp.dll, and symsrv.dll without asking to permanently
       // ignore
       if(m.name.contains("renderdoc.") || m.name.contains("dbghelp.") || m.name.contains("symsrv."))
         continue;

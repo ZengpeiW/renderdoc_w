@@ -18,7 +18,7 @@
                 execvpe;
                 _exit;
                 RENDERDOC_*;
-                VK_LAYER_RENDERDOC_*;
+                VK_LAYER_RENDERTEST_*;
         local:
                 *;
 };

@@ -717,7 +717,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
     }
   }
 #else
-  // farm off to alternate bitness renderdoccmd.exe
+  // farm off to alternate bitness rendertestcmd.exe
 
   // if the target process is 'wow64' that means it's 32-bit.
   capalt = (isWow64 == TRUE);
@@ -975,9 +975,6 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
   const char *rdoc_dll = STRINGIZE(RDOC_BASE_NAME);
 
   uintptr_t loc = FindRemoteDLL(pid, STRINGIZE(RDOC_BASE_NAME) ".dll");
-
-  CloseHandle(hProcess);
-  hProcess = NULL;
 
   rdcpair<RDResult, uint32_t> result = {ResultCode::Succeeded, 0};
 
@@ -1509,7 +1506,7 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
   renderdocPath = get_dirname(renderdocPath);
 
-  // the native renderdoccmd.exe is always next to the dll. Wow32 will be somewhere else
+  // the native rendertestcmd.exe is always next to the dll. Wow32 will be somewhere else
   rdcstr cmdpathNative = renderdocPath + "\\rendertestcmd.exe";
   rdcstr cmdpathWow32;
 
@@ -1518,7 +1515,7 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
 #if ENABLED(RDOC_X64)
 
-  // native shim is just renderdocshim64.dll
+  // native shim is just rendertestshim64.dll
   shimpathNative = renderdocPath + "\\rendertestshim64.dll";
 
   // if it looks like we're in the development environment, look for the alternate bitness in the

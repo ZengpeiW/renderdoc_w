@@ -605,6 +605,10 @@ private:
     switch(ID)
     {
       NVAPI_FUNCS();
+      // Streamline queries basic GPU and driver information before creating the graphics device.
+      // These calls don't consume wrapped D3D objects, so they are safe to pass through.
+      WHITELIST_NVAPI(NvAPI_SYS_GetDriverAndBranchVersion, 0x2926aaad);
+      WHITELIST_NVAPI(NvAPI_EnumPhysicalGPUs, 0xe5ac921f);
       // unknown, but these are fetched inside NvAPI_Initialize so allow them through to avoid
       // causing problems.
       WHITELIST_NVAPI(unknown_func, 0xad298d3f);

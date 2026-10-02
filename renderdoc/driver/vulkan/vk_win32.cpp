@@ -356,7 +356,7 @@ void VulkanReplay::InstallVulkanLayer(bool systemLevel)
   {
     rdcstr path = GetJSONPath(false);
 
-    // this function will delete all non-matching renderdoc.json values, and return true if our own
+    // this function will delete all non-matching rendertest.json values, and return true if our own
     // is registered
     bool thisRegistered = ProcessImplicitLayersKey(key, path, NULL, true);
 
@@ -376,7 +376,7 @@ void VulkanReplay::InstallVulkanLayer(bool systemLevel)
     {
       rdcstr path = GetJSONPath(true);
 
-      // this function will delete all non-matching renderdoc.json values, and return true if our
+      // this function will delete all non-matching rendertest.json values, and return true if our
       // own is registered
       bool thisRegistered = ProcessImplicitLayersKey(key, path, NULL, true);
 
