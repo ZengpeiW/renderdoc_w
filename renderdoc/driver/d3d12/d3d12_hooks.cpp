@@ -564,7 +564,13 @@ public:
     }
 
     LibraryHooks::RegisterLibraryHook("d3d12.dll", NULL);
+#if ENABLED(RDOC_X64)
+    LibraryHooks::RegisterLibraryHook("sl.interposer.dll", [](void *, const char *) {
+      d3d12hooks.PatchStreamlineHooks();
+    });
+#else
     LibraryHooks::RegisterLibraryHook("sl.interposer.dll", NULL);
+#endif
 
     CreateDevice.Register("d3d12.dll", "D3D12CreateDevice", D3D12CreateDevice_hook);
     GetDebugInterface.Register("d3d12.dll", "D3D12GetDebugInterface", D3D12GetDebugInterface_hook);
@@ -576,13 +582,6 @@ public:
 
     m_RecurseSlot = Threading::AllocateTLSSlot();
     Threading::SetTLSValue(m_RecurseSlot, NULL);
-  }
-
-  void OptionsUpdated()
-  {
-#if ENABLED(RDOC_X64)
-    PatchStreamlineHooks();
-#endif
   }
 
   static HRESULT GetWrappedInterface(IUnknown *realUnk, REFIID riid, void **ppvInterface)
@@ -703,6 +702,25 @@ private:
   bool m_StreamlinePatched = false;
 
 #if ENABLED(RDOC_X64)
+  typedef void(WINAPI *PFN_STREAMLINE_INITIALISE_D3D12)();
+
+  static void *FindStreamlineInitialiser(void *entry)
+  {
+    byte *code = (byte *)entry;
+
+    for(size_t i = 0; i + 5 <= 48; i++)
+    {
+      if(code[i] == 0xe8)
+      {
+        int32_t relativeOffset = 0;
+        memcpy(&relativeOffset, code + i + 1, sizeof(relativeOffset));
+        return code + i + 5 + relativeOffset;
+      }
+    }
+
+    return NULL;
+  }
+
   static void **FindStreamlineTargetSlot(void *entry, byte opcode)
   {
     byte *code = (byte *)entry;
@@ -756,15 +774,42 @@ private:
       return;
     }
 
-    // Force Streamline to resolve its onward D3D12 pointers while our GetProcAddress hook is active.
-    createDevice(NULL, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), NULL);
-
     void **createSlot = FindStreamlineTargetSlot((void *)createDevice, 0x15);
     void **interfaceSlot = FindStreamlineTargetSlot((void *)getInterface, 0x25);
 
-    if(createSlot == NULL || interfaceSlot == NULL || *createSlot == NULL || *interfaceSlot == NULL)
+    if(createSlot == NULL || interfaceSlot == NULL)
     {
       RDCWARN("Couldn't locate Streamline D3D12 onward function pointers");
+      return;
+    }
+
+    if(*createSlot == NULL || *interfaceSlot == NULL)
+    {
+      PFN_STREAMLINE_INITIALISE_D3D12 initialise =
+          (PFN_STREAMLINE_INITIALISE_D3D12)FindStreamlineInitialiser((void *)createDevice);
+
+      if(initialise == NULL ||
+         initialise != (PFN_STREAMLINE_INITIALISE_D3D12)FindStreamlineInitialiser((void *)getInterface))
+      {
+        RDCWARN("Couldn't locate Streamline D3D12 initialiser");
+        return;
+      }
+
+      // Streamline resolves d3d12.dll by walking its export table directly, so GetProcAddress hooks
+      // don't see these lookups. Run only its resolver, without creating a probe device.
+      initialise();
+    }
+
+    if(*createSlot == NULL || *interfaceSlot == NULL)
+    {
+      RDCWARN("Streamline D3D12 onward function pointers are still unresolved");
+      return;
+    }
+
+    if(*createSlot == (void *)&StreamlineD3D12CreateDevice_hook ||
+       *interfaceSlot == (void *)&StreamlineD3D12GetInterface_hook)
+    {
+      m_StreamlinePatched = true;
       return;
     }
 
