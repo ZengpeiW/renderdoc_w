@@ -25,6 +25,7 @@
 #include "d3d12_hooks.h"
 #include "driver/dxgi/dxgi_wrapped.h"
 #include "hooks/hooks.h"
+#include "hooks/streamline_hooks.h"
 #include "serialise/serialiser.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_device.h"
@@ -704,56 +705,6 @@ private:
 #if ENABLED(RDOC_X64)
   typedef void(WINAPI *PFN_STREAMLINE_INITIALISE_D3D12)();
 
-  static void *FindStreamlineInitialiser(void *entry)
-  {
-    byte *code = (byte *)entry;
-
-    for(size_t i = 0; i + 5 <= 48; i++)
-    {
-      if(code[i] == 0xe8)
-      {
-        int32_t relativeOffset = 0;
-        memcpy(&relativeOffset, code + i + 1, sizeof(relativeOffset));
-        return code + i + 5 + relativeOffset;
-      }
-    }
-
-    return NULL;
-  }
-
-  static void **FindStreamlineTargetSlot(void *entry, byte opcode)
-  {
-    byte *code = (byte *)entry;
-
-    // Streamline exports load the real D3D12 module, then call or jump through a RIP-relative
-    // function pointer. Locate that pointer without relying on a version-specific RVA.
-    for(size_t i = 0; i + 6 <= 96; i++)
-    {
-      if(code[i] == 0xff && code[i + 1] == opcode)
-      {
-        int32_t relativeOffset = 0;
-        memcpy(&relativeOffset, code + i + 2, sizeof(relativeOffset));
-        return (void **)(code + i + 6 + relativeOffset);
-      }
-    }
-
-    return NULL;
-  }
-
-  static bool PatchStreamlineTarget(void **slot, void *replacement)
-  {
-    DWORD oldProtection = 0;
-    if(slot == NULL || *slot == NULL || !VirtualProtect(slot, sizeof(void *), PAGE_READWRITE,
-                                                        &oldProtection))
-      return false;
-
-    *slot = replacement;
-
-    DWORD dummy = 0;
-    VirtualProtect(slot, sizeof(void *), oldProtection, &dummy);
-    return true;
-  }
-
   void PatchStreamlineHooks()
   {
     if(m_StreamlinePatched)
@@ -774,10 +725,19 @@ private:
       return;
     }
 
+    if(!IsStreamlineRange(streamline, (void *)createDevice, 96, true) ||
+       !IsStreamlineRange(streamline, (void *)getInterface, 96, true))
+    {
+      RDCWARN("Streamline D3D12 exports are outside readable executable memory");
+      return;
+    }
+
     void **createSlot = FindStreamlineTargetSlot((void *)createDevice, 0x15);
     void **interfaceSlot = FindStreamlineTargetSlot((void *)getInterface, 0x25);
 
-    if(createSlot == NULL || interfaceSlot == NULL)
+    if(!IsStreamlineRange(streamline, createSlot, sizeof(void *), false) ||
+       !IsStreamlineRange(streamline, interfaceSlot, sizeof(void *), false) ||
+       (uintptr_t)createSlot % sizeof(void *) != 0 || (uintptr_t)interfaceSlot % sizeof(void *) != 0)
     {
       RDCWARN("Couldn't locate Streamline D3D12 onward function pointers");
       return;
@@ -789,7 +749,9 @@ private:
           (PFN_STREAMLINE_INITIALISE_D3D12)FindStreamlineInitialiser((void *)createDevice);
 
       if(initialise == NULL ||
-         initialise != (PFN_STREAMLINE_INITIALISE_D3D12)FindStreamlineInitialiser((void *)getInterface))
+         initialise !=
+             (PFN_STREAMLINE_INITIALISE_D3D12)FindStreamlineInitialiser((void *)getInterface) ||
+         !IsStreamlineRange(streamline, (void *)initialise, 1, true))
       {
         RDCWARN("Couldn't locate Streamline D3D12 initialiser");
         return;
@@ -1169,8 +1131,7 @@ private:
     return D3D12GetInterface_Internal(d3d12hooks.GetInterface(), rclsid, riid, ppvDebug);
   }
 
-  static HRESULT WINAPI StreamlineD3D12GetInterface_hook(REFCLSID rclsid, REFIID riid,
-                                                         void **ppvDebug)
+  static HRESULT WINAPI StreamlineD3D12GetInterface_hook(REFCLSID rclsid, REFIID riid, void **ppvDebug)
   {
     RDCLOG("Intercepted Streamline D3D12GetInterface");
     return D3D12GetInterface_Internal(d3d12hooks.StreamlineGetInterface(), rclsid, riid, ppvDebug);
@@ -1206,3 +1167,76 @@ HRESULT STDMETHODCALLTYPE WrappedID3D12DeviceFactory::GetConfigurationInterface(
 
   return E_NOINTERFACE;
 }
+
+#if ENABLED(ENABLE_UNIT_TESTS) && ENABLED(RDOC_X64)
+#include "catch/catch.hpp"
+
+TEST_CASE("Streamline export instruction boundaries", "[d3d][streamline]")
+{
+  // Streamline 2.8 D3D12CreateDevice: the E8 in 'mov rbp, r8' must not be treated as a call.
+  const byte createDevice[] = {
+      0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24,
+      0x18, 0x57, 0x48, 0x83, 0xec, 0x50, 0x49, 0x8b, 0xf1, 0x49, 0x8b, 0xe8, 0x8b, 0xda,
+      0x48, 0x8b, 0xf9, 0xe8, 0x9c, 0x05, 0x00, 0x00, 0x4c, 0x8b, 0xce, 0x4c, 0x8b, 0xc5,
+      0x8b, 0xd3, 0x48, 0x8b, 0xcf, 0xff, 0x15, 0x3b, 0xc6, 0x05, 0x00,
+  };
+  const byte getInterface[] = {
+      0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20,
+      0x49, 0x8b, 0xd8, 0x48, 0x8b, 0xfa, 0x48, 0x8b, 0xf1, 0xe8, 0x23, 0x00, 0x00, 0x00, 0x4c,
+      0x8b, 0xc3, 0x48, 0x8b, 0xd7, 0x48, 0x8b, 0xce, 0x48, 0x8b, 0x5c, 0x24, 0x30, 0x48, 0x8b,
+      0x74, 0x24, 0x38, 0x48, 0x83, 0xc4, 0x20, 0x5f, 0x48, 0xff, 0x25, 0x9c, 0xbf, 0x05, 0x00,
+  };
+
+  CHECK(FindStreamlineInstruction(createDevice, sizeof(createDevice), 0xe8) == createDevice + 0x1f);
+  CHECK(FindStreamlineInstruction(createDevice, sizeof(createDevice), 0xff, 0x15) ==
+        createDevice + 0x2f);
+  CHECK(FindStreamlineInstruction(getInterface, sizeof(getInterface), 0xe8) == getInterface + 0x18);
+  CHECK(FindStreamlineInstruction(getInterface, sizeof(getInterface), 0xff, 0x25) ==
+        getInterface + 0x36);
+
+  // DXGI has its own resolver. Its onward factories must be hooked alongside D3D12 devices.
+  const byte createFactory1[] = {
+      0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x54, 0x24, 0x10, 0x57, 0x48, 0x83,
+      0xec, 0x20, 0x48, 0x8b, 0xda, 0x48, 0x8b, 0xf9, 0xe8, 0xc6, 0x01, 0x00, 0x00,
+      0x48, 0x8b, 0xd3, 0x48, 0x8b, 0xcf, 0xff, 0x15, 0xc2, 0x6d, 0x05, 0x00,
+  };
+  const byte createFactory2[] = {
+      0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x4c, 0x89,
+      0x44, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x49, 0x8b, 0xf8, 0x48,
+      0x8b, 0xf2, 0x8b, 0xd9, 0xe8, 0x6f, 0x01, 0x00, 0x00, 0x4c, 0x8b, 0xc7,
+      0x48, 0x8b, 0xd6, 0x8b, 0xcb, 0xff, 0x15, 0x49, 0x6e, 0x05, 0x00,
+  };
+  CHECK(FindStreamlineInstruction(createFactory1, sizeof(createFactory1), 0xe8) ==
+        createFactory1 + 0x15);
+  CHECK(FindStreamlineInstruction(createFactory1, sizeof(createFactory1), 0xff, 0x15) ==
+        createFactory1 + 0x20);
+  CHECK(FindStreamlineInstruction(createFactory2, sizeof(createFactory2), 0xe8) ==
+        createFactory2 + 0x1c);
+  CHECK(FindStreamlineInstruction(createFactory2, sizeof(createFactory2), 0xff, 0x15) ==
+        createFactory2 + 0x29);
+
+  // These operands contain both the direct-call opcode and indirect transfer byte patterns.
+  const byte operands[] = {
+      0x48, 0x8b, 0xac, 0x24, 0xe8, 0xff, 0x25, 0x00,                // mov rbp, [rsp+disp32]
+      0x48, 0x81, 0xec, 0xe8, 0xff, 0x15, 0x00,                      // sub rsp, imm32
+      0x48, 0xb8, 0xe8, 0xff, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00,    // mov rax, imm64
+      0xe8, 0x00, 0x00, 0x00, 0x00,
+  };
+  CHECK(FindStreamlineInstruction(operands, sizeof(operands), 0xe8) == operands + 25);
+  CHECK(FindStreamlineInstruction(operands, sizeof(operands), 0xff, 0x15) == NULL);
+  CHECK(FindStreamlineInstruction(operands, sizeof(operands), 0xff, 0x25) == NULL);
+
+  // Never read a partial instruction or search past an unsupported instruction/return.
+  for(size_t size = 0; size < sizeof(createDevice); size++)
+    CHECK(FindStreamlineInstruction(createDevice, size, 0xff, 0x15) == NULL);
+  for(size_t size = 0; size < sizeof(getInterface); size++)
+    CHECK(FindStreamlineInstruction(getInterface, size, 0xff, 0x25) == NULL);
+
+  const byte unknown[] = {0x0f, 0x0b, 0xe8, 0, 0, 0, 0};
+  const byte returned[] = {0xc3, 0xe8, 0, 0, 0, 0};
+  const byte jumped[] = {0xff, 0x25, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0};
+  CHECK(FindStreamlineInstruction(unknown, sizeof(unknown), 0xe8) == NULL);
+  CHECK(FindStreamlineInstruction(returned, sizeof(returned), 0xe8) == NULL);
+  CHECK(FindStreamlineInstruction(jumped, sizeof(jumped), 0xe8) == NULL);
+}
+#endif

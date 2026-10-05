@@ -25,6 +25,7 @@
 
 #include "core/core.h"
 #include "hooks/hooks.h"
+#include "hooks/streamline_hooks.h"
 #include "dxgi_wrapped.h"
 
 typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY)(REFIID, void **);
@@ -250,6 +251,10 @@ public:
     RDCLOG("Registering DXGI hooks");
 
     LibraryHooks::RegisterLibraryHook("dxgi.dll", NULL);
+#if ENABLED(RDOC_X64)
+    LibraryHooks::RegisterLibraryHook(
+        "sl.interposer.dll", [](void *, const char *) { dxgihooks.PatchStreamlineHooks(); });
+#endif
 
     CreateDXGIFactory.Register("dxgi.dll", "CreateDXGIFactory", CreateDXGIFactory_hook);
     CreateDXGIFactory1.Register("dxgi.dll", "CreateDXGIFactory1", CreateDXGIFactory1_hook);
@@ -269,6 +274,76 @@ private:
   HookedFunction<PFN_CREATE_DXGI_FACTORY2> CreateDXGIFactory2;
   HookedFunction<PFN_GET_DEBUG_INTERFACE> GetDebugInterface;
   HookedFunction<PFN_GET_DEBUG_INTERFACE1> GetDebugInterface1;
+
+#if ENABLED(RDOC_X64)
+  void PatchStreamlineHooks()
+  {
+    HMODULE streamline = GetModuleHandleA("sl.interposer.dll");
+    if(streamline == NULL)
+      return;
+
+    const char *exports[] = {"CreateDXGIFactory", "CreateDXGIFactory1", "CreateDXGIFactory2"};
+    void *replacements[] = {(void *)&CreateDXGIFactory_hook, (void *)&CreateDXGIFactory1_hook,
+                            (void *)&CreateDXGIFactory2_hook};
+    void **slots[3] = {};
+    void *initialiser = NULL;
+
+    for(size_t i = 0; i < ARRAY_COUNT(exports); i++)
+    {
+      void *entry = (void *)GetProcAddress(streamline, exports[i]);
+      if(!IsStreamlineRange(streamline, entry, 96, true))
+      {
+        RDCWARN("Streamline export %s is missing or unreadable", exports[i]);
+        return;
+      }
+
+      slots[i] = FindStreamlineTargetSlot(entry, 0x15);
+      void *init = FindStreamlineInitialiser(entry);
+      if(!IsStreamlineRange(streamline, slots[i], sizeof(void *), false) ||
+         (uintptr_t)slots[i] % sizeof(void *) != 0 ||
+         !IsStreamlineRange(streamline, init, 1, true) || (initialiser && init != initialiser))
+      {
+        RDCWARN("Couldn't locate Streamline DXGI resolver for %s", exports[i]);
+        return;
+      }
+      initialiser = init;
+    }
+
+    // Streamline resolves DXGI exports directly, bypassing GetProcAddress hooks. Patch the
+    // onward calls so factories, devices and queues all pass through RenderDoc together.
+    if(*slots[0] == NULL || *slots[1] == NULL || *slots[2] == NULL)
+      ((void(WINAPI *)())initialiser)();
+
+    for(size_t i = 0; i < ARRAY_COUNT(slots); i++)
+    {
+      if(*slots[i] == NULL)
+      {
+        RDCWARN("Streamline DXGI onward function pointers are still unresolved");
+        return;
+      }
+    }
+
+    // Reuse the normal DXGI hooks. If this resolver loaded DXGI before its import hooks were
+    // populated, use the native pointers it just resolved. Never store our hook as its own target.
+    if(!CreateDXGIFactory() && *slots[0] != replacements[0])
+      CreateDXGIFactory.SetFuncPtr(*slots[0]);
+    if(!CreateDXGIFactory1() && *slots[1] != replacements[1])
+      CreateDXGIFactory1.SetFuncPtr(*slots[1]);
+    if(!CreateDXGIFactory2() && *slots[2] != replacements[2])
+      CreateDXGIFactory2.SetFuncPtr(*slots[2]);
+
+    for(size_t i = 0; i < ARRAY_COUNT(slots); i++)
+    {
+      if(*slots[i] != replacements[i] && !PatchStreamlineTarget(slots[i], replacements[i]))
+      {
+        RDCWARN("Couldn't patch Streamline %s onward function pointer", exports[i]);
+        return;
+      }
+    }
+
+    RDCLOG("Patched Streamline DXGI onward function pointers");
+  }
+#endif
 
   static HRESULT WINAPI CreateDXGIFactory_hook(__in REFIID riid, __out void **ppFactory)
   {

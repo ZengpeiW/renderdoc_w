@@ -165,6 +165,9 @@
     <ClInclude Include="hooks\hooks.h">
       <Filter>Hooks</Filter>
     </ClInclude>
+    <ClInclude Include="hooks\streamline_hooks.h">
+      <Filter>Hooks</Filter>
+    </ClInclude>
     <ClInclude Include="common\common.h">
       <Filter>Common</Filter>
     </ClInclude>

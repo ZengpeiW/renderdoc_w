@@ -1003,6 +1003,65 @@ void WrappedID3D12CommandQueue::ExecuteCommandListsInternal(UINT NumCommandLists
 
     if(capframe)
     {
+      // GPU upload memory can be updated after the last intercepted Unmap. Snapshot referenced
+      // buffers at submission so replay sees the data consumed by this work, rather than the older
+      // Unmap contents. Mapped buffers are handled by the persistent-map path below.
+      for(ResourceId id : refdIDs)
+      {
+        ID3D12DeviceChild *child = GetResourceManager()->GetResource(id);
+        if(!child || IdentifyTypeByPtr(child) != Resource_Resource)
+          continue;
+
+        WrappedID3D12Resource *res = (WrappedID3D12Resource *)child;
+        D3D12_HEAP_PROPERTIES props = {};
+        res->GetHeapProperties(&props, NULL);
+        D3D12_RESOURCE_DESC desc = res->GetDesc();
+        if(props.Type != D3D12_HEAP_TYPE_GPU_UPLOAD ||
+           desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+          continue;
+
+        SCOPED_LOCK(res->GetResourceRecord()->m_MapLock);
+        if(res->GetMap(0))
+          continue;
+
+        QueueReadbackData &readback = m_pDevice->GetQueueReadbackData();
+        SCOPED_LOCK(readback.lock);
+        readback.Resize(desc.Width);
+
+        HRESULT hr = Unwrap(readback.list)->Reset(Unwrap(readback.alloc), NULL);
+        CHECK_HR(m_pDevice, hr);
+        if(FAILED(hr))
+          break;
+
+        Unwrap(readback.list)
+            ->CopyBufferRegion(readback.unwrappedReadbackBuf, 0, res->GetReal(), 0, desc.Width);
+        hr = Unwrap(readback.list)->Close();
+        CHECK_HR(m_pDevice, hr);
+        if(FAILED(hr))
+          break;
+
+        ID3D12CommandList *list = Unwrap(readback.list);
+        readback.unwrappedQueue->ExecuteCommandLists(1, &list);
+        m_pDevice->QueueWaitForIdle(readback.unwrappedQueue, Unwrap(readback.fence));
+        if(m_pDevice->HasFatalError())
+          break;
+
+        const size_t size = (size_t)desc.Width;
+        size_t start = 0, end = size;
+        byte *shadow = res->GetShadow(0);
+        bool changed = !shadow || FindDiffRange(readback.readbackMapped, shadow, size, start, end);
+        if(changed)
+        {
+          if(!shadow)
+            res->AllocShadow(0, size);
+          D3D12_RANGE range = {start, end};
+          RDCLOG("Unmapped GPU upload submit snapshot for %s (%llu -> %llu)",
+                 ToStr(id).c_str(), (uint64_t)start, (uint64_t)end);
+          m_pDevice->MapDataWrite(res, 0, readback.readbackMapped, range, true);
+          GetResourceManager()->MarkDirtyResource(id);
+        }
+      }
+
       rdcarray<MapState> maps = m_pDevice->GetMaps();
 
       // get the Mappable referenced IDs. With the case of placed resources the resource that's
