@@ -354,6 +354,26 @@ bool WrappedVulkan::Serialise_vkAllocateMemory(SerialiserType &ser, VkDevice dev
       patched.allocationSize = AlignUp(patched.allocationSize, VkDeviceSize(64 * 1024));
     }
 
+    // Qualcomm's proprietary driver (observed on Adreno 740, V@0676.11) ignores the
+    // opaque capture address when the address struct precedes the allocation flags.
+    // Move the existing flags to the head of the unwrapped chain, preserving every
+    // value and the address verification below. pNext order must not affect semantics.
+    if(m_PhysicalDeviceData.driverProps.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY)
+    {
+      VkMemoryAllocateFlagsInfo *flags = (VkMemoryAllocateFlagsInfo *)FindNextStruct(
+          &patched, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
+      const VkMemoryOpaqueCaptureAddressAllocateInfo *address =
+          (const VkMemoryOpaqueCaptureAddressAllocateInfo *)FindNextStruct(
+              &patched, VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
+
+      if(flags && address && address->opaqueCaptureAddress != 0 && patched.pNext != flags)
+      {
+        RemoveNextStruct(&patched, VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO);
+        flags->pNext = patched.pNext;
+        patched.pNext = flags;
+      }
+    }
+
     VkResult ret = ObjDisp(device)->AllocateMemory(Unwrap(device), &patched, NULL, &mem);
 
     if(ret != VK_SUCCESS)

@@ -222,6 +222,12 @@ function Install-Toolchain {
     if (-not (Test-Path -LiteralPath (Join-Path $androidSdk "build-tools\$buildToolsVersion\aapt.exe"))) {
         throw "Android build-tools $buildToolsVersion are missing."
     }
+    foreach ($javaTool in @('dx.jar', 'apksigner.jar')) {
+        $javaToolPath = Join-Path $androidSdk "build-tools\$buildToolsVersion\lib\$javaTool"
+        if (-not (Test-Path -LiteralPath $javaToolPath)) {
+            throw "Android build-tools installation is incomplete: '$javaToolPath' is missing."
+        }
+    }
     if (-not (Test-Path -LiteralPath (Join-Path $androidSdk "platforms\android-$androidPlatformVersion\android.jar"))) {
         throw "Android platform $androidPlatformVersion is missing."
     }
@@ -286,6 +292,27 @@ Include = /etc/pacman.d/mirrorlist.msys
         AndroidNdk = $androidNdk
         MsysShell = $msysShell
     }
+}
+
+function Test-AndroidApk($Toolchain, [string]$Abi) {
+    $apkPath = Join-Path $repoRoot "build-android-$Abi\bin\org.renderdoc.renderdoccmd.$Abi.apk"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($apkPath)
+    try {
+        foreach ($entryName in @('AndroidManifest.xml', 'classes.dex')) {
+            $entry = $archive.GetEntry($entryName)
+            if ($null -eq $entry -or $entry.Length -eq 0) {
+                throw "APK is incomplete: '$entryName' is missing or empty in '$apkPath'."
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+
+    $java = Join-Path $Toolchain.JavaHome 'bin\java.exe'
+    $signer = Join-Path $Toolchain.AndroidSdk "build-tools\$buildToolsVersion\lib\apksigner.jar"
+    Invoke-Checked $java @('-jar', $signer, 'verify', '--verbose', $apkPath)
+    Write-Host "[OK] APK contents and signature verified: $apkPath"
 }
 
 function Invoke-AndroidBuild($Toolchain, [bool]$BuildArm64, [bool]$BuildArm32) {
@@ -408,6 +435,9 @@ try {
     }
 
     Invoke-AndroidBuild $toolchain ($Target -in @('arm64', 'both')) ($Target -in @('arm32', 'both'))
+
+    if ($Target -in @('arm64', 'both')) { Test-AndroidApk $toolchain 'arm64' }
+    if ($Target -in @('arm32', 'both')) { Test-AndroidApk $toolchain 'arm32' }
 
     Write-Section 'Build completed successfully'
     if ($Target -in @('arm64', 'both')) {

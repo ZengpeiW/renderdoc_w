@@ -301,10 +301,23 @@ if(ANDROID)
 
     set(D8_SCRIPT "${BUILD_TOOLS}/d8${TOOL_SCRIPT_EXTENSION}")
     if(NOT EXISTS ${D8_SCRIPT})
-        set(DEX_COMMAND ${BUILD_TOOLS}/dx${TOOL_SCRIPT_EXTENSION} --dex --output=bin/classes.dex ./obj)
+        # Older Windows SDK launchers silently succeed when tools/lib/find_java.bat is
+        # missing. Use the Java runtime found by CMake instead of the dx.bat launcher.
+        set(DX_JAR "${BUILD_TOOLS}/lib/dx.jar")
+        if(NOT EXISTS "${DX_JAR}")
+            message(FATAL_ERROR "Android DEX compiler not found: ${DX_JAR}")
+        endif()
+        set(DEX_COMMAND "${Java_JAVA_EXECUTABLE}" -jar "${DX_JAR}" --dex --output=bin/classes.dex ./obj)
     else()
         set(DEX_COMMAND ${D8_SCRIPT} --output ./bin/ ./obj/org/renderdoc/renderdoccmd/${ABI_EXTENSION_NAME}/*.class)
     endif()
+
+    # apksigner.bat in old SDKs has the same find_java.bat dependency as dx.bat.
+    set(APKSIGNER_JAR "${BUILD_TOOLS}/lib/apksigner.jar")
+    if(NOT EXISTS "${APKSIGNER_JAR}")
+        message(FATAL_ERROR "Android APK signer not found: ${APKSIGNER_JAR}")
+    endif()
+    set(APKSIGNER_COMMAND "${Java_JAVA_EXECUTABLE}" -jar "${APKSIGNER_JAR}")
 
     add_custom_command(OUTPUT ${APK_FILE} APPEND
                        COMMAND ${BUILD_TOOLS}/aapt package -f -m -S res -J src -M AndroidManifest.xml -I ${ANDROID_JAR}
@@ -312,7 +325,8 @@ if(ANDROID)
                        COMMAND ${DEX_COMMAND}
                        COMMAND ${BUILD_TOOLS}/aapt package -f -M AndroidManifest.xml --version-code ${APK_VERSION_CODE} --version-name ${APK_VERSION_NAME} -S res -I ${ANDROID_JAR} -F RenderDocCmd-unaligned.apk bin libs
                        COMMAND ${BUILD_TOOLS}/zipalign -f 4 RenderDocCmd-unaligned.apk RenderDocCmd.apk
-                       COMMAND ${BUILD_TOOLS}/apksigner${TOOL_SCRIPT_EXTENSION} sign --ks ${KEYSTORE} --ks-pass pass:android --key-pass pass:android --ks-key-alias rdocandroidkey RenderDocCmd.apk
+                       COMMAND ${APKSIGNER_COMMAND} sign --ks ${KEYSTORE} --ks-pass pass:android --key-pass pass:android --ks-key-alias rdocandroidkey RenderDocCmd.apk
+                       COMMAND ${APKSIGNER_COMMAND} verify --verbose RenderDocCmd.apk
                        COMMAND ${CMAKE_COMMAND} -E copy RenderDocCmd.apk ${APK_FILE})
 
 endif()
