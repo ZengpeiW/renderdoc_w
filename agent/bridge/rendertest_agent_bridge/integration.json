@@ -1,0 +1,11 @@
+{
+  "name": "rendertest_agent_bridge",
+  "title": "RenderTest Agent Bridge",
+  "version": "0.1.0",
+  "protocol": "rendertest-agent-ipc/v1",
+  "minimumRenderDocVersion": "1.47",
+  "entryPoints": {
+    "start": "start(version, ctx)",
+    "stop": "stop()"
+  }
+}

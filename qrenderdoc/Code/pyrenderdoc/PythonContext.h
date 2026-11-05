@@ -69,6 +69,8 @@ public:
   static QStringList GetApplicationExtensionsPaths();
   static void ProcessExtensionWork(std::function<void()> callback);
   static QString LoadExtension(ICaptureContext &ctx, const rdcstr &extension);
+  static QString LoadInternalIntegration(const rdcstr &integration, const QString &packageRoot);
+  static bool ShutdownInternalIntegrations();
   static void ConvertPyArgs(const ExtensionCallbackData &data,
                             rdcarray<rdcpair<rdcstr, PyObject *>> &args);
   static void FreePyArgs(rdcarray<rdcpair<rdcstr, PyObject *>> &args);
@@ -185,6 +187,9 @@ private:
 
   // the list of extension objects, to be able to reload them
   static QMap<rdcstr, PyObject *> extensions;
+
+  // first-party integrations loaded from the application directory, stopped before shutdown
+  static QMap<rdcstr, PyObject *> internalIntegrations;
 
   static bool initialised();
 

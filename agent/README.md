@@ -2,7 +2,12 @@
 
 RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打开的 capture。设计见 [docs/MVP_DESIGN.md](docs/MVP_DESIGN.md)。
 
-当前进度：**M0 协议骨架**。MCP Server、文件 mailbox IPC、fake Bridge 和协议测试已完成；qrenderdoc 内置加载从 M1 开始。
+当前进度：**M1 内置加载**。
+
+- M0：MCP Server、文件 mailbox IPC、fake Bridge 和协议测试。
+- M1：qrendertest 启动时从 `integrations/rendertest_agent/python` 固定加载 Bridge，写实例清单和心跳，跟踪 capture 加载、关闭和选中事件，支持 `ping` / `get_status` / `get_context`。
+
+M2 开始接入 replay 只读工具。
 
 ## 目录
 
@@ -11,6 +16,9 @@ agent/
   bridge/rendertest_agent_bridge/   # qrenderdoc 内嵌 Bridge，保持 Python 3.6 兼容
   mcp_server/src/rendertest_mcp/    # 外部 stdio MCP Server，Python >= 3.10
   devtools/fake_bridge.py           # 不依赖 qrenderdoc 的 Bridge 模拟器
+  devtools/smoke_live.py            # 对运行中的 qrendertest 调 ping/get_status/get_context
+  devtools/live_lifecycle.py        # 启动 qrendertest，自动验收加载/选中/关闭/重载/退出
+  devtools/ui_lifecycle_script.py   # live_lifecycle.py 使用的 --ui-script
   tests/                            # 协议、实例选择、工具契约和 stdio 冒烟测试
   docs/MVP_DESIGN.md
 ```
@@ -31,6 +39,23 @@ cd agent/mcp_server
 ```
 
 测试会创建 asyncio 事件循环和 stdio 子进程，受限沙箱中可能卡在 loopback socketpair 上，需要在普通终端运行。
+
+## 在 qrendertest 中使用
+
+构建 `qrenderdoc_local.vcxproj` 后，Bridge 会被复制到 `x64/<Config>/integrations/rendertest_agent/python/`。启动 qrendertest 即自动运行，不出现在 Extension Manager 中。
+
+- `RENDERTEST_AGENT_BRIDGE=0`（或 `false` / `off` / `no`）：不加载 Bridge。
+- `RENDERTEST_AGENT_ROOT`：IPC 和日志根目录，Bridge 日志在 `<root>/logs/bridge-<instanceId>.log`。
+
+实测：
+
+```powershell
+# 对已经打开的 qrendertest
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --expect-capture
+
+# 自动跑完整生命周期
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\live_lifecycle.py --capture "E:\Captures\some.rdc"
+```
 
 ## 用 fake Bridge 手动试用
 

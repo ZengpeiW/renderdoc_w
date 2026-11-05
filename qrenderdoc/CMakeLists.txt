@@ -422,6 +422,12 @@ add_custom_command(OUTPUT QRenderDoc
     DEPENDS ${QRD_DEPENDENCIES})
 add_custom_target(build-qrenderdoc ALL DEPENDS QRenderDoc DEPENDS renderdoc DEPENDS swig-bindings)
 
+# Ship the built-in agent bridge next to the executable, where qrendertest loads it from
+set(RENDERTEST_AGENT_BRIDGE_DIR ${CMAKE_SOURCE_DIR}/agent/bridge/rendertest_agent_bridge)
+add_custom_target(rendertest-agent-bridge ALL
+    COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_BINARY_DIR}/bin/integrations/rendertest_agent/python/rendertest_agent_bridge
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${RENDERTEST_AGENT_BRIDGE_DIR} ${CMAKE_BINARY_DIR}/bin/integrations/rendertest_agent/python/rendertest_agent_bridge)
+
 if(APPLE AND CMAKE_GENERATOR STREQUAL "Xcode")
     set_target_properties(build-qrenderdoc PROPERTIES XCODE_SCHEME_DEBUG_DOCUMENT_VERSIONING OFF)
     set_target_properties(build-qrenderdoc PROPERTIES XCODE_SCHEME_EXECUTABLE ${CMAKE_BINARY_DIR}/bin/qrendertest.app)
@@ -434,6 +440,9 @@ if(APPLE AND CMAKE_GENERATOR STREQUAL "Xcode")
 endif()
 
 install (PROGRAMS ${CMAKE_BINARY_DIR}/bin/qrendertest DESTINATION bin)
+install (DIRECTORY ${RENDERTEST_AGENT_BRIDGE_DIR}
+         DESTINATION bin/integrations/rendertest_agent/python
+         PATTERN "__pycache__" EXCLUDE)
 
 # Install supporting files for file associations etc
 install (FILES share/application-x-renderdoc-capture.svg DESTINATION share/icons/hicolor/scalable/mimetypes/)

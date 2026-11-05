@@ -51,9 +51,10 @@ Codex / Claude / IDE Agent
 
 ### 线程模型
 
-- Qt 定时器每 100 ms 运行一次，只做请求认领和入队，不执行耗时工具。
-- Bridge 后台 worker 串行执行请求，队列上限 16。
-- `ui` 类方法通过 `ctx.Extensions().GetMiniQtHelper().InvokeOntoUIThread()` 回到 Qt 线程。
+- Bridge 的 poller 线程每 50 ms 认领一次请求并入队，只写心跳，不执行耗时工具。
+- Bridge 后台 worker 线程串行执行请求，队列上限 16。
+- poller 和 worker 都不直接访问 `ctx` 的 UI 状态。capture 状态由 `CaptureViewer` 回调在 Qt 线程上写入线程安全快照，`ping` / `get_status` / `get_context` 只读快照。
+- `ui` 类方法（M2 起）通过 `ctx.Extensions().GetMiniQtHelper().InvokeOntoUIThread()` 回到 Qt 线程。必须用不阻塞的投递加可取消等待：`stop()` 运行在 Qt 线程上，如果 worker 阻塞等待 UI 线程，`stop()` 的 join 会死锁。
 - `replay` 类方法在 worker 中调用 `ctx.Replay().BlockInvoke()`，不得在 Qt 线程中调用。
 - 带 `event_id` 的只读工具在同一次 replay 调用里：
   1. 保存当前 replay EID；
@@ -490,7 +491,7 @@ args = ["-m", "rendertest_mcp"]
 | `qrenderdoc/Code/pyrenderdoc/PythonContext.cpp` | 从应用目录导入固定包，调用 `start(version, ctx)`；退出时调用 `stop()` |
 | `qrenderdoc/Code/CaptureContext.h` | 增加 Agent integration 成员和只读状态访问 |
 | `qrenderdoc/Code/CaptureContext.cpp` | 在普通扩展加载后初始化 Bridge；析构开始时先停止 Bridge |
-| `qrenderdoc/qrenderdoc_local.vcxproj` | 添加新源文件；构建后复制 Bridge 到 `$(OutDir)integrations` |
+| `qrenderdoc/qrenderdoc_local.vcxproj` | 添加新源文件；`DeployRenderTestAgentBridge` 目标在构建后复制 Bridge 到 `$(OutDir)integrations` |
 | `qrenderdoc/qrenderdoc_local.vcxproj.filters` | 添加 `Code\Agent` 过滤器 |
 | `qrenderdoc/CMakeLists.txt` | 添加新源文件和 Bridge 安装规则 |
 | `qrenderdoc/qrenderdoc.pro` | 添加新源文件，保持 qmake 工程可编译 |
@@ -512,6 +513,9 @@ args = ["-m", "rendertest_mcp"]
 - 不读取 `%APPDATA%` 中的普通扩展来覆盖内置 Bridge。
 - 加载失败只记录日志并让 qrendertest 正常启动。
 - 设置 `RENDERTEST_AGENT_BRIDGE=0` 时不加载 Bridge。
+- 加载失败时调用模块的 `stop()` 并清理 `sys.modules`，不留下半启动的线程。
+- 退出时先停止内置集成；如果 Bridge 线程没有在超时内退出，跳过 `Py_Finalize`，避免解释器销毁时线程仍在运行导致崩溃。
+- `CaptureViewer` 不会收到 qrenderdoc 加载后的初始 `SetEventID`，所以 `OnCaptureLoaded` 里直接读取 `CurSelectedEvent()` / `CurEvent()`。
 
 参考 Bread 的实现：
 
@@ -595,30 +599,37 @@ cd agent/mcp_server
 
 ```powershell
 $solutionDir = (Resolve-Path .).Path.TrimEnd('\') + '\'
-MSBuild qrenderdoc/qrenderdoc_local.vcxproj /m:2 /t:Build /p:Configuration=Development /p:Platform=x64 "/p:SolutionDir=$solutionDir"
+MSBuild qrenderdoc/qrenderdoc_local.vcxproj /m /t:Build /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$solutionDir" /p:BuildProjectReferences=false
 ```
 
 通过条件：
 
 - `qrendertest.exe` 构建成功。
-- `x64/Development/integrations/rendertest_agent/python/rendertest_agent_bridge/__init__.py` 存在。
+- `x64/Release/integrations/rendertest_agent/python/rendertest_agent_bridge/__init__.py` 存在。
 - 启动 qrendertest 后 3 秒内生成 `instance.json`。
 - 未打开 capture 时，`get_status` 返回 `captureLoaded=false`。
 - 设置 `RENDERTEST_AGENT_BRIDGE=0` 后不创建实例目录，qrendertest 正常启动。
 - 普通 Extension Manager 中看不到内置 Bridge。
 
+M1 生命周期由 `agent/devtools/live_lifecycle.py` 自动验收：启动 qrendertest 并运行 `ui_lifecycle_script.py`，依次加载、选中第一个根 action、关闭、重载、WM_CLOSE 退出。通过条件：
+
+- 加载后 `selectedEventId` / `currentEventId` 非空。
+- 选中后 manifest 和 `get_context` 都反映目标 EID。
+- 关闭后 `captureLoaded=false`，重载后得到新的 `captureSessionId`。
+- 退出后 manifest 为 `stopped=true`，Bridge 日志有 started 和 stopped。
+
 ### C. 实际 capture 冒烟
 
 首批使用：
 
-- `E:/Captures/lings_renderdoctest_frame2723.rdc`
+- `E:/Captures/RenderDocCaptures/save/错误效果(打开nanite和adaptive_gbuffer).rdc`
 - `E:/Captures/mobile_lumen.rdc`
 
 后续压力测试再使用：
 
-- `E:/Captures/RenderDocCaptures/save/错误效果(打开nanite和adaptive_gbuffer).rdc`
 - `E:/Captures/RenderDocCaptures/save/正确效果(打开nanite和blendable_gbuffer).rdc`
 - `E:/Captures/pragmata1.rdc`
+- `E:/Captures/lings_renderdoctest_frame2723.rdc`：移动端 capture，本地打开会弹出 Remote Host 选择框，需要先配好远程 replay。
 
 操作：
 
@@ -684,7 +695,7 @@ cd agent/mcp_server
 1. **M0：协议骨架**
    - MCP Server、IPC client、fake Bridge 和协议测试。
 2. **M1：内置加载**
-   - qrenderdoc 固定加载 Bridge，生成心跳，支持 `ping` / `get_status`。
+   - qrenderdoc 固定加载 Bridge，生成心跳，支持 `ping` / `get_status` / `get_context`（`pipeline` 暂为 `null`）。
 3. **M2：P0 只读工具**
    - Context、Action、Pipeline、Shader、CBuffer、资源、纹理、Buffer、调试消息。
 4. **M3：Agent 工作流**

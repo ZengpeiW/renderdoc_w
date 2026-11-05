@@ -55,6 +55,7 @@ class PythonShell;
 class ResourceInspector;
 class ShaderViewer;
 class MiniQtHelper;
+class RenderTestAgentIntegration;
 
 class QFileSystemWatcher;
 
@@ -151,6 +152,7 @@ public:
 
   IReplayManager &Replay() override { return m_Replay; }
   IExtensionManager &Extensions() override { return *this; }
+  RenderTestAgentIntegration *AgentIntegration() const { return m_AgentIntegration; }
   bool IsCaptureLoaded() override { return m_CaptureLoaded; }
   bool IsCaptureLocal() override { return m_CaptureLocal; }
   bool IsCaptureTemporary() override { return m_CaptureTemporary; }
@@ -443,6 +445,8 @@ private:
   QList<ShaderViewer *> m_ShaderEditors;
 
   MiniQtHelper *m_QtHelper = NULL;
+
+  RenderTestAgentIntegration *m_AgentIntegration = NULL;
 
   QFileSystemWatcher *m_Watcher = NULL;
   QFileSystemWatcher *m_ExtensionWatcher = NULL;

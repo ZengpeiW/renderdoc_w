@@ -22,6 +22,9 @@
     <Filter Include="Code\pyrenderdoc">
       <UniqueIdentifier>{c2e91ed4-8c04-4fdc-accf-8fed288f2cd8}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Code\Agent">
+      <UniqueIdentifier>{5b0f6c1e-7d2a-4c58-9a41-3e8d2f6b7c90}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Windows">
       <UniqueIdentifier>{897f728c-8a11-41c3-ba6f-75815d9e06db}</UniqueIdentifier>
     </Filter>
@@ -122,6 +125,9 @@
     </ClCompile>
     <ClCompile Include="Code\CaptureContext.cpp">
       <Filter>Code</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\Agent\RenderTestAgentIntegration.cpp">
+      <Filter>Code\Agent</Filter>
     </ClCompile>
     <ClCompile Include="Widgets\TextureGoto.cpp">
       <Filter>Widgets</Filter>
@@ -811,6 +817,9 @@
     </ClInclude>
     <ClInclude Include="Code\CaptureContext.h">
       <Filter>Code</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\RenderTestAgentIntegration.h">
+      <Filter>Code\Agent</Filter>
     </ClInclude>
     <ClInclude Include="Code\qprocessinfo.h">
       <Filter>Code</Filter>

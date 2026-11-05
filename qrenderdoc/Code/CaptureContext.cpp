@@ -36,6 +36,7 @@
 #include <QProgressDialog>
 #include <QRegularExpression>
 #include <QTimer>
+#include "Code/Agent/RenderTestAgentIntegration.h"
 #include "Code/Resources.h"
 #include "Code/pyrenderdoc/PythonContext.h"
 #include "Widgets/AnnotationDisplay.h"
@@ -309,10 +310,20 @@ CaptureContext::CaptureContext(PersistentConfig &cfg) : m_Config(cfg)
     QFile f(sentinelFilename);
     f.remove();
   }
+
+  // the built-in agent bridge is loaded from the application directory after user extensions
+  m_AgentIntegration = new RenderTestAgentIntegration();
+  m_AgentIntegration->Initialize();
 }
 
 CaptureContext::~CaptureContext()
 {
+  // stop the agent bridge first, while the capture viewers and UI it talks to are still alive
+  if(m_AgentIntegration && !m_AgentIntegration->Shutdown())
+    qCritical() << "RenderTest agent bridge did not stop cleanly";
+  delete m_AgentIntegration;
+  m_AgentIntegration = NULL;
+
   delete m_ExtensionWatcher;
 
   delete m_QtHelper;

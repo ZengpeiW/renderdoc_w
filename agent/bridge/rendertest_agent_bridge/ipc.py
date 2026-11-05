@@ -253,10 +253,15 @@ class MailboxServer(object):
             self._queue.put_nowait(None)
         except queue.Full:
             pass
+        stopped = True
         if self._worker is not None:
             self._worker.join(timeout)
-            self._worker = None
+            if self._worker.is_alive():
+                stopped = False
+            else:
+                self._worker = None
         self.publish_manifest(stopped=True)
+        return stopped
 
     def notify_activity(self):
         self.publish_manifest(activity=True)
