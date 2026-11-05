@@ -5,6 +5,7 @@ import os
 import re
 import struct
 import uuid
+import zlib
 
 from .paths import artifacts_root
 
@@ -83,3 +84,42 @@ def png_size(path):
     if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
         return None
     return struct.unpack(">II", header[16:24])
+
+
+def _png_chunk(kind, body):
+    return (struct.pack(">I", len(body)) + kind + body +
+            struct.pack(">I", zlib.crc32(kind + body) & 0xffffffff))
+
+
+def bmp_to_png(bmp_path, png_path):
+    """Convert an uncompressed 24/32-bit BMP written by RenderDoc into an opaque RGB PNG."""
+    with open(bmp_path, "rb") as stream:
+        data = stream.read()
+    if data[:2] != b"BM" or len(data) < 54:
+        raise ValueError("Not a BMP file: %s" % bmp_path)
+    pixel_offset = struct.unpack("<I", data[10:14])[0]
+    width, height = struct.unpack("<ii", data[18:26])
+    bits, compression = struct.unpack("<H", data[28:30])[0], struct.unpack("<I", data[30:34])[0]
+    if bits not in (24, 32) or compression not in (0, 3) or width <= 0 or height == 0:
+        raise ValueError("Unsupported BMP layout: %d bpp, compression %d" % (bits, compression))
+    bottom_up = height > 0
+    height = abs(height)
+    channels = bits // 8
+    stride = (width * channels + 3) & ~3
+    rows = []
+    for row in range(height):
+        source = height - 1 - row if bottom_up else row
+        start = pixel_offset + source * stride
+        line = bytearray(data[start:start + width * channels])
+        rgb = bytearray(width * 3)
+        rgb[0::3] = line[2::channels]
+        rgb[1::3] = line[1::channels]
+        rgb[2::3] = line[0::channels]
+        rows.append(b"\x00" + bytes(rgb))
+    png = (b"\x89PNG\r\n\x1a\n" +
+           _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+           _png_chunk(b"IDAT", zlib.compress(b"".join(rows), 6)) +
+           _png_chunk(b"IEND", b""))
+    with open(png_path, "wb") as stream:
+        stream.write(png)
+    return width, height

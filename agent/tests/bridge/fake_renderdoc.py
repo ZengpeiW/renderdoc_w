@@ -59,6 +59,7 @@ class CompType(enum.IntEnum):
 class FileType(enum.IntEnum):
     DDS = 0
     PNG = 1
+    BMP = 3
     EXR = 7
 
 
@@ -307,6 +308,7 @@ class FakeController:
     def __init__(self) -> None:
         self.current = 9
         self.frame_events: list[int] = []
+        self.saved: list[tuple[Any, Any, str]] = []
         self.on_callback: Callable[[], None] | None = None
         self.textures = [NS(resourceId=ResourceId(100), width=4, height=4, depth=1, mips=2,
                             arraysize=1, msSamp=1, msQual=0, cubemap=False, dimension=2,
@@ -389,6 +391,15 @@ class FakeController:
 
     def SaveTexture(self, save: TextureSave, path: str) -> Any:
         width = max(1, 4 >> save.mip)
+        self.saved.append((save.destType, save.alpha, path))
+        if save.destType == FileType.BMP:
+            stride = (width * 3 + 3) & ~3
+            pixels = b"".join(bytes([10, 20, 30] * width) + b"\x00" * (stride - width * 3)
+                              for _ in range(width))
+            header = struct.pack("<2sIHHI", b"BM", 54 + len(pixels), 0, 0, 54)
+            info = struct.pack("<IiiHHIIiiII", 40, width, width, 1, 24, 0, len(pixels), 0, 0, 0, 0)
+            Path(path).write_bytes(header + info + pixels)
+            return NS(code=0)
         header = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
         Path(path).write_bytes(header + struct.pack(">II", width, width) + b"\x08\x06\x00\x00\x00")
         return NS(code=0)

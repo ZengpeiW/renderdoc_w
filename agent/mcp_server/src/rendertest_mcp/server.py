@@ -8,11 +8,13 @@ from typing import Annotated, Any, Literal
 import anyio
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from .errors import RenderTestAgentError
 from .ipc_client import BridgeClient, BridgeResponse
-from .protocol import LONG_TIMEOUT_SECONDS, METHOD_SPECS, RESULT_SCHEMA
+from .protocol import (EFFECT_ARTIFACT, EFFECT_READ, EFFECT_UI, LONG_TIMEOUT_SECONDS, METHOD_SPECS,
+                       RESULT_SCHEMA)
 
 Stage = Literal["vertex", "hull", "domain", "geometry", "pixel", "compute", "amplification", "mesh"]
 ActionFlag = Literal["draw", "dispatch", "marker", "clear", "copy", "resolve", "present"]
@@ -42,6 +44,18 @@ BufferSize = Annotated[int, Field(ge=1, le=16 * 1024 * 1024)]
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
+_ANNOTATIONS = {
+    EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
+                                 openWorldHint=False),
+    EFFECT_UI: ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+                               openWorldHint=False),
+    EFFECT_ARTIFACT: ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                     idempotentHint=False, openWorldHint=False),
+}
+
+
+def tool_effect(name: str) -> str:
+    return METHOD_SPECS.get(name, {"effect": EFFECT_READ})["effect"]
 
 
 def _clean_params(**params: Any) -> dict[str, Any]:
@@ -90,6 +104,13 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         ),
     )
 
+    def tool(**options: Any):
+        def register(function: Any) -> Any:
+            annotations = _ANNOTATIONS[tool_effect(function.__name__)]
+            return server.tool(annotations=annotations, **options)(function)
+
+        return register
+
     async def invoke(
         method: str,
         params: dict[str, Any] | None = None,
@@ -111,7 +132,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             raise _tool_error(error) from error
         return _envelope(response, METHOD_SPECS[method]["effect"])
 
-    @server.tool()
+    @tool()
     async def list_instances(include_offline: bool = False) -> dict[str, Any]:
         """List RenderTest instances that expose the agent bridge."""
         instances = await anyio.to_thread.run_sync(
@@ -130,17 +151,17 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             "meta": {},
         }
 
-    @server.tool()
+    @tool()
     async def get_status(instance_id: InstanceId = None) -> dict[str, Any]:
         """Read bridge status and the currently loaded capture."""
         return await invoke("get_status", instance_id=instance_id)
 
-    @server.tool()
+    @tool()
     async def get_context(instance_id: InstanceId = None) -> dict[str, Any]:
         """Read the current and selected EID with a compact pipeline summary."""
         return await invoke("get_context", instance_id=instance_id)
 
-    @server.tool()
+    @tool()
     async def list_actions(
         parent_event_id: OptionalEventId = None,
         cursor: Cursor = None,
@@ -160,7 +181,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def find_actions(
         query: Annotated[str, Field(min_length=1, max_length=256)],
         flags: list[ActionFlag] | None = None,
@@ -175,7 +196,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def inspect_event(
         event_id: OptionalEventId = None, instance_id: InstanceId = None
     ) -> dict[str, Any]:
@@ -184,12 +205,12 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             "inspect_event", _clean_params(event_id=event_id), instance_id=instance_id
         )
 
-    @server.tool()
+    @tool()
     async def set_event(event_id: EventId, instance_id: InstanceId = None) -> dict[str, Any]:
         """Change the selected EID in the RenderTest UI."""
         return await invoke("set_event", {"event_id": event_id}, instance_id=instance_id)
 
-    @server.tool()
+    @tool()
     async def get_pipeline_state(
         event_id: OptionalEventId = None,
         stages: list[Stage] | None = None,
@@ -203,7 +224,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def get_shader(
         stage: Stage,
         event_id: OptionalEventId = None,
@@ -223,7 +244,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def get_cbuffer(
         stage: Stage,
         event_id: OptionalEventId = None,
@@ -242,7 +263,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def list_resources(
         kind: ResourceKind | None = None,
         query: Annotated[str | None, Field(max_length=256)] = None,
@@ -257,12 +278,12 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def get_resource(resource_id: ResourceId, instance_id: InstanceId = None) -> dict[str, Any]:
         """Read detailed metadata for one resource."""
         return await invoke("get_resource", {"resource_id": resource_id}, instance_id=instance_id)
 
-    @server.tool()
+    @tool()
     async def get_resource_usage(
         resource_id: ResourceId,
         cursor: Cursor = None,
@@ -276,7 +297,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool(structured_output=False)
+    @tool(structured_output=False)
     async def export_texture(
         resource_id: ResourceId,
         event_id: OptionalEventId = None,
@@ -312,7 +333,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                     break
         return content
 
-    @server.tool()
+    @tool()
     async def pick_pixel(
         resource_id: ResourceId,
         x: NonNegativeInt,
@@ -338,7 +359,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def get_texture_stats(
         resource_id: ResourceId,
         event_id: OptionalEventId = None,
@@ -360,7 +381,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def get_buffer_data(
         resource_id: ResourceId,
         offset: NonNegativeInt = 0,
@@ -382,7 +403,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
-    @server.tool()
+    @tool()
     async def get_debug_messages(
         cursor: Cursor = None, limit: Limit = 200, instance_id: InstanceId = None
     ) -> dict[str, Any]:

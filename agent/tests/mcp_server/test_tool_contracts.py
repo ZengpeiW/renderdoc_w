@@ -37,6 +37,17 @@ def test_server_exposes_exact_p0_tools() -> None:
     assert by_name["get_resource"].inputSchema["properties"]["resource_id"]["pattern"] == r"^[0-9]{1,20}$"
 
 
+def test_tool_annotations_follow_effects() -> None:
+    server = create_server(BridgeClient(root=Path.cwd(), environ={}))
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+
+    read_only = {name for name, tool in tools.items() if tool.annotations.readOnlyHint}
+    assert read_only == set(P0_TOOL_NAMES) - {"set_event", "export_texture"}
+    for tool in tools.values():
+        assert tool.annotations.destructiveHint is False
+        assert tool.annotations.openWorldHint is False
+
+
 def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     with FakeRenderTestBridge(tmp_path) as bridge:
         server = create_server(BridgeClient(root=tmp_path, environ={}, poll_interval=0.005))

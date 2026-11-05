@@ -117,10 +117,10 @@ agent/
       test_ipc_client.py
       test_instance_selection.py
       test_tool_contracts.py
-  scripts/
-    deploy_bridge.ps1          # 本地开发时把 bridge 复制到 x64/<Config>
+  devtools/
     smoke_live.py              # 对已打开 capture 执行 P0 工具冒烟
-    print_codex_config.py      # 输出本机 MCP 配置片段
+    codex_config.py            # 输出本机 Codex MCP 配置片段或 -c 参数
+    codex_e2e.py               # 用 codex exec 跑 3 个端到端验收问题
 
 .agents/
   skills/
@@ -564,7 +564,7 @@ args = ["-m", "rendertest_mcp"]
 ### `rendertest-pixel-investigation`
 
 - 先确认目标 RT、坐标、mip、slice 和 sample。
-- 使用 `pick_pixel` 和 `pixel_history` 找到写入事件。
+- 使用 `pick_pixel` 和 `pixel_history` 找到写入事件。M4 之前没有 `pixel_history`，用 `get_resource_usage` 的写事件逐个 `pick_pixel` 比较前后值，找到“最后改变该像素”的事件，并说明这种近似的局限。
 - 对关键 Draw 使用 `debug_pixel`、`get_shader` 和 `get_cbuffer` 追踪原因。
 - 报告时列出 EID、ResourceId、坐标和实际读取值。
 
@@ -697,6 +697,22 @@ cd agent/mcp_server
 - 回答能区分实测数据和推断。
 - 只读问题不会改变 UI 选中事件。
 - 工具不支持的数据会明确说明，不编造结论。
+
+自动化：`agent/devtools/codex_e2e.py --launch <rdc>` 启动 qrendertest，自动挑一个有颜色 RT 和 Pixel Shader 的 Draw，用 `set_event` 把 UI 切过去，并通过 Bridge 算出基准答案（像素坐标、该像素最后改变的写事件）。然后用 `codex exec --json` 依次提问，MCP 配置通过 `-c` 注入，不改用户的 `config.toml`。脚本自动检查：
+
+- 调用了 rendertest MCP 工具，且包含该问题的关键工具（Q1：`get_context`/`inspect_event`；Q2：`pick_pixel` + `get_resource_usage`；Q3：`get_shader` + `get_cbuffer`）。
+- 没有调用 `set_event`，提问前后 UI 的 EID 不变。
+- 回答里出现实际 EID、RT 的 ResourceId 和基准写事件。
+
+“区分实测和推断”“不编造”需要人工看 `<root>/e2e/<时间>/` 下保存的回答和事件流。`--dry-run` 只计算基准答案，不调用模型。注意：真实运行会把 capture 中的名称、数值和路径发给 Codex 配置的模型服务。
+
+首轮实测（nanite D3D12 capture，EID 1513）的发现和处理：
+
+- Skill 中文正文被 Codex 用 Windows PowerShell 读成乱码 → Skill 正文改为英文。
+- `export_texture(channels="rgb")` 与 rgba 输出完全相同：RenderDoc 的 `SaveTexture` 只对 BMP/JPG 丢弃 alpha → rgb PNG 先导出 BMP，再在 Bridge 内转成 RGB PNG。
+- RT alpha 为 0 时 RGBA PNG 看起来全白，Agent 改用 shell 脚本解码 PNG 比较差异 → Skill 提示用 `channels="rgb"`，用 `get_texture_stats` / `pick_pixel` 比较前后写事件。
+- Q1 调用了 36 次工具（约 5.5 分钟）→ Skill 强调按问题深度取证。
+- 用户配置里的过期字段告警被当作失败 → e2e 把 Codex 配置告警单独列为 warning。
 
 ## 10. 实施顺序
 

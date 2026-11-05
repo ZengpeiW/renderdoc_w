@@ -218,6 +218,17 @@ class P0Smoke:
                 self.fail(f"exported PNG is {size}, expected {(width, height)}")
             else:
                 print(f"  PNG {artifact['path']} {size[0]}x{size[1]}")
+        rgb = self.call("export_texture", {"resource_id": rt_id, "event_id": event_id,
+                                           "channels": "rgb"}, timeout=120)
+        if rgb:
+            artifact = rgb["artifacts"][0]
+            header = Path(artifact["path"]).read_bytes()[:26]
+            if png_size(Path(artifact["path"])) != (width, height) or header[25] != 2:
+                self.fail(f"rgb export is not a {width}x{height} RGB PNG: {header[16:26].hex()}")
+            elif exported and artifact["sha256"] == exported["artifacts"][0]["sha256"]:
+                self.fail("rgb export is identical to the rgba export")
+            else:
+                print(f"  RGB PNG {artifact['path']}")
         depth = pipeline.get("depthTarget")
         if depth and depth.get("resourceId"):
             self.call("export_texture", {"resource_id": depth["resourceId"], "event_id": event_id,

@@ -5,13 +5,14 @@ import hashlib
 import struct
 import sys
 import types
+import zlib
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import rendertest_agent_bridge as bridge
-from fake_renderdoc import FakeContext, FakeReplayManager, module
+from fake_renderdoc import FakeContext, FakeReplayManager, FileType, module
 from rendertest_agent_bridge.ipc import AgentBridgeError
 from rendertest_agent_bridge.lifecycle import CaptureState
 from rendertest_agent_bridge.methods.buffers import decode_rows, parse_format
@@ -188,6 +189,22 @@ def test_texture_tools(loaded) -> None:
     assert artifact["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert artifact["source"]["mip"] == 1
     assert ctx.controller.current == 9
+
+
+def test_export_rgb_png_drops_alpha(loaded) -> None:
+    ctx, api = loaded
+    exported = call(api, "export_texture", resource_id="100", channels="rgb").result
+    artifact = exported["artifacts"][0]
+    path = Path(artifact["path"])
+    data = path.read_bytes()
+    width, height, depth, color_type = struct.unpack(">IIBB", data[16:26])
+    assert (width, height, depth, color_type) == (4, 4, 8, 2)
+    assert ctx.controller.saved[-1][0] == FileType.BMP
+    assert not list(path.parent.glob("*.bmp"))
+
+    idat = data[data.index(b"IDAT") + 4:data.index(b"IEND") - 8]
+    rows = zlib.decompress(idat)
+    assert rows[:7] == b"\x00" + bytes([30, 20, 10, 30, 20, 10])
 
 
 def test_buffer_data_inline_and_artifact(loaded) -> None:

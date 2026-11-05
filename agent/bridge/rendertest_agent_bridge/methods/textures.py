@@ -1,4 +1,6 @@
-from ..artifacts import artifact_path, describe, png_size
+import os
+
+from ..artifacts import artifact_path, bmp_to_png, describe, png_size
 from ..ipc import AgentBridgeError
 from ..values import enum_name, format_name, numbers
 from .common import (action_index, get_choice, get_int, get_resource_key, invalid,
@@ -129,15 +131,18 @@ def export_texture(runtime, context):
     key, resources, event_id, view = _prepare(runtime, context)
     handle = resources.handle(key)
     type_name, extension, media_type = EXPORT_FORMATS[file_format]
+    # SaveTexture only drops alpha for BMP/JPG, so opaque RGB PNGs go through a BMP first.
+    via_bmp = file_format == "png" and channels == "rgb"
     path = artifact_path(runtime, session_of(context),
                          "texture-%s-e%d-m%d-s%d" % (key, event_id, view["mip"], view["slice"]),
                          extension)
+    save_path = path[:-len(extension)] + "bmp" if via_bmp else path
 
     def save(controller):
         rd = renderdoc_module()
         options = rd.TextureSave()
         options.resourceId = handle
-        options.destType = getattr(rd.FileType, type_name)
+        options.destType = getattr(rd.FileType, "BMP" if via_bmp else type_name)
         options.typeCast = rd.CompType.Typeless
         options.mip = view["mip"]
         slice_mapping = options.slice
@@ -160,7 +165,7 @@ def export_texture(runtime, context):
                 mapping.blackPoint = low
                 mapping.whitePoint = high
                 options.comp = mapping
-        status = controller.SaveTexture(options, path)
+        status = controller.SaveTexture(options, save_path)
         try:
             failed = int(status.code) != 0
         except (AttributeError, TypeError, ValueError):
@@ -169,6 +174,14 @@ def export_texture(runtime, context):
             raise AgentBridgeError("REPLAY_ERROR", "SaveTexture failed: %s" % status)
 
     _, meta = runtime.replay.at_event(context, event_id, save)
+    if via_bmp:
+        try:
+            bmp_to_png(save_path, path)
+        except (OSError, ValueError) as error:
+            raise AgentBridgeError("REPLAY_ERROR", "Could not convert the RGB export: %s" % error)
+        finally:
+            if os.path.exists(save_path):
+                os.remove(save_path)
     extra = {"width": view["width"], "height": view["height"],
              "source": {"event_id": event_id, "resource_id": key, "mip": view["mip"],
                         "slice": view["slice"], "sample": view["sample"],
