@@ -6,11 +6,32 @@ namespace
 {
 const char *CodeStyle = "font-family: Consolas, 'Courier New', monospace;";
 
+QString Linkify(const QString &escaped)
+{
+  static const QRegularExpression reference(
+      lit("(?:\\b(?:EID|event)|\\x{4E8B}\\x{4EF6})\\s*[:#]?\\s*(\\d+)\\b|\\bResourceId::(\\d+)\\b"),
+      QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
+  QString html;
+  int pos = 0;
+  QRegularExpressionMatchIterator it = reference.globalMatch(escaped);
+  while(it.hasNext())
+  {
+    QRegularExpressionMatch match = it.next();
+    QString url = match.captured(1).isEmpty() ? lit("rt://resource/%1").arg(match.captured(2))
+                                              : lit("rt://event/%1").arg(match.captured(1));
+    html += escaped.mid(pos, match.capturedStart() - pos);
+    html += lit("<a href=\"%1\">%2</a>").arg(url, match.captured(0));
+    pos = match.capturedEnd();
+  }
+  html += escaped.mid(pos);
+  return html;
+}
+
 QString BoldAndLinks(const QString &escaped)
 {
   static const QRegularExpression bold(lit("\\*\\*(.+?)\\*\\*"));
   static const QRegularExpression link(lit("\\[([^\\]]+)\\]\\(([^)\\s]+)\\)"));
-  QString text = escaped;
+  QString text = Linkify(escaped);
   text.replace(bold, lit("<b>\\1</b>"));
   text.replace(link, lit("<a href=\"\\2\">\\1</a>"));
   return text;
@@ -62,7 +83,8 @@ QString AgentMarkdown::InlineToHtml(const QString &text)
     }
     html += BoldAndLinks(Escape(text.mid(pos, open - pos)));
     html += lit("<code style=\"%1 background-color: rgba(127,127,127,40);\">%2</code>")
-                .arg(QString::fromLatin1(CodeStyle), Escape(text.mid(open + 1, close - open - 1)));
+                .arg(QString::fromLatin1(CodeStyle),
+                     Linkify(Escape(text.mid(open + 1, close - open - 1))));
     pos = close + 1;
   }
   return html;

@@ -43,6 +43,7 @@
 #include <QStylePainter>
 #include <QTextEdit>
 #include <QTimer>
+#include "Code/Agent/AgentAsk.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Widgets/CollapseGroupBox.h"
@@ -5637,6 +5638,7 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
   QAction toggleBookmark(tr("Toggle &Bookmark"), this);
   QAction selectCols(tr("&Select Columns..."), this);
   QAction rgpSelect(tr("Select &RGP Event"), this);
+  QAction askAI(tr("&Ask AI about this event"), this);
   rgpSelect.setIcon(Icons::connect());
 
   contextMenu.addAction(&expandAll);
@@ -5670,6 +5672,13 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
     QObject::connect(&rgpSelect, &QAction::triggered,
                      [this, rgp]() { rgp->SelectRGPEvent(m_Ctx.CurEvent()); });
   }
+
+  const uint32_t askEID = index.isValid() ? GetSelectedEID(index) : m_Ctx.CurEvent();
+  askAI.setEnabled(m_Ctx.IsCaptureLoaded() && askEID > 0);
+  contextMenu.addSeparator();
+  contextMenu.addAction(&askAI);
+  QObject::connect(&askAI, &QAction::triggered,
+                   [this, askEID]() { AgentAsk::Request(m_Ctx, AgentAsk::Event(m_Ctx, askEID)); });
 
   contextMenu.addSeparator();
 

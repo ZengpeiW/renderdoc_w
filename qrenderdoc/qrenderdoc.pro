@@ -173,6 +173,7 @@ SOURCES += Code/qrenderdoc.cpp \
     Code/Agent/RenderTestAgentIntegration.cpp \
     Code/Agent/AgentConversation.cpp \
     Code/Agent/AgentLaunchConfig.cpp \
+    Code/Agent/AgentAsk.cpp \
     Code/Agent/AgentMarkdown.cpp \
     Code/Agent/CodexAppServerClient.cpp \
     Code/ScintillaSyntax.cpp \
@@ -269,6 +270,7 @@ HEADERS += Code/CaptureContext.h \
     Code/Agent/RenderTestAgentIntegration.h \
     Code/Agent/AgentConversation.h \
     Code/Agent/AgentLaunchConfig.h \
+    Code/Agent/AgentAsk.h \
     Code/Agent/AgentMarkdown.h \
     Code/Agent/CodexAppServerClient.h \
     Code/qprocessinfo.h \

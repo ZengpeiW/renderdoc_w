@@ -1,8 +1,8 @@
-"""End-to-end checks for the qrendertest AI panel (M5a).
+"""End-to-end checks for the qrendertest AI panel (M5a/M5b).
 
 Usage:
     python devtools/chat_panel_e2e.py [--scenario all|A1|A2|...] [--exe qrendertest.exe]
-    python devtools/chat_panel_e2e.py --real --capture FILE.rdc [--question TEXT]
+    python devtools/chat_panel_e2e.py --real --capture FILE.rdc [--question TEXT] [--ask-pixel]
 
 Fake mode points the panel at ``fake_app_server.py`` through RENDERTEST_AGENT_CODEX_COMMAND, drives
 it with the RENDERTEST_AGENT_CHAT_AUTOTEST hook and asserts on both the transcript the panel writes
@@ -356,6 +356,61 @@ def scenario_exit(run: Run) -> None:
     run.check_no_survivors(pids)
 
 
+PIXEL_CHIP = {
+    "kind": "pixel",
+    "label": "Pixel (256, 256) of Lumen.CardCaptureAlbedoAtlas",
+    "selection": {"kind": "pixel", "resource_id": "116618", "x": 256, "y": 256, "origin": "top-left",
+                  "mip": 0, "slice": 0, "sample": 0, "view": 0, "event_id": 1513},
+}
+
+
+def turn_texts(run: Run) -> list[str]:
+    return [(m["params"].get("input") or [{}])[0].get("text", "")
+            for m in run.received() if m.get("method") == "turn/start"]
+
+
+def selections(text: str) -> list[dict[str, Any]]:
+    return [json.loads(line[len("selection: "):]) for line in text.splitlines()
+            if line.startswith("selection: ")]
+
+
+def scenario_b1_ask(run: Run) -> None:
+    run.launch({"questions": ["", "follow up"],
+                "asks": [{"source": "chip", "chip": PIXEL_CHIP, "question": "why is this pixel black?"}],
+                "clickLinks": ["first-event", "rt://event/abc"]}, fake_env(run, "stream"))
+    if not run.wait_transcript(60):
+        return
+    asks = run.transcript.get("autotest", {}).get("asks", [])
+    run.check(len(asks) == 1 and asks[0].get("ok"), f"asks {asks}")
+    if asks:
+        run.check(asks[0].get("input") == "why is this pixel black?", f"prefill {asks[0].get('input')!r}")
+        labels = [chip.get("label") for chip in asks[0].get("chips", [])]
+        run.check(labels == [PIXEL_CHIP["label"]], f"chips after ask {labels}")
+        run.check(asks[0].get("panelVisible") is True, "panel not visible after ask")
+    texts = turn_texts(run)
+    run.check(len(texts) == 2, f"turn texts {len(texts)}")
+    if texts:
+        run.check(selections(texts[0]) == [PIXEL_CHIP["selection"]], f"selection {selections(texts[0])}")
+        run.check(texts[0].endswith("why is this pixel black?"), f"turn text {texts[0]!r}")
+    if len(texts) > 1:
+        run.check(selections(texts[1]) == [], "chips were not cleared after sending")
+    users = run.items("user")
+    run.check(len(users) == 2 and users[0].get("context") == [PIXEL_CHIP], f"user context {users[:1]}")
+    run.check(len(users) == 2 and "context" not in users[1], f"second user context {users[1:]}")
+    auto = run.transcript.get("autotest", {})
+    links = auto.get("renderedLinks", [])
+    run.check("rt://event/1513" in links and "rt://resource/116618" in links, f"rendered links {links}")
+    clicks = auto.get("linkClicks", [])
+    run.check(len(clicks) == 2, f"link clicks {clicks}")
+    if len(clicks) == 2:
+        run.check(clicks[0].get("link") == "rt://event/1513" and clicks[0].get("ok") is False,
+                  f"first-event click {clicks[0]}")
+        run.check(clicks[1].get("ok") is False, f"malformed link click {clicks[1]}")
+    notices = " ".join(i.get("text", "") for i in run.items("notice"))
+    run.check("No capture is loaded" in notices and "Malformed link" in notices, f"link notices {notices!r}")
+    run.check([r.get("status") for r in run.results()] == ["completed", "completed"], f"results {run.results()}")
+
+
 SCENARIOS: dict[str, Callable[[Run], None]] = {
     "A1": scenario_a1,
     "A2": scenario_a2,
@@ -366,6 +421,7 @@ SCENARIOS: dict[str, Callable[[Run], None]] = {
     "A6-logged-out": scenario_a6_logged_out,
     "A6-bad-codex": scenario_a6_bad_codex,
     "A6-bad-python": scenario_a6_bad_python,
+    "B1-ask": scenario_b1_ask,
     "exit": scenario_exit,
 }
 
@@ -417,11 +473,84 @@ def report(run: Run) -> None:
         print(f"    - {failure}")
 
 
+def run_real_ask(args) -> int:
+    """Q2/Q3 through the Texture Viewer "Ask AI" pixel entry, then clicks the first EID link."""
+    run = Run("real-ask", args.exe, DATA_DIR / "real-ask")
+    rt0 = "116618"
+    autotest = {
+        "questions": ["这个像素为什么是这个值？是哪个事件写的？", "这个像素是当前 draw 的哪个图元画的？"],
+        "asks": [{"source": "texturePixel", "resourceId": rt0, "x": 256, "y": 256},
+                 {"source": "texturePixel", "resourceId": rt0, "x": 1, "y": 1}],
+        "clickLinks": ["first-event"],
+        "waitForCapture": True, "selectEvent": args.event, "captureTimeoutMs": int(args.timeout * 1000),
+    }
+    run.launch(autotest, {}, [str(args.capture.resolve())])
+    ok = run.wait_transcript(args.timeout)
+    tree = process_tree(run.process.pid) if run.process and run.process.poll() is None else {}
+    run.close()
+    run.check_no_survivors(list(tree))
+    if ok:
+        auto = run.transcript.get("autotest", {})
+        asks = auto.get("asks", [])
+        print("asks:", json.dumps(asks, ensure_ascii=False))
+        run.check(len(asks) == 2 and all(a.get("ok") for a in asks), f"asks {asks}")
+        texts = turn_texts_from_session(run)
+        expected = [(256, 256), (1, 1)]
+        for index, text in enumerate(texts[:2]):
+            sel = selections(text)
+            print(f"Q{index + 2} selection:", sel)
+            run.check(len(sel) == 1 and sel[0].get("kind") == "pixel" and sel[0].get("resource_id") == rt0
+                      and (sel[0].get("x"), sel[0].get("y")) == expected[index]
+                      and sel[0].get("event_id") == args.event, f"Q{index + 2} selection {sel}")
+        turns = split_turns(run)
+        for index, (tools, answer) in enumerate(turns):
+            print(f"Q{index + 2} tools:", tools)
+            print(f"Q{index + 2} answer:", answer[:1500])
+        results = run.results()
+        print("results:", results)
+        run.check([r.get("status") for r in results] == ["completed", "completed"], f"results {results}")
+        if turns:
+            tools, answer = turns[0]
+            run.check("pixel_history" in tools, f"Q2 did not use pixel_history: {tools}")
+            run.check("1459" in answer, "Q2 answer does not point at EID 1459")
+        if len(turns) > 1:
+            run.check("30161" in turns[1][1], "Q3 answer does not name primitive 30161")
+        clicks = auto.get("linkClicks", [])
+        print("links:", auto.get("renderedLinks"), "clicks:", clicks)
+        run.check(len(clicks) == 1 and clicks[0].get("ok"), f"link click {clicks}")
+        if clicks and clicks[0].get("link", "").startswith("rt://event/"):
+            eid = int(clicks[0]["link"].rsplit("/", 1)[1])
+            run.check(clicks[0].get("eventAfter") == eid, f"link did not move the UI to {eid}: {clicks[0]}")
+        run.check(auto.get("eventBefore") == auto.get("eventAfter") == args.event,
+                  f"UI event changed before the click {auto.get('eventBefore')} -> {auto.get('eventAfter')}")
+    report(run)
+    return 1 if run.failures else 0
+
+
+def turn_texts_from_session(run: Run) -> list[str]:
+    return [text for text in run.session().get("turnTexts", []) if isinstance(text, str)]
+
+
+def split_turns(run: Run) -> list[tuple[list[str], str]]:
+    """Groups tool names and agent text per user message."""
+    turns: list[tuple[list[str], str]] = []
+    for item in run.transcript.get("items", []):
+        kind = item.get("kind")
+        if kind == "user":
+            turns.append(([], ""))
+        elif turns and kind == "tool":
+            turns[-1][0].append(item.get("tool"))
+        elif turns and kind == "agent":
+            turns[-1] = (turns[-1][0], turns[-1][1] + item.get("text", "") + "\n")
+    return turns
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scenario", default="all", help="all or one of: " + ", ".join(SCENARIOS))
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--real", action="store_true")
+    parser.add_argument("--ask-pixel", action="store_true", help="real mode: Q2/Q3 via the Ask AI pixel entry")
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--question", default=DEFAULT_REAL_QUESTION)
     parser.add_argument("--event", type=int, default=DEFAULT_REAL_EVENT, help="event selected before asking")
@@ -432,7 +561,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.real:
         if not args.capture:
             parser.error("--real needs --capture")
-        return run_real(args)
+        return run_real_ask(args) if args.ask_pixel else run_real(args)
 
     names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
     failed = 0

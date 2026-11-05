@@ -135,6 +135,9 @@
     <ClCompile Include="Code\Agent\AgentLaunchConfig.cpp">
       <Filter>Code\Agent</Filter>
     </ClCompile>
+    <ClCompile Include="Code\Agent\AgentAsk.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
     <ClCompile Include="Code\Agent\AgentMarkdown.cpp">
       <Filter>Code\Agent</Filter>
     </ClCompile>
@@ -846,6 +849,9 @@
       <Filter>Code\Agent</Filter>
     </ClInclude>
     <ClInclude Include="Code\Agent\AgentLaunchConfig.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\AgentAsk.h">
       <Filter>Code\Agent</Filter>
     </ClInclude>
     <ClInclude Include="Code\Agent\AgentMarkdown.h">

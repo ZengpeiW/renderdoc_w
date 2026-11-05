@@ -40,6 +40,7 @@
 #include <QTimer>
 #include <QToolTip>
 #include <QtMath>
+#include "Code/Agent/AgentAsk.h"
 #include "Code/FBXExporter.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
@@ -2835,6 +2836,7 @@ BufferViewer::BufferViewer(ICaptureContext &ctx, bool meshview, QWidget *parent)
 
   m_DebugVert = new QAction(tr("&Debug this Vertex"), this);
   m_DebugVert->setIcon(Icons::wrench());
+  m_AskAIVert = new QAction(tr("&Ask AI about this Vertex"), this);
 
   m_DebugMeshThread = new QAction(tr("&Debug Mesh Thread"), this);
   m_DebugMeshThread->setIcon(Icons::wrench());
@@ -2859,6 +2861,7 @@ BufferViewer::BufferViewer(ICaptureContext &ctx, bool meshview, QWidget *parent)
   QObject::connect(m_ExportFBX, &QAction::triggered,
                    [this] { exportData(BufferExport(BufferExport::FBX)); });
   QObject::connect(m_DebugVert, &QAction::triggered, this, &BufferViewer::debugVertex);
+  QObject::connect(m_AskAIVert, &QAction::triggered, this, &BufferViewer::askAIAboutVertex);
   QObject::connect(m_DebugMeshThread, &QAction::triggered, this, &BufferViewer::debugMeshThread);
   QObject::connect(m_RemoveFilter, &QAction::triggered,
                    [this]() { SetMeshFilter(MeshFilter::None); });
@@ -3558,6 +3561,8 @@ void BufferViewer::stageRowMenu(MeshDataStage stage, QMenu *menu, const QPoint &
     }
 
     menu->addAction(m_DebugVert);
+    m_AskAIVert->setEnabled(m_Ctx.CurAction() && idx.isValid());
+    menu->addAction(m_AskAIVert);
     menu->addSeparator();
   }
 
@@ -7272,6 +7277,26 @@ void BufferViewer::exportData(const BufferExport &params)
 
     delete f;
   }
+}
+
+void BufferViewer::askAIAboutVertex()
+{
+  if(!m_Ctx.IsCaptureLoaded() || !m_Ctx.CurAction() || !m_CurView)
+    return;
+
+  QModelIndex idx = m_CurView->selectionModel()->currentIndex();
+
+  if(!idx.isValid())
+    return;
+
+  uint32_t vertid =
+      m_CurView->model()->data(m_CurView->model()->index(idx.row(), 0), Qt::DisplayRole).toUInt();
+  uint32_t index =
+      m_CurView->model()->data(m_CurView->model()->index(idx.row(), 1), Qt::DisplayRole).toUInt();
+  QString stage = m_CurView == ui->inTable ? lit("vs_in") : lit("vs_out");
+
+  AgentAsk::Request(m_Ctx, AgentAsk::Vertex(m_Ctx, m_Ctx.CurEvent(), vertid, index,
+                                            m_Config.curInstance, m_Config.curView, stage));
 }
 
 void BufferViewer::debugVertex()

@@ -739,6 +739,7 @@
     <ClCompile Include="Code\Agent\RenderTestAgentIntegration.cpp" />
     <ClCompile Include="Code\Agent\AgentConversation.cpp" />
     <ClCompile Include="Code\Agent\AgentLaunchConfig.cpp" />
+    <ClCompile Include="Code\Agent\AgentAsk.cpp" />
     <ClCompile Include="Code\Agent\AgentMarkdown.cpp" />
     <ClCompile Include="Code\Agent\CodexAppServerClient.cpp" />
     <ClCompile Include="Styles\RDStyle\RDStyle.cpp" />
@@ -1011,6 +1012,7 @@
     <ClInclude Include="Code\Agent\RenderTestAgentIntegration.h" />
     <ClInclude Include="Code\Agent\AgentConversation.h" />
     <ClInclude Include="Code\Agent\AgentLaunchConfig.h" />
+    <ClInclude Include="Code\Agent\AgentAsk.h" />
     <ClInclude Include="Code\Agent\AgentMarkdown.h" />
     <ClInclude Include="Styles\StyleData.h" />
     <ClInclude Include="Code\qprocessinfo.h" />

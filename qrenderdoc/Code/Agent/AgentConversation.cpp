@@ -69,12 +69,13 @@ void AgentConversation::SetThread(const QString &threadId, const QString &model)
   m_Model = model;
 }
 
-void AgentConversation::AddUserMessage(const QString &text)
+void AgentConversation::AddUserMessage(const QString &text, const QJsonArray &context)
 {
   AgentItem item;
   item.kind = AgentItem::Kind::User;
   item.type = lit("userMessage");
   item.text = text;
+  item.context = context;
   m_Items << item;
 }
 
@@ -336,6 +337,8 @@ QJsonObject AgentConversation::ToJson() const
     {
       json[lit("status")] = item.status;
     }
+    if(!item.context.isEmpty())
+      json[lit("context")] = item.context;
     items << json;
   }
 

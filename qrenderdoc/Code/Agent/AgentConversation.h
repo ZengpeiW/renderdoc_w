@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
 #include <QString>
@@ -34,6 +35,8 @@ struct AgentItem
   QString error;
   QString result;
   qint64 durationMs = -1;
+  // user messages: the context chips attached when it was sent
+  QJsonArray context;
 };
 
 // Reduces app-server notifications into an ordered list of items. Has no UI dependency so it can
@@ -47,7 +50,7 @@ public:
   const QString &ThreadId() const { return m_ThreadId; }
   const QString &Model() const { return m_Model; }
 
-  void AddUserMessage(const QString &text);
+  void AddUserMessage(const QString &text, const QJsonArray &context = QJsonArray());
   void AddNotice(const QString &level, const QString &text);
 
   // the turn was requested; the id arrives with the turn/start response or turn/started

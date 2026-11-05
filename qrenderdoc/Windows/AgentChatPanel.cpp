@@ -1,5 +1,6 @@
 #include "AgentChatPanel.h"
 #include <QCoreApplication>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -9,14 +10,19 @@
 #include <QLabel>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollBar>
 #include <QTextBrowser>
 #include <QTimer>
+#include <QToolButton>
+#include <QUrl>
 #include <QVBoxLayout>
 #include "Code/Agent/AgentMarkdown.h"
 #include "Code/Agent/CodexAppServerClient.h"
 #include "Code/Agent/RenderTestAgentIntegration.h"
 #include "Code/CaptureContext.h"
+#include "Windows/TextureViewer.h"
+#include "flowlayout/FlowLayout.h"
 
 namespace
 {
@@ -48,6 +54,32 @@ QString ErrorMessage(const QJsonObject &error)
   QString message = error[lit("message")].toString();
   return message.isEmpty() ? lit("unknown error") : message;
 }
+
+QString Elide(const QString &text, int maxChars)
+{
+  if(text.size() <= maxChars)
+    return text;
+  return text.left(maxChars - 1) + Glyph(0x2026);
+}
+
+QStringList RenderedLinks(const QList<AgentItem> &items)
+{
+  static const QRegularExpression href(lit("href=\"(rt://[^\"]+)\""));
+  QStringList links;
+  for(const AgentItem &item : items)
+  {
+    if(item.kind != AgentItem::Kind::Agent)
+      continue;
+    QRegularExpressionMatchIterator it = href.globalMatch(AgentMarkdown::ToHtml(item.text));
+    while(it.hasNext())
+    {
+      QString link = it.next().captured(1);
+      if(!links.contains(link))
+        links << link;
+    }
+  }
+  return links;
+}
 }
 
 AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(parent), m_Ctx(ctx)
@@ -64,6 +96,9 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   m_View = new QTextBrowser(this);
   m_View->setOpenLinks(false);
   m_View->setOpenExternalLinks(false);
+
+  m_ContextBar = new QWidget(this);
+  m_ContextLayout = new FlowLayout(m_ContextBar, 0, 3, 3);
 
   m_Input = new QPlainTextEdit(this);
   m_Input->setPlaceholderText(tr("Ask about this capture. Enter sends, Shift+Enter adds a line."));
@@ -90,6 +125,7 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   layout->setContentsMargins(3, 3, 3, 3);
   layout->addLayout(top);
   layout->addWidget(m_View, 1);
+  layout->addWidget(m_ContextBar);
   layout->addLayout(bottom);
 
   m_RenderTimer = new QTimer(this);
@@ -112,10 +148,12 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   connect(m_Send, &QPushButton::clicked, this, &AgentChatPanel::Send);
   connect(m_StopButton, &QPushButton::clicked, this, &AgentChatPanel::Stop);
   connect(m_NewChat, &QPushButton::clicked, this, &AgentChatPanel::NewChat);
+  connect(m_View, &QTextBrowser::anchorClicked, this, &AgentChatPanel::OpenLink);
 
   m_Ctx.AddCaptureViewer(this);
 
   Render();
+  UpdateChips();
   UpdateControls();
 }
 
@@ -130,6 +168,9 @@ AgentChatPanel::~AgentChatPanel()
 
 void AgentChatPanel::OnCaptureLoaded()
 {
+  m_Chips.clear();
+  m_IncludeEvent = true;
+  UpdateChips();
   if(!m_Conversation.Items().isEmpty())
   {
     m_Conversation.AddNotice(lit("info"), tr("A capture was loaded. Earlier answers may refer to "
@@ -140,11 +181,186 @@ void AgentChatPanel::OnCaptureLoaded()
 
 void AgentChatPanel::OnCaptureClosed()
 {
+  m_Chips.clear();
+  UpdateChips();
   if(!m_Conversation.Items().isEmpty())
   {
     m_Conversation.AddNotice(lit("info"), tr("The capture was closed."));
     ScheduleRender();
   }
+}
+
+void AgentChatPanel::OnEventChanged(uint32_t eventId)
+{
+  Q_UNUSED(eventId);
+  UpdateChips();
+}
+
+void AgentChatPanel::Ask(const AgentAskRequest &request)
+{
+  AddChip(request.chip);
+
+  QString current = m_Input->toPlainText().trimmed();
+  if(!request.question.isEmpty() && (current.isEmpty() || current == m_Prefill))
+  {
+    m_Prefill = request.question;
+    m_Input->setPlainText(request.question);
+    m_Input->selectAll();
+  }
+  m_Input->setFocus(Qt::OtherFocusReason);
+}
+
+void AgentChatPanel::AddChip(const AgentContextChip &chip)
+{
+  for(int i = 0; i < m_Chips.size(); i++)
+  {
+    if(m_Chips[i].selection == chip.selection)
+      m_Chips.removeAt(i--);
+  }
+  m_Chips << chip;
+  UpdateChips();
+}
+
+QList<AgentContextChip> AgentChatPanel::ContextSnapshot() const
+{
+  QList<AgentContextChip> context;
+  if(m_IncludeEvent && m_Ctx.IsCaptureLoaded())
+  {
+    AgentContextChip current;
+    current.kind = lit("currentEvent");
+    current.label = tr("Current EID %1").arg(m_Ctx.CurEvent());
+    current.selection[lit("kind")] = current.kind;
+    current.selection[lit("event_id")] = double(m_Ctx.CurEvent());
+    current.selection[lit("selected_event_id")] = double(m_Ctx.CurSelectedEvent());
+    context << current;
+  }
+  context << m_Chips;
+  return context;
+}
+
+void AgentChatPanel::UpdateChips()
+{
+  while(QLayoutItem *item = m_ContextLayout->takeAt(0))
+  {
+    delete item->widget();
+    delete item;
+  }
+
+  const QString close = Glyph(0x00D7);
+  auto addButton = [this](const QString &text, const QString &tooltip, bool chip) {
+    QToolButton *button = new QToolButton(m_ContextBar);
+    button->setText(text);
+    button->setToolTip(tooltip);
+    button->setAutoRaise(!chip);
+    if(chip)
+      button->setStyleSheet(
+          lit("QToolButton { border: 1px solid palette(mid); border-radius: 8px; padding: 1px 6px; "
+              "background-color: rgba(58,95,138,40); }"));
+    m_ContextLayout->addWidget(button);
+    return button;
+  };
+
+  if(m_Ctx.IsCaptureLoaded())
+  {
+    if(m_IncludeEvent)
+    {
+      QToolButton *button = addButton(tr("Current EID %1 %2").arg(m_Ctx.CurEvent()).arg(close),
+                                      tr("The current event is sent with the question. Click to "
+                                         "remove it."),
+                                      true);
+      connect(button, &QToolButton::clicked, this, [this]() {
+        m_IncludeEvent = false;
+        QTimer::singleShot(0, this, &AgentChatPanel::UpdateChips);
+      });
+    }
+    else
+    {
+      QToolButton *button =
+          addButton(tr("+ Current EID"), tr("Send the current event with the question"), false);
+      connect(button, &QToolButton::clicked, this, [this]() {
+        m_IncludeEvent = true;
+        QTimer::singleShot(0, this, &AgentChatPanel::UpdateChips);
+      });
+    }
+  }
+
+  for(int i = 0; i < m_Chips.size(); i++)
+  {
+    const AgentContextChip &chip = m_Chips[i];
+    QString tooltip = QString::fromUtf8(QJsonDocument(chip.selection).toJson(QJsonDocument::Compact));
+    QToolButton *button =
+        addButton(lit("%1 %2").arg(Elide(chip.label, 48)).arg(close), tooltip, true);
+    connect(button, &QToolButton::clicked, this, [this, i]() {
+      if(i < m_Chips.size())
+        m_Chips.removeAt(i);
+      QTimer::singleShot(0, this, &AgentChatPanel::UpdateChips);
+    });
+  }
+
+  m_ContextBar->setVisible(m_ContextLayout->count() > 0);
+}
+
+QString AgentChatPanel::LinkError(const QUrl &url)
+{
+  if(url.scheme() != lit("rt"))
+  {
+    if(url.scheme() == lit("http") || url.scheme() == lit("https"))
+      return QDesktopServices::openUrl(url) ? QString() : tr("Could not open %1").arg(url.toString());
+    return tr("Unsupported link %1").arg(url.toString());
+  }
+
+  bool ok = false;
+  const qulonglong number = url.path().mid(1).toULongLong(&ok);
+  if(!ok)
+    return tr("Malformed link %1").arg(url.toString());
+  if(!m_Ctx.IsCaptureLoaded())
+    return tr("No capture is loaded.");
+
+  if(url.host() == lit("event"))
+  {
+    const ActionDescription *last = m_Ctx.GetLastAction();
+    if(number == 0 || (last && number > last->eventId))
+      return tr("EID %1 is not in this capture.").arg(number);
+    m_Ctx.SetEventID({}, uint32_t(number), uint32_t(number));
+    return QString();
+  }
+
+  if(url.host() == lit("resource"))
+  {
+    ResourceId id = AgentAsk::ResourceIdFromNumber(number);
+    if(m_Ctx.GetTexture(id))
+    {
+      m_Ctx.ShowTextureViewer();
+      m_Ctx.GetTextureViewer()->ViewTexture(id, CompType::Typeless, true);
+    }
+    else if(m_Ctx.GetBuffer(id))
+    {
+      IBufferViewer *viewer = m_Ctx.ViewBuffer(0, ~0ULL, id);
+      m_Ctx.AddDockWindow(viewer->Widget(), DockReference::MainToolArea, NULL);
+    }
+    else if(m_Ctx.GetResource(id))
+    {
+      m_Ctx.ShowResourceInspector();
+      m_Ctx.GetResourceInspector()->Inspect(id);
+    }
+    else
+    {
+      return tr("ResourceId::%1 is not in this capture.").arg(number);
+    }
+    return QString();
+  }
+
+  return tr("Unsupported link %1").arg(url.toString());
+}
+
+bool AgentChatPanel::OpenLink(const QUrl &url)
+{
+  QString error = LinkError(url);
+  if(error.isEmpty())
+    return true;
+  m_Conversation.AddNotice(lit("warning"), error);
+  ScheduleRender();
+  return false;
 }
 
 bool AgentChatPanel::eventFilter(QObject *watched, QEvent *event)
@@ -173,8 +389,16 @@ void AgentChatPanel::Send()
 
 void AgentChatPanel::SendText(const QString &text)
 {
-  m_Conversation.AddUserMessage(text);
-  m_PendingText = BuildTurnText(text);
+  QList<AgentContextChip> context = ContextSnapshot();
+  QJsonArray contextJson;
+  for(const AgentContextChip &chip : context)
+    contextJson << chip.ToJson();
+
+  m_Conversation.AddUserMessage(text, contextJson);
+  m_PendingText = BuildTurnText(text, context);
+  m_Chips.clear();
+  m_Prefill.clear();
+  UpdateChips();
   m_Conversation.BeginTurn();
   m_QuestionActive = true;
   m_StopRequested = false;
@@ -195,7 +419,7 @@ void AgentChatPanel::SendText(const QString &text)
   UpdateControls();
 }
 
-QString AgentChatPanel::BuildTurnText(const QString &question)
+QString AgentChatPanel::BuildTurnText(const QString &question, const QList<AgentContextChip> &context)
 {
   RenderTestAgentIntegration *integration = m_Ctx.AgentIntegration();
   QJsonObject manifest = integration ? integration->ReadManifest() : QJsonObject();
@@ -212,8 +436,20 @@ QString AgentChatPanel::BuildTurnText(const QString &question)
     if(!session.isEmpty())
       lines << lit("captureSessionId: %1").arg(session);
     lines << lit("capture: %1").arg(QDir::fromNativeSeparators(QString(m_Ctx.GetCaptureFilename())));
-    lines << lit("currentEventId: %1").arg(m_Ctx.CurEvent());
-    lines << lit("selectedEventId: %1").arg(m_Ctx.CurSelectedEvent());
+  }
+  for(const AgentContextChip &chip : context)
+  {
+    if(chip.kind == lit("currentEvent"))
+    {
+      lines << lit("currentEventId: %1").arg(chip.selection[lit("event_id")].toInt());
+      lines << lit("selectedEventId: %1").arg(chip.selection[lit("selected_event_id")].toInt());
+    }
+    else
+    {
+      lines << lit("selection: %1")
+                   .arg(QString::fromUtf8(
+                       QJsonDocument(chip.selection).toJson(QJsonDocument::Compact)));
+    }
   }
   lines << lit("</rendertest_context>");
   lines << QString();
@@ -614,6 +850,8 @@ void AgentChatPanel::NewChat()
     return;
   m_Conversation.Clear();
   m_HadThread = false;
+  m_IncludeEvent = true;
+  UpdateChips();
   ScheduleRender();
   UpdateControls();
 }
@@ -768,6 +1006,12 @@ QString AgentChatPanel::RenderItem(const AgentItem &item) const
     case AgentItem::Kind::User:
     {
       QString text = item.text.toHtmlEscaped().replace(lit("\n"), lit("<br/>"));
+      QStringList labels;
+      for(const QJsonValue &chip : item.context)
+        labels << Elide(chip.toObject()[lit("label")].toString(), 60).toHtmlEscaped();
+      if(!labels.isEmpty())
+        text += lit("<br/><span style=\"color:#c8d8ea;\">%1 %2</span>")
+                    .arg(tr("Context:").toHtmlEscaped(), labels.join(lit(" %1 ").arg(Glyph(0x00B7))));
       return lit("<table width=\"100%\" cellpadding=\"6\" bgcolor=\"#3a5f8a\" "
                  "style=\"margin-top:8px;\"><tr><td><span style=\"color:#ffffff;\"><b>%1</b><br/>"
                  "%2</span></td></tr></table>")
@@ -877,6 +1121,8 @@ void AgentChatPanel::RunAutotest(const QJsonObject &config)
   m_Autotest.active = true;
   for(const QJsonValue &question : config[lit("questions")].toArray())
     m_Autotest.questions << question.toString();
+  m_Autotest.asks = config[lit("asks")].toArray();
+  m_Autotest.clickLinks = config[lit("clickLinks")].toArray();
   m_Autotest.transcript = config[lit("transcript")].toString();
   m_Autotest.stopOnTool = config[lit("stopOnTool")].toString();
   m_Autotest.stopAfterMs = config[lit("stopAfterMs")].toInt(0);
@@ -907,8 +1153,9 @@ void AgentChatPanel::AutotestNext()
     m_Autotest.questions.clear();
   }
 
-  if(m_Autotest.index == 0)
+  if(!m_Autotest.prepared)
   {
+    m_Autotest.prepared = true;
     if(m_Autotest.selectEvent >= 0 && m_Ctx.IsCaptureLoaded())
       m_Ctx.SetEventID({}, uint32_t(m_Autotest.selectEvent), uint32_t(m_Autotest.selectEvent));
     m_Autotest.eventBefore = m_Ctx.IsCaptureLoaded() ? qint64(m_Ctx.CurEvent()) : -1;
@@ -916,13 +1163,21 @@ void AgentChatPanel::AutotestNext()
 
   if(m_Autotest.index >= m_Autotest.questions.size())
   {
-    WriteTranscript();
-    m_Autotest.active = false;
+    AutotestClickLinks();
+    return;
+  }
+
+  if(m_Autotest.askApplied != m_Autotest.index && m_Autotest.index < m_Autotest.asks.size() &&
+     m_Autotest.asks[m_Autotest.index].isObject())
+  {
+    m_Autotest.askApplied = m_Autotest.index;
+    AutotestAsk(m_Autotest.index, m_Autotest.asks[m_Autotest.index].toObject());
     return;
   }
 
   const int index = m_Autotest.index++;
-  m_Input->setPlainText(m_Autotest.questions[index]);
+  if(!m_Autotest.questions[index].isEmpty())
+    m_Input->setPlainText(m_Autotest.questions[index]);
   Send();
 
   if(m_Autotest.stopAfterMs > 0 && index == m_Autotest.stopQuestion)
@@ -932,6 +1187,114 @@ void AgentChatPanel::AutotestNext()
         Stop();
     });
   }
+}
+
+void AgentChatPanel::AutotestAsk(int index, const QJsonObject &ask)
+{
+  const QString source = ask[lit("source")].toString();
+  if(source == lit("chip"))
+  {
+    AgentAskRequest request;
+    request.chip = AgentContextChip::FromJson(ask[lit("chip")].toObject());
+    request.question = ask[lit("question")].toString();
+    AgentAsk::Request(m_Ctx, request);
+    AutotestAskDone(index, ask, true, QString());
+    return;
+  }
+
+  if(!m_Ctx.IsCaptureLoaded())
+  {
+    AutotestAskDone(index, ask, false, lit("no capture loaded"));
+    return;
+  }
+
+  if(source == lit("event"))
+  {
+    AgentAsk::Request(m_Ctx, AgentAsk::Event(m_Ctx, uint32_t(ask[lit("eventId")].toInt())));
+    AutotestAskDone(index, ask, true, QString());
+    return;
+  }
+
+  if(source == lit("texturePixel"))
+  {
+    const ResourceId id =
+        AgentAsk::ResourceIdFromNumber(ask[lit("resourceId")].toString().toULongLong());
+    const uint32_t x = uint32_t(ask[lit("x")].toInt());
+    const uint32_t y = uint32_t(ask[lit("y")].toInt());
+    m_Ctx.ShowTextureViewer();
+    ITextureViewer *viewer = m_Ctx.GetTextureViewer();
+    if(viewer->GetCurrentResource() != id)
+      viewer->ViewTexture(id, CompType::Typeless, false);
+
+    QTimer::singleShot(1000, this, [this, index, ask, x, y]() {
+      ITextureViewer *viewer = m_Ctx.GetTextureViewer();
+      viewer->GotoLocation(x, y);
+      QTimer::singleShot(500, this, [this, index, ask]() {
+        TextureViewer *texViewer = qobject_cast<TextureViewer *>(m_Ctx.GetTextureViewer()->Widget());
+        bool ok = texViewer && texViewer->AskAIAboutPixel();
+        AutotestAskDone(index, ask, ok,
+                        ok ? QString() : lit("the texture viewer had no picked pixel"));
+      });
+    });
+    return;
+  }
+
+  AutotestAskDone(index, ask, false, lit("unknown ask source %1").arg(source));
+}
+
+void AgentChatPanel::AutotestAskDone(int index, const QJsonObject &ask, bool ok, const QString &error)
+{
+  QJsonArray chips;
+  for(const AgentContextChip &chip : ContextSnapshot())
+    chips << chip.ToJson();
+
+  QJsonObject result;
+  result[lit("index")] = index;
+  result[lit("source")] = ask[lit("source")].toString();
+  result[lit("ok")] = ok;
+  if(!error.isEmpty())
+    result[lit("error")] = error;
+  result[lit("chips")] = chips;
+  result[lit("input")] = m_Input->toPlainText();
+  result[lit("panelVisible")] = isVisible();
+  result[lit("inputFocused")] = m_Input->hasFocus();
+  m_Autotest.askResults << result;
+
+  QTimer::singleShot(300, this, &AgentChatPanel::AutotestNext);
+}
+
+void AgentChatPanel::AutotestClickLinks()
+{
+  m_Autotest.eventAfter = m_Ctx.IsCaptureLoaded() ? qint64(m_Ctx.CurEvent()) : -1;
+
+  const QStringList rendered = RenderedLinks(m_Conversation.Items());
+  for(const QJsonValue &value : m_Autotest.clickLinks)
+  {
+    QString link = value.toString();
+    if(link == lit("first-event") || link == lit("first-resource"))
+    {
+      QString prefix = link == lit("first-event") ? lit("rt://event/") : lit("rt://resource/");
+      link.clear();
+      for(const QString &candidate : rendered)
+      {
+        if(candidate.startsWith(prefix))
+        {
+          link = candidate;
+          break;
+        }
+      }
+    }
+
+    QJsonObject click;
+    click[lit("requested")] = value.toString();
+    click[lit("link")] = link;
+    click[lit("ok")] = !link.isEmpty() && OpenLink(QUrl(link));
+    click[lit("eventAfter")] = m_Ctx.IsCaptureLoaded() ? double(m_Ctx.CurEvent()) : -1.0;
+    m_Autotest.linkClicks << click;
+  }
+
+  WriteTranscript();
+  m_Autotest.active = false;
 }
 
 void AgentChatPanel::WriteTranscript()
@@ -966,7 +1329,10 @@ void AgentChatPanel::WriteTranscript()
   autotest[lit("results")] = m_Autotest.results;
   autotest[lit("elapsedMs")] = double(m_Autotest.clock.elapsed());
   autotest[lit("eventBefore")] = double(m_Autotest.eventBefore);
-  autotest[lit("eventAfter")] = m_Ctx.IsCaptureLoaded() ? double(m_Ctx.CurEvent()) : -1.0;
+  autotest[lit("eventAfter")] = double(m_Autotest.eventAfter);
+  autotest[lit("asks")] = m_Autotest.askResults;
+  autotest[lit("renderedLinks")] = QJsonArray::fromStringList(RenderedLinks(m_Conversation.Items()));
+  autotest[lit("linkClicks")] = m_Autotest.linkClicks;
   transcript[lit("autotest")] = autotest;
 
   if(m_Autotest.transcript.isEmpty())

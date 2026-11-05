@@ -127,7 +127,7 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "E:\Captures\some.rdc"
 ```
 
-## qrendertest 内的 AI 面板（M5a）
+## qrendertest 内的 AI 面板（M5a/M5b）
 
 菜单 `Window → AI Assistant` 打开可停靠面板。第一次发送消息时，面板启动 `codex app-server`，并把 rendertest MCP 绑定到本窗口的 Bridge 实例；不需要改 `~/.codex/config.toml`。
 
@@ -135,6 +135,13 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 - 只读：thread 使用 `read-only` 沙箱和 `never` 审批，所有审批请求都会被拒绝；默认关闭 shell、web search 和其它 MCP server。
 - 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息会新建 thread。“New Chat”清空对话。
 - 每条消息前会附上 `<rendertest_context>`（实例 id、capture、当前 EID），这是发送时的快照。
+- 上下文 chip：输入框上方显示本条消息会带上的上下文。“Current EID”默认附带，点 × 去掉，点 “+ Current EID” 加回；其它 chip 发送后清空，并显示在用户气泡下方。每个 chip 以 `selection: {json}` 写进 `<rendertest_context>`，字段名和 MCP 工具参数一致（`event_id`、`resource_id`、`x`/`y`（左上原点）、`mip`、`slice`、`sample`、`vertex`、`instance`、`view`）。
+- “问 AI”入口（只添加 chip 并预填可编辑的问题，不自动发送）：
+  - Event Browser 右键 → `Ask AI about this event`
+  - Texture Viewer 缩略图右键 → `Ask AI about this resource`
+  - Texture Viewer 的 Pixel Context 面板 → `Ask AI`（用当前拾取的像素，坐标换算和 Pixel History 一致）
+  - Mesh Viewer VS In / VS Out 表格右键 → `Ask AI about this Vertex`
+- 回答里的 `EID 1459`、`event 1459`、`ResourceId::116618` 会变成链接：点击 EID 跳到该事件；点击资源时纹理在 Texture Viewer 打开，缓冲在 Buffer Viewer 打开，其它资源在 Resource Inspector 打开。
 - 日志：`<agent root>/logs/chat-<instanceId>.log`，包含启动参数和 app-server 的 stderr 尾部。
 
 环境变量：
@@ -151,6 +158,8 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py
 # 真实 codex：选中 EID 后提问、第二问中途 Stop、退出后检查进程树（会把 capture 数据发给模型）
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --real --capture "E:\Captures\some.rdc" --event 1513
+# 真实 codex：通过 Texture Viewer 的 Ask AI 像素入口问 Q2 (256,256) / Q3 (1,1)，再点击回答里的第一个 EID 链接
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --real --ask-pixel --capture "E:\Captures\some.rdc" --event 1513
 ```
 
 ## 用 fake Bridge 手动试用

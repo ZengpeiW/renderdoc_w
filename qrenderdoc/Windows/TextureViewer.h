@@ -41,6 +41,7 @@ class ResourcePreview;
 class ThumbnailStrip;
 class TextureGoto;
 class QFileSystemWatcher;
+class QPushButton;
 class TextureViewer;
 
 struct Following
@@ -156,6 +157,10 @@ public:
   void SetHistogramRange(float blackpoint, float whitepoint) override;
 
   uint32_t GetChannelVisibilityBits() override;
+
+  // attaches the picked pixel to the AI panel; false if no pixel is picked
+  bool AskAIAboutPixel();
+
   rdcfixedarray<bool, 4> GetChannelVisibility() override;
   void SetChannelVisibility(bool red, bool green, bool blue, bool alpha) override;
 
@@ -346,6 +351,7 @@ private:
   int m_ResourceCacheID = -1;
 
   TextureGoto *m_Goto;
+  QPushButton *m_AskAIPixel = NULL;
 
   Ui::TextureViewer *ui;
   ICaptureContext &m_Ctx;

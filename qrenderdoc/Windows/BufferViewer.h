@@ -169,6 +169,7 @@ private slots:
   void updateExportActionNames();
   void exportData(const BufferExport &params);
   void debugVertex();
+  void askAIAboutVertex();
   void debugMeshThread();
   void meshDebugSelector_beginDebug(const rdcfixedarray<uint32_t, 3> &group,
                                     const rdcfixedarray<uint32_t, 3> &thread);
@@ -336,6 +337,7 @@ private:
   QAction *m_ExportBytes = NULL;
   QAction *m_ExportFBX = NULL;
   QAction *m_DebugVert = NULL;
+  QAction *m_AskAIVert = NULL;
   QAction *m_DebugMeshThread = NULL;
   QAction *m_FilterMesh = NULL;
   QAction *m_RemoveFilter = NULL;

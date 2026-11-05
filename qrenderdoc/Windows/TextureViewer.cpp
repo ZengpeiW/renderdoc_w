@@ -34,7 +34,9 @@
 #include <QMenu>
 #include <QPainter>
 #include <QPointer>
+#include <QPushButton>
 #include <QStyledItemDelegate>
+#include "Code/Agent/AgentAsk.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Dialogs/TextureSaveDialog.h"
@@ -448,6 +450,8 @@ void TextureViewer::UI_UpdateCachedTexture()
       ui->debugPixelContext->setToolTip(tr("Shader Debugging not supported on this API"));
     }
 
+    m_AskAIPixel->setEnabled(true);
+
     if(m_Ctx.APIProps().pixelHistory)
     {
       ui->pixelHistory->setEnabled(true);
@@ -465,6 +469,7 @@ void TextureViewer::UI_UpdateCachedTexture()
     ui->debugPixelContext->setToolTip(tr("No active texture selected"));
     ui->pixelHistory->setEnabled(false);
     ui->pixelHistory->setToolTip(tr("No active texture selected"));
+    m_AskAIPixel->setEnabled(false);
   }
 }
 
@@ -615,6 +620,12 @@ TextureViewer::TextureViewer(ICaptureContext &ctx, QWidget *parent)
   Ui_TextureViewer *u = ui;
   u->pixelcontextgrid->setAlignment(u->pixelHistory, Qt::AlignCenter);
   u->pixelcontextgrid->setAlignment(u->debugPixelContext, Qt::AlignCenter);
+
+  m_AskAIPixel = new QPushButton(tr("Ask AI"), this);
+  m_AskAIPixel->setToolTip(tr("Ask the AI assistant about the picked pixel"));
+  m_AskAIPixel->setEnabled(false);
+  u->pixelcontextgrid->addWidget(m_AskAIPixel, 2, 0, 1, 2, Qt::AlignCenter);
+  QObject::connect(m_AskAIPixel, &QPushButton::clicked, [this]() { AskAIAboutPixel(); });
 
   QWidget *statusflowWidget = new QWidget(this);
 
@@ -2360,6 +2371,7 @@ void TextureViewer::OpenResourceContextMenu(ResourceId id, bool input,
 
   QAction openLockedTab(tr("Open new Locked Tab"), this);
   QAction openResourceInspector(tr("Open in Resource Inspector"), this);
+  QAction askAI(tr("Ask AI about this resource"), this);
   QAction usageTitle(tr("Used:"), this);
   QAction imageLayout(this);
 
@@ -2377,6 +2389,7 @@ void TextureViewer::OpenResourceContextMenu(ResourceId id, bool input,
   {
     contextMenu.addAction(&openLockedTab);
     contextMenu.addAction(&openResourceInspector);
+    contextMenu.addAction(&askAI);
 
     contextMenu.addSeparator();
     m_Ctx.Extensions().MenuDisplaying(input ? ContextMenu::TextureViewer_InputThumbnail
@@ -2395,6 +2408,10 @@ void TextureViewer::OpenResourceContextMenu(ResourceId id, bool input,
       m_Ctx.ShowResourceInspector();
 
       m_Ctx.GetResourceInspector()->Inspect(id);
+    });
+
+    QObject::connect(&askAI, &QAction::triggered, [this, id]() {
+      AgentAsk::Request(m_Ctx, AgentAsk::Resource(m_Ctx, id, m_Ctx.CurEvent()));
     });
 
     CombineUsageEvents(m_Ctx, usage, false,
@@ -2941,6 +2958,7 @@ void TextureViewer::OnCaptureLoaded()
 
   ui->debugPixelContext->setEnabled(false);
   ui->pixelHistory->setToolTip(QString());
+  m_AskAIPixel->setEnabled(false);
 
   m_TexDisplay.backgroundColor =
       backCol.isValid() ? FloatVector(backCol.redF(), backCol.greenF(), backCol.blueF(), 1.0f)
@@ -2999,6 +3017,8 @@ void TextureViewer::Reset()
   ui->pixelHistory->setToolTip(QString());
   ui->debugPixelContext->setEnabled(false);
   ui->debugPixelContext->setToolTip(QString());
+  if(m_AskAIPixel)
+    m_AskAIPixel->setEnabled(false);
 
   ui->texStatusName->setText(QString());
   ui->texStatusDim->setText(QString());
@@ -4164,6 +4184,29 @@ void TextureViewer::on_debugPixelContext_clicked()
   IShaderViewer *s = m_Ctx.DebugShader(shaderDetails, pipeline, trace, debugContext);
 
   m_Ctx.AddDockWindow(s->Widget(), DockReference::AddTo, this);
+}
+
+bool TextureViewer::AskAIAboutPixel()
+{
+  TextureDescription *texptr = GetCurrentTexture();
+
+  if(!texptr || m_PickedPoint.x() < 0 || m_PickedPoint.y() < 0)
+    return false;
+
+  int x = MipCoordFromBase(m_PickedPoint.x(), texptr->width);
+  int y = MipCoordFromBase(m_PickedPoint.y(), texptr->height);
+
+  uint32_t mipHeight = qMax(1U, texptr->height >> (int)m_TexDisplay.subresource.mip);
+
+  if(m_TexDisplay.flipY)
+    y = (int)(mipHeight - 1) - y;
+
+  uint32_t view = m_TexDisplay.subresource.slice - m_Following.GetFirstArraySlice(m_Ctx);
+  AgentAsk::Request(m_Ctx,
+                    AgentAsk::Pixel(m_Ctx, texptr->resourceId, (uint32_t)x, (uint32_t)y,
+                                    m_TexDisplay.subresource.mip, m_TexDisplay.subresource.slice,
+                                    m_TexDisplay.subresource.sample, view, m_Ctx.CurEvent()));
+  return true;
 }
 
 void TextureViewer::on_pixelHistory_clicked()

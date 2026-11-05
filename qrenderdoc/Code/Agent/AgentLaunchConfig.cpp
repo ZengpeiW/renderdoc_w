@@ -192,6 +192,18 @@ QString AgentLaunchConfig::DeveloperInstructions(const QString &instanceId)
              "when the message was sent. The UI may have moved since, so pass `event_id` "
              "explicitly to tools, and pass ResourceIds as decimal strings without the "
              "`ResourceId::` prefix.\n"
+             "- `selection:` lines in that block are JSON objects the user attached from the UI "
+             "(kind event, resource, pixel or vertex). Their fields use the rendertest tool "
+             "argument names (event_id, resource_id, x, y with a top-left origin, mip, slice, "
+             "sample, vertex, instance, view), so use them directly instead of asking the user. "
+             "For a pixel, start with `pick_pixel` and `pixel_history` on that resource; for a "
+             "vertex, use `debug_vertex` or `get_mesh_data`.\n"
+             "- The rendertest server provides get_status, get_context, list_actions, "
+             "find_actions, inspect_event, get_pipeline_state, get_shader, get_cbuffer, "
+             "list_resources, get_resource, get_resource_usage, export_texture, pick_pixel, "
+             "get_texture_stats, pixel_history, debug_pixel, debug_vertex, get_mesh_data, "
+             "get_buffer_data and get_debug_messages. If one of them is not loaded yet, search "
+             "for it instead of saying it is unavailable.\n"
              "- You cannot run shell commands or write files; rely on the rendertest tools.")
       .arg(instance);
 }
