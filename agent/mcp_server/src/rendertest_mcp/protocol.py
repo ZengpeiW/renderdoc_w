@@ -95,3 +95,7 @@ P0_TOOL_NAMES = (
     "get_buffer_data",
     "get_debug_messages",
 )
+
+P1_TOOL_NAMES = ("pixel_history",)
+
+TOOL_NAMES = P0_TOOL_NAMES + P1_TOOL_NAMES

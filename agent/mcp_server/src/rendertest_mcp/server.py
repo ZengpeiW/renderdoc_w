@@ -21,6 +21,7 @@ ActionFlag = Literal["draw", "dispatch", "marker", "clear", "copy", "resolve", "
 ResourceKind = Literal["texture", "buffer", "shader", "pipeline", "sampler", "other"]
 TextureFormat = Literal["png", "exr", "dds"]
 TextureChannels = Literal["rgba", "rgb", "r", "g", "b", "a", "depth", "stencil"]
+HistoryOrder = Literal["newest", "oldest"]
 
 EventId = Annotated[int, Field(ge=0, description="RenderDoc event ID (EID).")]
 OptionalEventId = Annotated[
@@ -42,7 +43,7 @@ Limit = Annotated[int, Field(ge=1, le=1000, description="Maximum number of items
 NonNegativeInt = Annotated[int, Field(ge=0)]
 BufferSize = Annotated[int, Field(ge=1, le=16 * 1024 * 1024)]
 
-_LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data"})
+_LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data", "pixel_history"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -377,6 +378,46 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                 mip=mip,
                 slice=slice,
                 sample=sample,
+            ),
+            instance_id=instance_id,
+        )
+
+    @tool()
+    async def pixel_history(
+        resource_id: ResourceId,
+        x: NonNegativeInt,
+        y: NonNegativeInt,
+        event_id: OptionalEventId = None,
+        mip: NonNegativeInt = 0,
+        slice: NonNegativeInt = 0,
+        sample: NonNegativeInt = 0,
+        order: HistoryOrder = "newest",
+        include_fragments: bool = False,
+        cursor: Cursor = None,
+        limit: Limit = 50,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """List the events that modified one texel up to an EID (top-left origin).
+
+        Each event has its fragment counts, failure reasons (depth/stencil/discard/...), and the
+        value before the event, from the shader and after it. The summary names the last passing
+        and last changing events. include_fragments adds up to 64 per-fragment entries per event.
+        This replays the frame and can take seconds on large captures.
+        """
+        return await invoke(
+            "pixel_history",
+            _clean_params(
+                resource_id=resource_id,
+                x=x,
+                y=y,
+                event_id=event_id,
+                mip=mip,
+                slice=slice,
+                sample=sample,
+                order=order,
+                include_fragments=include_fragments,
+                cursor=cursor,
+                limit=limit,
             ),
             instance_id=instance_id,
         )

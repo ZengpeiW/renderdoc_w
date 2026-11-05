@@ -10,7 +10,7 @@ from mcp.client.stdio import stdio_client
 from mcp.types import ImageContent
 
 from fake_bridge import FakeRenderTestBridge
-from rendertest_mcp.protocol import P0_TOOL_NAMES
+from rendertest_mcp.protocol import TOOL_NAMES
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2] / "mcp_server" / "src"
 
@@ -29,7 +29,7 @@ def test_stdio_server_round_trip(tmp_path: Path) -> None:
                     await session.initialize()
 
                     tools = await session.list_tools()
-                    assert {tool.name for tool in tools.tools} == set(P0_TOOL_NAMES)
+                    assert {tool.name for tool in tools.tools} == set(TOOL_NAMES)
 
                     status = await session.call_tool("get_status", {})
                     assert not status.isError

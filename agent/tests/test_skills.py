@@ -18,7 +18,7 @@ EXPECTED_SKILLS = {
     "rendertest-shader-debug",
     "rendertest-pixel-investigation",
 }
-FUTURE_TOOLS = {"pixel_history", "debug_pixel", "debug_vertex", "get_mesh_data"}
+FUTURE_TOOLS = {"debug_pixel", "debug_vertex", "get_mesh_data"}
 
 _FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 _CALL = re.compile(r"`([a-z][a-z0-9_]+)\(([^`]*)\)`")

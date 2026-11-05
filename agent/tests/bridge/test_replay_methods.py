@@ -60,7 +60,8 @@ def test_manifest_lists_p0_methods(loaded) -> None:
     _, api = loaded
     methods = call(api, "get_status").result["data"]["bridge"]["methods"]
     assert {"list_actions", "inspect_event", "export_texture", "get_debug_messages"} <= set(methods)
-    assert "pixel_history" not in methods
+    assert "pixel_history" in methods
+    assert "debug_pixel" not in methods
 
 
 def test_list_and_find_actions(loaded) -> None:
@@ -165,7 +166,8 @@ def test_resources_and_usage(loaded) -> None:
     assert error_code(api, "get_resource", resource_id="999") == "INVALID_RESOURCE"
 
     usage = call(api, "get_resource_usage", resource_id="100").result["data"]["usages"]
-    assert [(item["eventId"], item["access"]) for item in usage] == [(5, "write"), (8, "read")]
+    assert [(item["eventId"], item["access"]) for item in usage] == \
+        [(5, "write"), (7, "write"), (8, "read")]
     assert usage[0]["actionName"] == "DrawIndexed(36)"
 
 
@@ -189,6 +191,70 @@ def test_texture_tools(loaded) -> None:
     assert artifact["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert artifact["source"]["mip"] == 1
     assert ctx.controller.current == 9
+
+
+def test_pixel_history(loaded) -> None:
+    ctx, api = loaded
+    controller = ctx.controller
+    controller.frame_events.clear()
+
+    response = call(api, "pixel_history", resource_id="100", x=1, y=2, event_id=5)
+    data = response.result["data"]
+    assert data["total"] == 1 and data["order"] == "newest"
+    event = data["events"][0]
+    assert event["eventId"] == 5 and event["actionName"] == "DrawIndexed(36)"
+    assert (event["fragmentCount"], event["passedCount"], event["passed"]) == (2, 1, True)
+    assert event["failureCounts"] == {"depthTestFailed": 1}
+    assert event["primitiveIds"] == [3] and event["changed"] is True
+    assert event["preMod"] == {"color": [0.0, 0.0, 0.0, 1.0], "depth": None, "stencil": None}
+    assert event["shaderOut"]["depth"] == 0.25
+    assert event["postMod"]["color"] == [0.5, 0.5, 0.5, 1.0]
+    assert "fragments" not in event
+    summary = data["summary"]
+    assert summary["lastPassedEventId"] == 5 and summary["lastChangedEventId"] == 5
+    assert summary["eventCount"] == 1 and summary["fragmentCount"] == 2
+    assert data["discardEventIds"] == []
+    assert response.meta["replayEventRestored"] is True
+    assert controller.history_calls == [(5, 1, 2, 0)]
+    assert controller.current == 9
+
+    fragments = call(api, "pixel_history", resource_id="100", x=1, y=2, event_id=5,
+                     include_fragments=True).result["data"]["events"][0]["fragments"]
+    assert [(item["fragIndex"], item["passed"]) for item in fragments] == [(0, True), (1, False)]
+    assert fragments[1]["failures"] == ["depthTestFailed"] and fragments[1]["preMod"] is None
+    assert len(controller.history_calls) == 1
+
+    full = call(api, "pixel_history", resource_id="100", x=1, y=2, event_id=9, order="oldest",
+                limit=1).result
+    assert [item["eventId"] for item in full["data"]["events"]] == [5]
+    assert full["data"]["summary"]["lastChangedEventId"] == 8
+    assert full["data"]["summary"]["finalValue"]["color"] == [0.0, 0.0, 0.0, 1.0]
+    assert full["data"]["discardEventIds"] == [7]
+    assert not full["warnings"]
+    rest = call(api, "pixel_history", resource_id="100", x=1, y=2, event_id=9, order="oldest",
+                limit=1, cursor=full["nextCursor"]).result
+    assert [item["eventId"] for item in rest["data"]["events"]] == [8]
+    assert rest["data"]["events"][0]["directShaderWrite"] is True
+    assert rest["nextCursor"] is None
+    assert len(controller.history_calls) == 2
+    assert error_code(api, "pixel_history", resource_id="100", x=1, y=2, event_id=9,
+                      cursor=full["nextCursor"]) == "INVALID_REQUEST"
+
+    assert error_code(api, "pixel_history", resource_id="100", x=4, y=0) == "INVALID_REQUEST"
+    assert error_code(api, "pixel_history", resource_id="200", x=0, y=0) == "INVALID_RESOURCE"
+    assert error_code(api, "pixel_history", resource_id="100", x=0, y=0,
+                      order="sideways") == "INVALID_REQUEST"
+    controller.pixel_history_supported = False
+    assert error_code(api, "pixel_history", resource_id="100", x=0, y=0) == "UNSUPPORTED"
+
+
+def test_pixel_history_warns_about_discards(loaded) -> None:
+    ctx, api = loaded
+    ctx.controller.PixelHistory = lambda *args: []
+    result = call(api, "pixel_history", resource_id="100", x=0, y=0, event_id=9).result
+    assert result["data"]["summary"]["lastPassedEventId"] is None
+    assert result["data"]["events"] == []
+    assert len(result["warnings"]) == 2 and "Discard events 7" in result["warnings"][1]
 
 
 def test_export_rgb_png_drops_alpha(loaded) -> None:

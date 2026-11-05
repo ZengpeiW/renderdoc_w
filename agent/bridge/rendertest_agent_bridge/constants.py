@@ -83,3 +83,5 @@ P0_METHODS = (
     "get_buffer_data",
     "get_debug_messages",
 )
+
+P1_METHODS = ("pixel_history",)

@@ -2,12 +2,13 @@
 
 RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打开的 capture。设计见 [docs/MVP_DESIGN.md](docs/MVP_DESIGN.md)。
 
-当前进度：**M3 Agent 工作流**。
+当前进度：**M4 P1 调试工具（进行中：`pixel_history` 已完成）**。
 
 - M0：MCP Server、文件 mailbox IPC、fake Bridge 和协议测试。
 - M1：qrendertest 启动时从 `integrations/rendertest_agent/python` 固定加载 Bridge，写实例清单和心跳，跟踪 capture 加载、关闭和选中事件，支持 `ping` / `get_status` / `get_context`。
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
+- M4：`pixel_history` 已完成；`debug_pixel`、`debug_vertex`、`get_mesh_data` 待做。
 
 ## P0 工具
 
@@ -20,6 +21,12 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
 | Buffer | `get_buffer_data`（64 KiB 内 base64，1 KiB 内附 hex，更大写 artifact；`format="float4, uint"` 可解码行） |
 | 消息 | `get_debug_messages` |
+
+## P1 工具（M4）
+
+| 工具 | 说明 |
+| --- | --- |
+| `pixel_history` | 截至目标 EID 修改过某个像素的事件，默认新到旧，按事件分组：片元数、通过数、失败原因计数（深度/模板/discard/裁剪…）、通过片元的 primitive、`preMod`/`shaderOut`/`postMod`（color/depth/stencil）。`summary` 给出最后通过和最后改变值的 EID；`include_fragments=true` 每个事件附最多 64 个片元。RenderDoc 的像素历史不含 `Discard`，这类事件放在 `discardEventIds` 里并给出 warning。结果按 capture session 缓存，翻页不会重放。 |
 
 约定：
 
@@ -49,7 +56,7 @@ agent/
 - `rendertest-core`：目标选择、capture/session 身份、工具效果、实测与推断的区分。
 - `rendertest-event-analysis`：解释 EID/pass 的输入、计算和输出。
 - `rendertest-shader-debug`：Shader 反射、绑定、CBuffer 和反汇编。
-- `rendertest-pixel-investigation`：像素取值、最后改变它的事件、原因排查（M4 前用资源用途近似像素历史）。
+- `rendertest-pixel-investigation`：像素取值、用 `pixel_history` 找最后改变它的事件和失败原因；不支持时退回资源用途比较。
 
 ## 环境
 
@@ -83,6 +90,8 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --expect-
 
 # 启动 qrendertest 打开 capture，跑全部 P0 工具后退出
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc"
+# 额外检查指定像素的 pixel_history（可重复）
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc" --pixel-history 116618:1513:1:1
 
 # 自动跑完整生命周期
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\live_lifecycle.py --capture "E:\Captures\some.rdc"

@@ -309,6 +309,8 @@ class FakeController:
         self.current = 9
         self.frame_events: list[int] = []
         self.saved: list[tuple[Any, Any, str]] = []
+        self.history_calls: list[tuple[int, int, int, int]] = []
+        self.pixel_history_supported = True
         self.on_callback: Callable[[], None] | None = None
         self.textures = [NS(resourceId=ResourceId(100), width=4, height=4, depth=1, mips=2,
                             arraysize=1, msSamp=1, msQual=0, cubemap=False, dimension=2,
@@ -363,7 +365,36 @@ class FakeController:
 
     def GetUsage(self, resource: ResourceId) -> list[Any]:
         return [NS(eventId=5, usage=NS(name="ColorTarget")),
+                NS(eventId=7, usage=NS(name="Discard")),
                 NS(eventId=8, usage=NS(name="CS_Resource"))]
+
+    def GetAPIProperties(self) -> Any:
+        return NS(pixelHistory=self.pixel_history_supported)
+
+    def PixelHistory(self, texture: ResourceId, x: int, y: int, sub: Subresource,
+                     cast: CompType) -> list[Any]:
+        self.history_calls.append((self.current, x, y, sub.mip))
+
+        def value(level: float, depth: float = -1.0, stencil: int = -1) -> Any:
+            raw = int(level * 255)
+            return NS(col=NS(floatValue=(level, level, level, 1.0), uintValue=(raw, raw, raw, 255),
+                             intValue=(raw, raw, raw, 255)), depth=depth, stencil=stencil)
+
+        invalid = NS(col=NS(floatValue=(0.0,) * 4, uintValue=(0xdeadbeef, 0xdeadf00d, 0, 0),
+                            intValue=(0,) * 4), depth=-1.0, stencil=-1)
+        flags = dict(sampleMasked=False, backfaceCulled=False, depthClipped=False,
+                     depthBoundsFailed=False, viewClipped=False, scissorClipped=False,
+                     shaderDiscarded=False, depthTestFailed=False, stencilTestFailed=False,
+                     predicationSkipped=False)
+        return [
+            NS(eventId=5, directShaderWrite=False, unboundPS=False, fragIndex=0, primitiveID=3,
+               preMod=value(0.0), shaderOut=value(0.5, 0.25), postMod=value(0.5), **flags),
+            NS(eventId=5, directShaderWrite=False, unboundPS=False, fragIndex=1, primitiveID=4,
+               preMod=invalid, shaderOut=value(1.0, 0.75), postMod=value(0.5),
+               **dict(flags, depthTestFailed=True)),
+            NS(eventId=8, directShaderWrite=True, unboundPS=False, fragIndex=0, primitiveID=0,
+               preMod=value(0.5), shaderOut=value(0.0), postMod=value(0.0), **flags),
+        ]
 
     def GetDisassemblyTargets(self, with_pipeline: bool) -> list[str]:
         return ["DXIL", "HLSL"]

@@ -448,7 +448,7 @@ args = ["-m", "rendertest_mcp"]
 
 | 工具 | 效果 | 主要参数 | 返回内容 |
 | --- | --- | --- | --- |
-| `pixel_history` | read | `resource_id`, `x`, `y`, `event_id?`, `sample?` | 截至目标 EID 的像素修改历史 |
+| `pixel_history` | read | `resource_id`, `x`, `y`, `event_id?`, `mip?`, `slice?`, `sample?`, `order?`, `include_fragments?`, `cursor?`, `limit?` | 截至目标 EID 的像素修改历史，按事件分组（片元/失败原因计数、前后值），附 summary 和 discard 事件（M4 已实现） |
 | `debug_pixel` | artifact | `event_id`, `x`, `y`, `sample?`, `primitive?`, `max_steps?` | 调试摘要、关键变量、完整 trace artifact |
 | `debug_vertex` | artifact | `event_id`, `vertex`, `instance?`, `view?`, `max_steps?` | 调试摘要、输出变量、完整 trace artifact |
 | `get_mesh_data` | read/artifact | `event_id`, `stage`, `cursor?`, `limit?` | Post-VS 输入输出布局和顶点数据 |
@@ -564,7 +564,7 @@ args = ["-m", "rendertest_mcp"]
 ### `rendertest-pixel-investigation`
 
 - 先确认目标 RT、坐标、mip、slice 和 sample。
-- 使用 `pick_pixel` 和 `pixel_history` 找到写入事件。M4 之前没有 `pixel_history`，用 `get_resource_usage` 的写事件逐个 `pick_pixel` 比较前后值，找到“最后改变该像素”的事件，并说明这种近似的局限。
+- 使用 `pick_pixel` 和 `pixel_history` 找到写入事件和片元失败原因。API 不支持像素历史（`UNSUPPORTED`）或历史为空时，用 `get_resource_usage` 的写事件逐个 `pick_pixel` 比较前后值，并说明这种近似的局限。
 - 对关键 Draw 使用 `debug_pixel`、`get_shader` 和 `get_cbuffer` 追踪原因。
 - 报告时列出 EID、ResourceId、坐标和实际读取值。
 
@@ -661,6 +661,16 @@ cd agent/mcp_server
 - 每个响应都小于 8 MiB，大数据通过 artifact 返回。
 - 工具执行期间 qrendertest UI 仍可操作。
 
+M4 `pixel_history` 实机验收（`--pixel-history RESOURCE:EID:X:Y` 可追加指定像素）：
+
+```powershell
+.\.venv\Scripts\python.exe ..\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc" --pixel-history 116618:1513:1:1
+```
+
+- 事件按 EID 新到旧且不超过目标 EID；`oldest` 翻页结果与 `newest` 互为倒序；`include_fragments` 片元数与 `fragmentCount` 一致（上限 64）。
+- 目标 EID 之后没有 discard 时，`summary.finalValue` 与同一位置 `pick_pixel` 一致。
+- nanite capture 实测（D3D12）：RT 116618（Lumen.CardCaptureAlbedoAtlas）(1,1) 截至 EID 1513 有 2 个事件：1474 全屏 `DrawInstanced` 写 0（未改变值），1513 有 80 个片元、5 个通过、75 个 `depthTestFailed`，最终值 [69,69,68,0]/255；(256,256) 不在 1513 的 8×16 viewport 内，历史为空并提示 EID 1459 的 discard。首次约 0.3 s，缓存后翻页约 0.05 s，默认响应约 2 KB。
+
 参考耗时目标：
 
 | 操作 | 目标 |
@@ -725,7 +735,7 @@ cd agent/mcp_server
 4. **M3：Agent 工作流**
    - 4 个 Skills、Codex 配置和端到端问题验收。
 5. **M4：P1 调试工具**
-   - Pixel History、Pixel/Vertex Debug 和 Mesh 数据。
+   - Pixel History（已完成）、Pixel/Vertex Debug 和 Mesh 数据。
 
 完成 M3 后即可形成可用 MVP。M4 完成后再评估是否进入 Shader 替换、CBuffer 修改和 qrenderdoc 内嵌 AI 面板。
 

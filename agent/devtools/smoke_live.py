@@ -206,6 +206,11 @@ class P0Smoke:
                                           if key not in ("texture",)}))
         self.call("pick_pixel", {"resource_id": rt_id, "event_id": event_id, "x": width, "y": 0},
                   expect_error="INVALID_REQUEST")
+        if picked_pixel:
+            self.check_pixel_history(rt_id, event_id, width // 2, height // 2,
+                                     picked_pixel["data"]["value"])
+        self.call("pixel_history", {"resource_id": rt_id, "event_id": event_id, "x": width,
+                                    "y": 0}, expect_error="INVALID_REQUEST")
         stats = self.call("get_texture_stats", {"resource_id": rt_id, "event_id": event_id})
         if stats:
             print("  min:", json.dumps(stats["data"]["min"]), "max:", json.dumps(stats["data"]["max"]))
@@ -270,6 +275,52 @@ class P0Smoke:
         if before[1] is not None:
             self.call("set_event", {"event_id": before[1]})
 
+    def check_pixel_history(self, resource_id: str, event_id: int, x: int, y: int,
+                            expected: list[Any] | None = None) -> dict | None:
+        params = {"resource_id": resource_id, "event_id": event_id, "x": x, "y": y}
+        first = self.call("pixel_history", dict(params, limit=1000), timeout=300)
+        if first is None:
+            return None
+        data = first["data"]
+        summary = data["summary"]
+        print(f"  pixel_history {resource_id} @EID {event_id} ({x},{y}):",
+              json.dumps(summary, ensure_ascii=False))
+        for item in data["events"][:6]:
+            print("   ", json.dumps({key: item[key] for key in (
+                "eventId", "actionName", "fragmentCount", "passedCount", "failureCounts",
+                "changed")}, ensure_ascii=False),
+                  "post", json.dumps((item["postMod"] or {}).get("color")))
+        events = [item["eventId"] for item in data["events"]]
+        if events != sorted(set(events), reverse=True) or any(item > event_id for item in events):
+            self.fail(f"pixel_history events are not newest-first up to {event_id}: {events[:10]}")
+        if data["total"] != len(events):
+            self.fail(f"pixel_history total {data['total']} != {len(events)} events")
+        if 1 < data["total"] <= 40:
+            oldest = self.page_all("pixel_history", dict(params, order="oldest", limit=1),
+                                   "events", "eventId")
+            if oldest != data["events"][::-1]:
+                self.fail("pixel_history oldest-first paging does not mirror newest-first")
+        detailed = self.call("pixel_history", dict(params, include_fragments=True, limit=1))
+        if detailed and detailed["data"]["events"]:
+            newest = detailed["data"]["events"][0]
+            fragments = newest.get("fragments") or []
+            if len(fragments) != min(newest["fragmentCount"], 64):
+                self.fail(f"pixel_history returned {len(fragments)} fragments for EID "
+                          f"{newest['eventId']} with {newest['fragmentCount']}")
+            passed = [item for item in fragments if item["passed"]]
+            print(f"  EID {newest['eventId']}: {len(fragments)} fragments, {len(passed)} passed; "
+                  f"primitives {newest['primitiveIds']}")
+        final = summary.get("finalValue")
+        later_discard = any(item > (summary.get("lastEventId") or -1)
+                            for item in data.get("discardEventIds") or [])
+        if expected is not None and final is not None and not later_discard:
+            if not all(abs(float(a) - float(b)) < 1e-3
+                       for a, b in zip(final["color"], expected) if isinstance(a, (int, float))):
+                self.fail(f"pixel_history final value {final['color']} != pick_pixel {expected}")
+            else:
+                print(f"  pixel_history final value matches pick_pixel {expected}")
+        return data
+
     def first_buffer(self, state: dict | None) -> str | None:
         data = (state or {}).get("data", {})
         assembly = data.get("inputAssembly") or {}
@@ -316,6 +367,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wait", type=float, default=30.0)
     parser.add_argument("--all-p0", action="store_true")
     parser.add_argument("--max-draws", type=int, default=40)
+    parser.add_argument("--pixel-history", action="append", default=[],
+                        metavar="RESOURCE:EID:X:Y",
+                        help="Also print pixel_history for this texel (repeatable).")
     parser.add_argument("--launch", type=Path, help="Start qrendertest with this capture first.")
     parser.add_argument("--exe", type=Path, default=REPO_DIR / "x64" / "Release" / "qrendertest.exe")
     args = parser.parse_args(argv)
@@ -343,6 +397,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.all_p0:
             smoke = P0Smoke(client, instance_id)
             smoke.run(args.max_draws)
+            for spec in args.pixel_history:
+                resource_id, event_id, x, y = spec.split(":")
+                print(f"[pixel_history {spec}]")
+                smoke.check_pixel_history(resource_id, int(event_id), int(x), int(y))
             smoke.report()
             print("PASS" if not smoke.failures else f"{len(smoke.failures)} check(s) failed")
             return 0 if not smoke.failures else 1

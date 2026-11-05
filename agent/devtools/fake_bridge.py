@@ -18,7 +18,7 @@ if str(BRIDGE_DIR) not in sys.path:
     sys.path.insert(0, str(BRIDGE_DIR))
 
 from rendertest_agent_bridge.artifacts import artifact_directory, describe_artifact  # noqa: E402
-from rendertest_agent_bridge.constants import P0_METHODS  # noqa: E402
+from rendertest_agent_bridge.constants import P0_METHODS, P1_METHODS  # noqa: E402
 from rendertest_agent_bridge.ipc import AgentBridgeError, BridgeResult, MailboxServer  # noqa: E402
 from rendertest_agent_bridge.paths import agent_root  # noqa: E402
 
@@ -84,7 +84,7 @@ class FakeRenderTestBridge:
             self.instance_id,
             self.handle,
             self.state,
-            methods=("ping",) + P0_METHODS,
+            methods=("ping",) + P0_METHODS + P1_METHODS,
             renderdoc_version="1.47-fake",
         )
 
@@ -520,6 +520,59 @@ class FakeRenderTestBridge:
                     "min": [min(pixel[index] for pixel in pixels) for index in range(4)],
                     "max": [max(pixel[index] for pixel in pixels) for index in range(4)],
                 }
+            ),
+            self._read_meta(event_id),
+        )
+
+    def _method_pixel_history(self, params: dict[str, Any]) -> BridgeResult:
+        resource, _ = self._texture_view(params)
+        event_id = self._event_id(params)
+        x = params.get("x")
+        y = params.get("y")
+        if type(x) is not int or type(y) is not int or not (0 <= x < 4 and 0 <= y < 4):
+            raise AgentBridgeError("INVALID_REQUEST", "The pixel coordinate is outside the texture.")
+        final = [channel / 255.0 for channel in self._texture_pixels(resource["resourceId"])[y * 4 + x]]
+        cleared = {"color": [0.0, 0.0, 0.0, 0.0], "depth": None, "stencil": None}
+        written = {"color": final, "depth": None, "stencil": None}
+        entries = [
+            {
+                "eventId": usage["eventId"],
+                "actionName": self._actions[usage["eventId"]]["name"],
+                "fragmentCount": 1,
+                "passedCount": 1,
+                "passed": True,
+                "failureCounts": {},
+                "primitiveIds": [0],
+                "directShaderWrite": False,
+                "unboundPS": False,
+                "changed": True,
+                "preMod": cleared,
+                "shaderOut": written,
+                "postMod": written,
+            }
+            for usage in self._usage.get(resource["resourceId"], [])
+            if usage["access"] == "write" and usage["eventId"] <= event_id
+        ]
+        last = entries[-1]["eventId"] if entries else None
+        page, next_cursor = self._page(list(reversed(entries)), params)
+        return BridgeResult(
+            _payload(
+                {
+                    "eventId": event_id,
+                    "texture": resource,
+                    "x": x,
+                    "y": y,
+                    "order": "newest",
+                    "total": len(entries),
+                    "summary": {
+                        "eventCount": len(entries),
+                        "lastPassedEventId": last,
+                        "lastChangedEventId": last,
+                        "finalValue": entries[-1]["postMod"] if entries else None,
+                    },
+                    "events": page,
+                },
+                next_cursor=next_cursor,
             ),
             self._read_meta(event_id),
         )

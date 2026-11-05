@@ -20,7 +20,7 @@ Start with `inspect_event(event_id=...)`: action parameters, shaders per stage, 
 
 - Fixed-function state (input assembly, viewport and scissor, rasteriser, depth/stencil, blend): `get_pipeline_state`, narrowed with `stages` or `include_bindings=false`.
 - Output content: `export_texture(resource_id=..., event_id=..., include_image=true)`. Use `channels="rgb"` when alpha is 0 or holds data, and `channels="depth"` for depth (stretched to its min/max, not linear depth).
-- What this event changed: compare `get_texture_stats` or a few `pick_pixel` reads at this EID and at the previous write event of the same resource.
+- What this event changed: compare `get_texture_stats` or a few `pick_pixel` reads at this EID and at the previous write event of the same resource. For one pixel, `pixel_history` at this EID shows whether this event's fragments passed and what they wrote.
 - Where a resource comes from and where it goes: `get_resource_usage(resource_id=...)` lists writers and readers.
 - Shader arithmetic: see `rendertest-shader-debug`.
 
