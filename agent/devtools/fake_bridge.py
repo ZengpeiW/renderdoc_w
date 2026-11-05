@@ -669,6 +669,47 @@ class FakeRenderTestBridge:
             self._read_meta(event_id),
         )
 
+    def _method_get_mesh_data(self, params: dict[str, Any]) -> BridgeResult:
+        event_id = self._event_id(params)
+        action = self._actions[event_id]
+        if "draw" not in action["flags"]:
+            raise AgentBridgeError("INVALID_EVENT", "The event is not a draw.",
+                                   details={"event_id": event_id})
+        if params.get("stage", "vs_out") != "vs_out":
+            raise AgentBridgeError("INVALID_REQUEST", "The draw has no geometry stage.")
+        count = action["numIndices"]
+        positions = [[-1.0 + 2.0 * (row % 3), 1.0 - 2.0 * (row // 3 % 2), 0.0, 1.0]
+                     for row in range(count)]
+        rows = [{"vertex": row, "index": row, "values": [position, [row / max(1, count), 0.0]]}
+                for row, position in enumerate(positions)]
+        page, next_cursor = self._page(rows, params)
+        return BridgeResult(
+            _payload(
+                {
+                    "eventId": event_id,
+                    "stage": "vs_out",
+                    "instance": params.get("instance", 0),
+                    "view": params.get("view", 0),
+                    "topology": "TriangleList",
+                    "indexed": False,
+                    "rowCount": count,
+                    "decodedRows": count,
+                    "columns": [
+                        {"name": "SV_Position", "semantic": "SV_Position",
+                         "systemValue": "Position", "type": "Float", "components": 4,
+                         "byteOffset": 0},
+                        {"name": "TEXCOORD0", "semantic": "TEXCOORD0",
+                         "systemValue": "NoBuiltin", "type": "Float", "components": 2,
+                         "byteOffset": 16},
+                    ],
+                    "position": {"name": "SV_Position", "wNonPositiveRows": 0,
+                                 "ndcMin": [-1.0, -1.0, 0.0], "ndcMax": [3.0, 1.0, 0.0]},
+                    "rows": page,
+                },
+                next_cursor=next_cursor,
+            ),
+            self._read_meta(event_id),
+        )
     def _buffer_data(self, params: dict[str, Any]) -> BridgeResult:
         resource = self._resource(params, "buffer")
         offset = params.get("offset", 0)

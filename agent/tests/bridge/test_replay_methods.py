@@ -62,7 +62,7 @@ def test_manifest_lists_p0_methods(loaded) -> None:
     methods = call(api, "get_status").result["data"]["bridge"]["methods"]
     assert {"list_actions", "inspect_event", "export_texture", "get_debug_messages"} <= set(methods)
     assert "pixel_history" in methods
-    assert "debug_vertex" in methods and "get_mesh_data" not in methods
+    assert "debug_vertex" in methods and "get_mesh_data" in methods
 
 
 def test_list_and_find_actions(loaded) -> None:
@@ -329,6 +329,42 @@ def test_debug_vertex(loaded) -> None:
     assert error_code(api, "debug_vertex", vertex=0, instance=1, event_id=5) == "INVALID_REQUEST"
     assert error_code(api, "debug_vertex", vertex=0, event_id=8) == "INVALID_EVENT"
     assert error_code(api, "debug_vertex", event_id=5) == "INVALID_REQUEST"
+
+
+def test_get_mesh_data(loaded) -> None:
+    ctx, api = loaded
+    controller = ctx.controller
+    response = call(api, "get_mesh_data", event_id=5, limit=5)
+    result = response.result
+    data = result["data"]
+    assert controller.current == 9 and response.meta["replayEventRestored"] is True
+    assert [item[1:3] for item in controller.post_vs_calls] == [(0, 0)]
+    assert data["stage"] == "vs_out" and data["rowCount"] == 36 and data["indexed"] is True
+    assert [(item["name"], item["byteOffset"]) for item in data["columns"]] == [
+        ("SV_Position", 0), ("TEXCOORD0", 16)]
+    rows = data["rows"]
+    assert [item["vertex"] for item in rows] == [0, 1, 2, 3, 4]
+    assert [item["index"] for item in rows] == [10, 11, 12, 13, 14]
+    assert rows[1]["values"] == [[1.0, -1.0, 0.5, 2.0], [pytest.approx(0.1), 1.0]]
+    assert rows[4]["values"][0][0] == "NaN"
+    position = data["position"]
+    assert position["wNonPositiveRows"] == 5 and position["ndcMin"][0] == 0.0
+    assert position["ndcMax"][0] == 3.5
+    assert data["stats"][0]["nonFiniteRows"] == 4 and data["stats"][0]["max"][3] == 2.0
+    assert result["nextCursor"]
+
+    following = call(api, "get_mesh_data", event_id=5, limit=5,
+                     cursor=result["nextCursor"]).result
+    assert [item["vertex"] for item in following["data"]["rows"]] == [5, 6, 7, 8, 9]
+    assert len(controller.post_vs_calls) == 1
+    tail = call(api, "get_mesh_data", event_id=5, start=34).result
+    assert [item["vertex"] for item in tail["data"]["rows"]] == [34, 35]
+    assert tail["nextCursor"] is None
+
+    assert error_code(api, "get_mesh_data", event_id=8) == "INVALID_EVENT"
+    assert error_code(api, "get_mesh_data", event_id=5, instance=1) == "INVALID_REQUEST"
+    assert error_code(api, "get_mesh_data", event_id=5, stage="gs_out") == "INVALID_REQUEST"
+    assert error_code(api, "get_mesh_data", event_id=5, stage="ps_out") == "INVALID_REQUEST"
 
 
 def test_export_rgb_png_drops_alpha(loaded) -> None:

@@ -214,7 +214,7 @@ class P0Smoke:
         if "pixel" in pipeline["shaders"]:
             self.check_debug_pixel(rt_id, event_id, width // 2, height // 2)
         if "vertex" in pipeline["shaders"]:
-            self.check_debug_vertex(event_id, 0)
+            self.check_mesh_data(event_id, [0])
             self.call("debug_vertex", {"event_id": event_id,
                                        "vertex": int(inspected["action"]["numIndices"])},
                       expect_error="INVALID_REQUEST")
@@ -398,7 +398,50 @@ class P0Smoke:
         value = int.from_bytes(bytes.fromhex(raw["data"]["hex"]), "little")
         return max(0, value + action["baseVertex"])
 
-    def check_debug_vertex(self, event_id: int, vertex: int, instance: int = 0) -> None:
+    def check_mesh_data(self, event_id: int, vertices: list[int]) -> None:
+        first = self.call("get_mesh_data", {"event_id": event_id, "limit": 8}, timeout=300)
+        if first is None:
+            return
+        data = first["data"]
+        print(f"  get_mesh_data EID {event_id}: {data['rowCount']} rows {data['topology']} "
+              f"indexed={data['indexed']} stride={data.get('vertexByteStride')} "
+              f"columns={[item['name'] for item in data['columns']]}")
+        print("   position:", json.dumps(data.get("position"), ensure_ascii=False))
+        print("   stats:", json.dumps(data.get("stats"), ensure_ascii=False)[:1200])
+        for warning in first["warnings"]:
+            print("   warning:", warning)
+        if not data["rows"]:
+            self.fail(f"get_mesh_data returned no rows for EID {event_id}")
+            return
+        if first["nextCursor"]:
+            page = self.call("get_mesh_data", {"event_id": event_id, "limit": 8,
+                                               "cursor": first["nextCursor"]})
+            if page and page["data"]["rows"][0]["vertex"] != 8:
+                self.fail("get_mesh_data cursor did not continue at row 8")
+        for vertex in vertices:
+            rows = self.call("get_mesh_data", {"event_id": event_id, "start": vertex,
+                                               "limit": 1})
+            row = (rows or {}).get("data", {}).get("rows", [None])[0]
+            debugged = self.check_debug_vertex(event_id, vertex)
+            if row is None or debugged is None or row.get("values") is None:
+                continue
+            if row["index"] != debugged["index"]:
+                self.fail(f"mesh row {vertex} index {row['index']} != debug_vertex "
+                          f"{debugged['index']}")
+            position = next((item["value"] for item in debugged["outputs"]
+                             if item["name"].upper().endswith("POSITION")), None)
+            mesh_position = row["values"][0]
+            if position is None or mesh_position is None:
+                continue
+            if all(abs(float(a) - float(b)) < 1e-4 for a, b in zip(position, mesh_position)):
+                print(f"   vertex {vertex}: get_mesh_data position matches debug_vertex "
+                      f"{[round(item, 4) for item in mesh_position]}")
+            else:
+                self.fail(f"vertex {vertex}: get_mesh_data position {mesh_position} != "
+                          f"debug_vertex {position}")
+
+    def check_debug_vertex(self, event_id: int, vertex: int,
+                           instance: int = 0) -> dict[str, Any] | None:
         expected = self.expected_vertex_index(event_id, vertex)
         before = self.ui_events()
         result = self.call("debug_vertex", {"event_id": event_id, "vertex": vertex,
@@ -406,7 +449,7 @@ class P0Smoke:
         if self.ui_events() != before:
             self.fail("debug_vertex changed the UI event")
         if result is None:
-            return
+            return None
         data = result["data"]
         print(f"  debug_vertex EID {event_id} vertex {vertex} instance {instance}: "
               f"index={data.get('index')} (raw {data.get('indexBufferValue')}, "
@@ -416,7 +459,7 @@ class P0Smoke:
             self.fail(f"debug_vertex index {data.get('index')} != index buffer {expected}")
         if not data["debugged"]:
             self.fail(f"debug_vertex could not debug vertex {vertex} at EID {event_id}")
-            return
+            return None
         print("   shader:", json.dumps(data["shader"], ensure_ascii=False))
         print("   inputs:", json.dumps([{key: item.get(key) for key in ("name", "value")}
                                         for item in data["inputs"]], ensure_ascii=False)[:1200])
@@ -439,6 +482,7 @@ class P0Smoke:
         if len(lines) != data["steps"] + 2 and data["traceComplete"]:
             self.fail(f"vertex trace has {len(lines)} lines for {data['steps']} steps")
         print(f"   trace {artifact['path']} {artifact['bytes']} bytes")
+        return data
 
     def first_buffer(self, state: dict | None) -> str | None:
         data = (state or {}).get("data", {})
@@ -495,6 +539,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--debug-vertex", action="append", default=[],
                         metavar="EID:VERTEX[:INSTANCE]",
                         help="Also run debug_vertex for this vertex (repeatable).")
+    parser.add_argument("--mesh-data", action="append", default=[],
+                        metavar="EID[:VERTEX,...]",
+                        help="Also run get_mesh_data and compare vertices with debug_vertex.")
     parser.add_argument("--launch", type=Path, help="Start qrendertest with this capture first.")
     parser.add_argument("--exe", type=Path, default=REPO_DIR / "x64" / "Release" / "qrendertest.exe")
     args = parser.parse_args(argv)
@@ -534,6 +581,11 @@ def main(argv: list[str] | None = None) -> int:
                 parts = [int(item) for item in spec.split(":")]
                 print(f"[debug_vertex {spec}]")
                 smoke.check_debug_vertex(*parts)
+            for spec in args.mesh_data:
+                event_id, _, vertices = spec.partition(":")
+                print(f"[get_mesh_data {spec}]")
+                smoke.check_mesh_data(int(event_id),
+                                      [int(item) for item in vertices.split(",") if item])
             smoke.report()
             print("PASS" if not smoke.failures else f"{len(smoke.failures)} check(s) failed")
             return 0 if not smoke.failures else 1

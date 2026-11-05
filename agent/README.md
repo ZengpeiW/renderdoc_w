@@ -2,13 +2,13 @@
 
 RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打开的 capture。设计见 [docs/MVP_DESIGN.md](docs/MVP_DESIGN.md)。
 
-当前进度：**M4 P1 调试工具（进行中：`pixel_history`、`debug_pixel`、`debug_vertex` 已完成）**。
+当前进度：**M4 P1 调试工具已完成**。
 
 - M0：MCP Server、文件 mailbox IPC、fake Bridge 和协议测试。
 - M1：qrendertest 启动时从 `integrations/rendertest_agent/python` 固定加载 Bridge，写实例清单和心跳，跟踪 capture 加载、关闭和选中事件，支持 `ping` / `get_status` / `get_context`。
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
-- M4：`pixel_history`、`debug_pixel`、`debug_vertex` 已完成；`get_mesh_data` 待做。
+- M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
 
 ## P0 工具
 
@@ -29,6 +29,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 | `pixel_history` | 截至目标 EID 修改过某个像素的事件，默认新到旧，按事件分组：片元数、通过数、失败原因计数（深度/模板/discard/裁剪…）、通过片元的 primitive、`preMod`/`shaderOut`/`postMod`（color/depth/stencil）。`summary` 给出最后通过和最后改变值的 EID；`include_fragments=true` 每个事件附最多 64 个片元。RenderDoc 的像素历史不含 `Discard`，这类事件放在 `discardEventIds` 里并给出 warning。结果按 capture session 缓存，翻页不会重放。 |
 | `debug_pixel` | 用 RenderDoc Shader 调试器跑某个 Draw 在某像素的 Pixel Shader（`primitive` 选重叠片元，可取自 `pixel_history` 的 `primitiveIds`）。返回 Shader、插值输入、最终输出（`SV_Target*`，混合和格式转换之前）、最后改变的变量、产生 NaN/Inf 的步骤（指令和行号）；完整逐步 trace 写成 JSONL artifact（每步 `instruction`、`line`、变量 `changes`，上限 64 MiB）。`max_steps` 默认 20000。没有片元覆盖该像素时返回 `debugged=false`。 |
 | `debug_vertex` | 调试某个 Draw 的某个顶点的 Vertex Shader。`vertex` 是 Draw 内 0 起的序号（Mesh Viewer 的 VTX 列，小于 `numIndices`），`instance` 默认 0。Indexed Draw 由 Bridge 读 index buffer，按 Mesh Viewer 的算法加 base vertex 得到 `index`（另返回原始 `indexBufferValue`，遇到 primitive restart 报错）。返回字段与 `debug_pixel` 相同，`outputs` 含 `SV_Position`（裁剪空间）。 |
+| `get_mesh_data` | 读 Draw 变换后的顶点，对应 Mesh Viewer 的 VS Out（`stage="vs_out"`，默认）/ GS Out（`stage="gs_out"`）表。返回输出列（位置在前，布局与 Mesh Viewer 相同）、全 Draw 的每列 min/max 和非有限值行数、位置的 NDC 范围和 w≤0 的顶点数；`rows` 每行含 `vertex`、`index`（实际取的顶点，已加 base vertex）和各列值，用 `start`/`limit` 或 `cursor` 翻页（默认 50 行）。一次回放后按 capture session 缓存。暂不支持 Mesh Shader。 |
 
 约定：
 
@@ -98,6 +99,8 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc" --debug-pixel 116618:1513:1:1
 # 额外对指定顶点跑 debug_vertex（EID:VERTEX[:INSTANCE]，用 get_buffer_data 读 index buffer 交叉验证 index，可重复）
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc" --debug-vertex 1513:0
+# 额外读 get_mesh_data，并逐个和 debug_vertex 的 index、位置比较（EID[:VERTEX,...]，可重复）
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc" --mesh-data 1513:0,5,100
 
 # 自动跑完整生命周期
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\live_lifecycle.py --capture "E:\Captures\some.rdc"

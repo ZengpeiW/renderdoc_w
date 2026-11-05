@@ -22,6 +22,7 @@ ResourceKind = Literal["texture", "buffer", "shader", "pipeline", "sampler", "ot
 TextureFormat = Literal["png", "exr", "dds"]
 TextureChannels = Literal["rgba", "rgb", "r", "g", "b", "a", "depth", "stencil"]
 HistoryOrder = Literal["newest", "oldest"]
+MeshStage = Literal["vs_out", "gs_out"]
 MaxSteps = Annotated[int, Field(ge=1, le=200000, description="Shader steps to execute at most.")]
 
 EventId = Annotated[int, Field(ge=0, description="RenderDoc event ID (EID).")]
@@ -45,7 +46,7 @@ NonNegativeInt = Annotated[int, Field(ge=0)]
 BufferSize = Annotated[int, Field(ge=1, le=16 * 1024 * 1024)]
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data", "pixel_history",
-                                   "debug_pixel", "debug_vertex"})
+                                   "debug_pixel", "debug_vertex", "get_mesh_data"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -486,6 +487,38 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             instance_id=instance_id,
         )
 
+    @tool()
+    async def get_mesh_data(
+        event_id: OptionalEventId = None,
+        stage: MeshStage = "vs_out",
+        instance: NonNegativeInt = 0,
+        view: NonNegativeInt = 0,
+        start: NonNegativeInt = 0,
+        cursor: Cursor = None,
+        limit: Annotated[int, Field(ge=1, le=1000)] = 50,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Read a draw's post-transform vertices, like the VS Out / GS Out tables of the Mesh Viewer.
+
+        Returns the output columns (position first), per-column min/max and non-finite row counts,
+        the position's NDC range and rows with clip-space positions and other outputs. vertex is
+        the row in the draw; index is the vertex fetched for it (base vertex applied). stage=gs_out
+        reads geometry/tessellation output. Stats cover the whole draw; rows are paged with
+        start/limit or cursor.
+        """
+        return await invoke(
+            "get_mesh_data",
+            _clean_params(
+                event_id=event_id,
+                stage=stage,
+                instance=instance,
+                view=view,
+                start=start,
+                cursor=cursor,
+                limit=limit,
+            ),
+            instance_id=instance_id,
+        )
     @tool()
     async def get_buffer_data(
         resource_id: ResourceId,

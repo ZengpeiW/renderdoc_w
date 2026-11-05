@@ -2,13 +2,13 @@ import bisect
 import hashlib
 import json
 import os
-import struct
 
 from ..artifacts import artifact_path, describe
 from ..ipc import AgentBridgeError
 from ..values import enum_name, flags_value
 from .common import (action_index, get_int, invalid, renderdoc_module, resolve_event,
                      resource_index, result, session_of, stage_enum)
+from .mesh import draw_indices, with_base
 from .pipeline import _bound_shader, convert_variable
 
 DEFAULT_MAX_STEPS = 20000
@@ -21,7 +21,6 @@ LAST_CHANGES = 16
 EVENT_STEP_LIMIT = 16
 NO_PREFERENCE = 0xFFFFFFFF
 SHADER_EVENTS = (("SampleLoadGather", 0x1), ("GeneratedNanOrInf", 0x2), ("DebugBreak", 0x4))
-INDEX_FORMATS = {1: "<B", 2: "<H", 4: "<I"}
 DRAW_FLAG = "Drawcall"
 INDEXED_FLAG = "Indexed"
 
@@ -299,26 +298,12 @@ def _vertex_index(controller, pipe, node, vertex):
     """Return the index used to fetch vertex inputs, as qrenderdoc's BufferViewer computes it."""
     if INDEXED_FLAG not in node["flags"]:
         return vertex, None
-    buffer = pipe.GetIBuffer()
-    stride = int(buffer.byteStride)
-    if stride not in INDEX_FORMATS:
-        raise AgentBridgeError("INVALID_EVENT", "The indexed draw has no usable index buffer.",
-                               details={"byteStride": stride})
-    offset = (node["indexOffset"] + vertex) * stride
-    if offset + stride > int(buffer.byteSize):
-        raise invalid("vertex %d reads past the end of the bound index buffer." % vertex,
-                      byteSize=int(buffer.byteSize), offset=offset)
-    raw = bytes(controller.GetBufferData(buffer.resourceId, int(buffer.byteOffset) + offset,
-                                         stride))
-    if len(raw) < stride:
-        raise invalid("vertex %d reads past the end of the index buffer." % vertex)
-    value = struct.unpack(INDEX_FORMATS[stride], raw[:stride])[0]
-    if pipe.IsRestartEnabled():
-        restart = int(pipe.GetRestartIndex()) & ((1 << (8 * stride)) - 1)
-        if restart and value == restart:
-            raise invalid("vertex %d is a primitive restart index." % vertex, index=value)
-    base = node["baseVertex"]
-    return max(0, value + base), value
+    values = draw_indices(controller, pipe, node, vertex, 1)
+    if not values:
+        raise invalid("vertex %d reads past the end of the bound index buffer." % vertex)
+    if values[0] is None:
+        raise invalid("vertex %d is a primitive restart index." % vertex)
+    return with_base(node, values[0]), values[0]
 
 
 def debug_vertex(runtime, context):

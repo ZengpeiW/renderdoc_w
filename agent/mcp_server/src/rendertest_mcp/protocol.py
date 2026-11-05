@@ -96,6 +96,6 @@ P0_TOOL_NAMES = (
     "get_debug_messages",
 )
 
-P1_TOOL_NAMES = ("pixel_history", "debug_pixel", "debug_vertex")
+P1_TOOL_NAMES = ("pixel_history", "debug_pixel", "debug_vertex", "get_mesh_data")
 
 TOOL_NAMES = P0_TOOL_NAMES + P1_TOOL_NAMES

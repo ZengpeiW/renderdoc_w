@@ -72,6 +72,7 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "pixel_history": {"resource_id": "1001", "x": 1, "y": 2, "event_id": 30},
             "debug_pixel": {"x": 1, "y": 2, "event_id": 30},
             "debug_vertex": {"vertex": 2, "event_id": 30},
+            "get_mesh_data": {"event_id": 10, "limit": 4},
             "get_buffer_data": {"resource_id": "2001", "offset": 4, "size": 4},
             "get_debug_messages": {},
         }
@@ -88,6 +89,9 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert Path(results["debug_pixel"]["artifacts"][0]["path"]).is_file()
     assert results["debug_vertex"]["data"]["outputs"][0]["name"] == "SV_Position"
     assert Path(results["debug_vertex"]["artifacts"][0]["path"]).is_file()
+    assert results["get_mesh_data"]["data"]["columns"][0]["systemValue"] == "Position"
+    assert len(results["get_mesh_data"]["data"]["rows"]) == 4
+    assert results["get_mesh_data"]["nextCursor"]
     artifact = results["export_texture"]["artifacts"][0]
     assert Path(artifact["path"]).read_bytes().startswith(b"\x89PNG")
 

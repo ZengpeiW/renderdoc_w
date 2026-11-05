@@ -84,4 +84,4 @@ P0_METHODS = (
     "get_debug_messages",
 )
 
-P1_METHODS = ("pixel_history", "debug_pixel", "debug_vertex")
+P1_METHODS = ("pixel_history", "debug_pixel", "debug_vertex", "get_mesh_data")

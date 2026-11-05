@@ -33,7 +33,16 @@ Use `debug_vertex(event_id=..., vertex=..., instance=...)` for wrong positions, 
 - `vertex` is the 0-based position in the draw (the VTX column of the Mesh Viewer) and must be below the draw's `numIndices`. For indexed draws the result's `index` is the vertex fetched from the index buffer with base vertex applied, and `indexBufferValue` is the raw index.
 - `instance` defaults to 0 and must be below `numInstances`; `view` is only for multiview.
 - `outputs` include `SV_Position` (clip space; divide xyz by w for NDC) and the other outputs passed to later stages. `inputs` are the fetched vertex attributes and system values.
-- Post-transform mesh data for many vertices at once (`get_mesh_data`) is not available yet (M4); debug a few representative vertices instead.
+- Find which vertices to debug with `get_mesh_data` first; `vertex` there is the same row number.
+
+## Post-transform geometry
+
+`get_mesh_data(event_id=..., stage="vs_out")` reads the whole draw's vertex shader outputs like the Mesh Viewer's VS Out table; use `stage="gs_out"` for geometry or tessellation output. It is one replay, then cached.
+
+- `columns` list the outputs with position first. `stats` give per-column min/max and `nonFiniteRows` over the whole draw, and `position` gives `ndcMin` / `ndcMax` (xyz / w) and `wNonPositiveRows` (vertices with w <= 0, excluded from the NDC range).
+- Check `stats` and `position` before paging rows: NaN or Inf, w <= 0 and NDC far outside [-1, 1] point at exploding or missing geometry. Then page `rows` with `start` / `limit` or `cursor` around the suspicious vertices and `debug_vertex` one of them.
+- Each row has `vertex` (row in the draw), `index` (fetched vertex, base vertex applied), `values` in column order, or `restart=true` for a primitive restart.
+- Positions are clip space and the data is for one `instance` and `view`. It does not prove raster coverage; use `pixel_history` for that.
 
 ## Judgement
 

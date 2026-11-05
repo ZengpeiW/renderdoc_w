@@ -142,10 +142,6 @@ def test_start_without_capture_serves_status(fake_qrenderdoc: None, agent_root: 
         api.call("list_actions", {})
     assert error.value.code == "NO_CAPTURE"
 
-    with pytest.raises(RenderTestAgentError) as error:
-        api.call("get_mesh_data", {})
-    assert error.value.code == "UNKNOWN_METHOD"
-
 
 def test_capture_lifecycle_updates_manifest_and_session(fake_qrenderdoc: None, agent_root: Path) -> None:
     ctx = FakeContext()

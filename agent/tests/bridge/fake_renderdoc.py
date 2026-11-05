@@ -109,6 +109,15 @@ class Simple(enum.IntEnum):
     Pixel = 16
     Target = 17
     UsageColorTarget = 18
+    Position = 19
+    NoBuiltin = 20
+    TriangleStrip = 21
+
+
+class MeshDataStage(enum.IntEnum):
+    VSIn = 0
+    VSOut = 1
+    GSOut = 2
 
 
 class Subresource:
@@ -149,7 +158,7 @@ def module() -> types.ModuleType:
     rd = types.ModuleType("renderdoc")
     for value in (ResourceId, ShaderStage, ActionFlags, CompType, FileType, AlphaMapping,
                   ResourceType, DescriptorType, VarType, Subresource, TextureSave,
-                  DebugPixelInputs, DebugVariableType):
+                  DebugPixelInputs, DebugVariableType, MeshDataStage):
         setattr(rd, value.__name__, value)
     return rd
 
@@ -194,6 +203,24 @@ def constant(name: str, offset: int, type_name: str) -> Any:
               type=NS(name=type_name, elements=1, arrayByteStride=0, members=[]))
 
 
+VS_OUTPUTS = [
+    NS(varName="", semanticName="TEXCOORD", semanticIdxName="TEXCOORD0", semanticIndex=0,
+       regIndex=1, systemValue=Simple.NoBuiltin, varType=VarType.Float, compCount=2,
+       regChannelMask=3, channelUsedMask=3, stream=0),
+    NS(varName="", semanticName="SV_Position", semanticIdxName="SV_Position", semanticIndex=0,
+       regIndex=0, systemValue=Simple.Position, varType=VarType.Float, compCount=4,
+       regChannelMask=15, channelUsedMask=15, stream=0),
+]
+POST_VS = ResourceId(210)
+POST_IB = ResourceId(211)
+
+
+def post_vs_vertex(index: int) -> tuple[float, ...]:
+    w = 0.0 if index == 3 else 2.0
+    x = float("nan") if index == 4 else float(index)
+    return (x, -float(index), 0.5, w, index * 0.1, 1.0)
+
+
 def reflection(stage: ShaderStage) -> Any:
     globals_block = NS(name="Globals", byteSize=32, bufferBacked=True, fixedBindNumber=0,
                        fixedBindSetOrSpace=0, bindArraySize=1,
@@ -202,9 +229,10 @@ def reflection(stage: ShaderStage) -> Any:
         entryPoint="main", stage=stage, encoding=Simple.DXIL,
         dispatchThreadsDimension=(8, 8, 1) if stage == ShaderStage.Compute else (0, 0, 0),
         inputSignature=[],
-        outputSignature=[NS(varName="color", semanticName="SV_Target", semanticIndex=0,
-                            regIndex=0, systemValue=Simple.Target, varType=VarType.Float,
-                            compCount=4, regChannelMask=15, channelUsedMask=15, stream=0)],
+        outputSignature=VS_OUTPUTS if stage == ShaderStage.Vertex else
+        [NS(varName="color", semanticName="SV_Target", semanticIndex=0,
+            regIndex=0, systemValue=Simple.Target, varType=VarType.Float,
+            compCount=4, regChannelMask=15, channelUsedMask=15, stream=0)],
         constantBlocks=[globals_block],
         samplers=[NS(name="linearSampler", fixedBindNumber=0, fixedBindSetOrSpace=0,
                      bindArraySize=1)],
@@ -330,6 +358,7 @@ class FakeController:
         self.freed: list[Any] = []
         self.debug_steps = 3
         self.debug_misses = False
+        self.post_vs_calls: list[tuple[int, int, int, Any]] = []
         self.on_callback: Callable[[], None] | None = None
         self.textures = [NS(resourceId=ResourceId(100), width=4, height=4, depth=1, mips=2,
                             arraysize=1, msSamp=1, msQual=0, cubemap=False, dimension=2,
@@ -502,7 +531,25 @@ class FakeController:
         Path(path).write_bytes(header + struct.pack(">II", width, width) + b"\x08\x06\x00\x00\x00")
         return NS(code=0)
 
+    def GetPostVSData(self, instance: int, view: int, stage: Any) -> Any:
+        self.post_vs_calls.append((self.current, instance, view, stage))
+        if stage != MeshDataStage.VSOut:
+            return NS(vertexResourceId=ResourceId(), numIndices=0, vertexByteStride=0,
+                      indexByteStride=0, topology=Simple.TriangleList, unproject=False,
+                      nearPlane=0.1, farPlane=100.0, status="")
+        return NS(indexResourceId=POST_IB, indexByteOffset=0, indexByteStride=2,
+                  baseVertex=0, vertexResourceId=POST_VS, vertexByteOffset=0,
+                  vertexByteStride=24, numIndices=36, topology=Simple.TriangleList,
+                  unproject=True, nearPlane=0.1, farPlane=100.0, restartIndex=0xFFFFFFFF,
+                  allowRestart=False, status="")
+
     def GetBufferData(self, buffer: ResourceId, offset: int, length: int) -> bytes:
+        if buffer == POST_IB:
+            data = b"".join(struct.pack("<H", index % 8) for index in range(36))
+            return data[offset:offset + length]
+        if buffer == POST_VS:
+            data = b"".join(struct.pack("<6f", *post_vs_vertex(index)) for index in range(8))
+            return data[offset:offset + length]
         if buffer == ResourceId(201):
             indices = b"".join(struct.pack("<H", index + 10) for index in range(36))
             return indices[offset:offset + length]
