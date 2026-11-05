@@ -96,6 +96,6 @@ P0_TOOL_NAMES = (
     "get_debug_messages",
 )
 
-P1_TOOL_NAMES = ("pixel_history",)
+P1_TOOL_NAMES = ("pixel_history", "debug_pixel")
 
 TOOL_NAMES = P0_TOOL_NAMES + P1_TOOL_NAMES

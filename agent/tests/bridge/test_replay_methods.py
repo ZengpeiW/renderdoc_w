@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import struct
 import sys
 import types
@@ -61,7 +62,7 @@ def test_manifest_lists_p0_methods(loaded) -> None:
     methods = call(api, "get_status").result["data"]["bridge"]["methods"]
     assert {"list_actions", "inspect_event", "export_texture", "get_debug_messages"} <= set(methods)
     assert "pixel_history" in methods
-    assert "debug_pixel" not in methods
+    assert "debug_pixel" in methods and "debug_vertex" not in methods
 
 
 def test_list_and_find_actions(loaded) -> None:
@@ -255,6 +256,51 @@ def test_pixel_history_warns_about_discards(loaded) -> None:
     assert result["data"]["summary"]["lastPassedEventId"] is None
     assert result["data"]["events"] == []
     assert len(result["warnings"]) == 2 and "Discard events 7" in result["warnings"][1]
+
+
+def test_debug_pixel(loaded) -> None:
+    ctx, api = loaded
+    controller = ctx.controller
+    response = call(api, "debug_pixel", x=1, y=2, event_id=5, primitive=3)
+    result = response.result
+    data = result["data"]
+    assert controller.debug_calls == [(5, 1, 2, 3)]
+    assert len(controller.freed) == 1 and controller.current == 9
+    assert response.meta["replayEventRestored"] is True
+    assert data["debugged"] is True and data["steps"] == 3 and data["executionComplete"] is True
+    assert data["shader"]["resourceId"] == "300" and data["shader"]["entryPoint"] == "main"
+    assert data["inputs"][0]["name"] == "uv" and data["inputs"][0]["value"] == [0.5, 0.25]
+    assert data["outputs"] == [{"name": "SV_Target0", "signatureIndex": 0, "type": "Float",
+                                "value": [0.25, 0.5, 0.75, 1.0]}]
+    assert [item["name"] for item in data["lastChanges"]] == ["o0"]
+    assert [item["step"] for item in data["nanOrInfSteps"]] == [2]
+    assert data["nanOrInfSteps"][0]["changes"][0]["value"] == [2.0, "NaN"]
+    assert data["nanOrInfSteps"][0]["line"] == {"disassemblyLine": 5, "file": "shader.hlsl",
+                                                "lineStart": 3, "lineEnd": 3}
+    assert data["sampleSteps"] == 1
+
+    artifact = result["artifacts"][0]
+    lines = Path(artifact["path"]).read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines]
+    assert records[0]["record"] == "header" and records[0]["files"] == ["shader.hlsl"]
+    assert [item["step"] for item in records[1:-1]] == [1, 2, 3]
+    assert records[1]["line"] == {"disassemblyLine": 1}
+    assert records[-1] == {"record": "summary", "steps": 3, "executionComplete": True,
+                           "traceComplete": True}
+    assert artifact["sha256"] == hashlib.sha256(Path(artifact["path"]).read_bytes()).hexdigest()
+    assert not list(Path(artifact["path"]).parent.glob("*.part"))
+
+    limited = call(api, "debug_pixel", x=1, y=2, event_id=5, max_steps=2).result
+    assert limited["data"]["executionComplete"] is False and limited["data"]["steps"] == 2
+    assert limited["data"]["outputs"][0]["value"] == [None, None, None, None]
+    assert any("max_steps" in item for item in limited["warnings"])
+
+    controller.debug_misses = True
+    missed = call(api, "debug_pixel", x=3, y=3, event_id=5).result
+    assert missed["data"]["debugged"] is False and missed["artifacts"] == []
+    assert "pixel_history" in missed["warnings"][0]
+    assert error_code(api, "debug_pixel", x=0, y=0, event_id=8) == "INVALID_EVENT"
+    assert error_code(api, "debug_pixel", x=0, y=0, event_id=5, max_steps=0) == "INVALID_REQUEST"
 
 
 def test_export_rgb_png_drops_alpha(loaded) -> None:

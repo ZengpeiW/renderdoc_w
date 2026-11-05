@@ -22,13 +22,14 @@ Use `pixel_history(resource_id=..., x=..., y=..., event_id=...)`. It replays the
 - `changed=false` with passing fragments means the event wrote the same value (or blending kept it). An event that only failed tests did not write the pixel; its `failureCounts` say why.
 - Add `include_fragments=true` (with a small `limit`) only when per-fragment detail matters, such as which primitive won the depth test.
 - Pixel history skips `Discard` events. Its `discardEventIds` and warnings list them; content after a discard is undefined, not rendered.
-- An empty history means nothing tracked wrote the pixel up to the target EID: the value predates the frame, came from a discard, or from a write pixel history does not record. Check `get_resource_usage` for the remaining writes and compare `pick_pixel` before and after them.
+- An empty history means no draw, clear or copy wrote the pixel up to the target EID. If `discardEventIds` is non-empty, the latest discard there is the last event that changed the value (RenderDoc replays it as a fill pattern); report that event, and say the target draw does not cover the pixel. Otherwise check `get_resource_usage` for the remaining writes and compare `pick_pixel` before and after them.
 - If `pixel_history` returns `UNSUPPORTED`, fall back to that same comparison over the write events from `get_resource_usage`, and say the result is approximate.
 
 ## Cause
 
 - For the writing event, check with `inspect_event` and `get_pipeline_state` whether the viewport and scissor cover the pixel and whether depth test, blend, cull and write masks match what `pixel_history` reports.
-- Use `rendertest-shader-debug` for its pixel shader, input textures and constant buffers, and `pick_pixel` the inputs around the matching coordinates. Shader stepping (`debug_pixel`) is not available yet (planned for M4).
+- Use `rendertest-shader-debug` for its pixel shader, input textures and constant buffers, and `pick_pixel` the inputs around the matching coordinates.
+- To see why the shader produced the value, `debug_pixel` the writing draw at this pixel, passing `primitive` from a passing fragment. Its `outputs` should match that fragment's `shaderOut`; `nanOrInfSteps` locate where NaN or Inf came from.
 - NaN and Inf come back as the strings "NaN" and "Inf". They are measured values; trace earlier writers to where they first appear.
 - Use `export_texture(include_image=true)` when the surrounding image matters.
 

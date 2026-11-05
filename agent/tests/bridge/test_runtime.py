@@ -143,7 +143,7 @@ def test_start_without_capture_serves_status(fake_qrenderdoc: None, agent_root: 
     assert error.value.code == "NO_CAPTURE"
 
     with pytest.raises(RenderTestAgentError) as error:
-        api.call("debug_pixel", {})
+        api.call("debug_vertex", {})
     assert error.value.code == "UNKNOWN_METHOD"
 
 

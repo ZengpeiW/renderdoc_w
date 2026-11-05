@@ -36,5 +36,5 @@ description: Shared rules for inspecting a RenderDoc capture open in RenderTest 
 - Answer in the user's language.
 - Separate measured tool data, inferences drawn from it and unconfirmed guesses.
 - Cite EIDs, ResourceIds, resource names, coordinates, mip/slice and the values actually read.
-- State what the tools cannot provide, such as shader stepping or shader source, instead of inventing it.
+- State what the tools cannot provide, such as vertex shader stepping or original shader source, instead of inventing it.
 - Match the depth to the question. An ordinary question needs an answer, not an exhaustive frame investigation, extra exports or UI changes.

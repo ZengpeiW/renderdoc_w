@@ -211,6 +211,8 @@ class P0Smoke:
                                      picked_pixel["data"]["value"])
         self.call("pixel_history", {"resource_id": rt_id, "event_id": event_id, "x": width,
                                     "y": 0}, expect_error="INVALID_REQUEST")
+        if "pixel" in pipeline["shaders"]:
+            self.check_debug_pixel(rt_id, event_id, width // 2, height // 2)
         stats = self.call("get_texture_stats", {"resource_id": rt_id, "event_id": event_id})
         if stats:
             print("  min:", json.dumps(stats["data"]["min"]), "max:", json.dumps(stats["data"]["max"]))
@@ -321,6 +323,56 @@ class P0Smoke:
                 print(f"  pixel_history final value matches pick_pixel {expected}")
         return data
 
+    def check_debug_pixel(self, resource_id: str, event_id: int, x: int, y: int) -> None:
+        history = self.call("pixel_history", {"resource_id": resource_id, "event_id": event_id,
+                                              "x": x, "y": y, "limit": 1,
+                                              "include_fragments": True}, timeout=300)
+        events = (history or {}).get("data", {}).get("events") or []
+        newest = events[0] if events and events[0]["eventId"] == event_id else None
+        passed = [item for item in (newest or {}).get("fragments") or [] if item["passed"]]
+        params: dict[str, Any] = {"event_id": event_id, "x": x, "y": y}
+        if passed:
+            params["primitive"] = passed[-1]["primitiveId"]
+        before = self.ui_events()
+        result = self.call("debug_pixel", params, timeout=300)
+        if self.ui_events() != before:
+            self.fail("debug_pixel changed the UI event")
+        if result is None:
+            return
+        data = result["data"]
+        print(f"  debug_pixel EID {event_id} ({x},{y}) primitive {params.get('primitive')}: "
+              f"debugged={data['debugged']} steps={data.get('steps')} "
+              f"complete={data.get('executionComplete')}")
+        if not data["debugged"]:
+            if passed:
+                self.fail(f"debug_pixel found no fragment but pixel_history has {len(passed)}")
+            return
+        print("   shader:", json.dumps(data["shader"], ensure_ascii=False))
+        print("   outputs:", json.dumps(data["outputs"], ensure_ascii=False))
+        print(f"   inputs {len(data['inputs'])}, nanOrInf steps {len(data['nanOrInfSteps'])}, "
+              f"sample steps {data['sampleSteps']}")
+        artifact = result["artifacts"][0]
+        lines = Path(artifact["path"]).read_text(encoding="utf-8").splitlines()
+        summary = json.loads(lines[-1])
+        if summary.get("record") != "summary" or summary.get("steps") != data["steps"]:
+            self.fail(f"debug trace summary {summary} does not match {data['steps']} steps")
+        if len(lines) != data["steps"] + 2 and data["traceComplete"]:
+            self.fail(f"debug trace has {len(lines)} lines for {data['steps']} steps")
+        print(f"   trace {artifact['path']} {artifact['bytes']} bytes")
+        if not passed or not data["outputs"]:
+            return
+        target = next((item for item in data["outputs"] if item["signatureIndex"] == 0
+                       or item["name"].upper().endswith("TARGET0")), data["outputs"][0])
+        shader_out = (passed[-1].get("shaderOut") or {}).get("color") or []
+        count = min(len(shader_out), len(target["value"]))
+        if count and all(isinstance(target["value"][index], (int, float)) and
+                         abs(float(target["value"][index]) - float(shader_out[index])) < 2e-3
+                         for index in range(count)):
+            print(f"   {target['name']} matches pixel_history shaderOut {shader_out[:count]}")
+        else:
+            print(f"   NOTE: {target['name']} {target['value']} vs pixel_history shaderOut "
+                  f"{shader_out} (UNORM targets quantise the shader output)")
+
     def first_buffer(self, state: dict | None) -> str | None:
         data = (state or {}).get("data", {})
         assembly = data.get("inputAssembly") or {}
@@ -370,6 +422,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pixel-history", action="append", default=[],
                         metavar="RESOURCE:EID:X:Y",
                         help="Also print pixel_history for this texel (repeatable).")
+    parser.add_argument("--debug-pixel", action="append", default=[],
+                        metavar="RESOURCE:EID:X:Y",
+                        help="Also run debug_pixel for this pixel (repeatable).")
     parser.add_argument("--launch", type=Path, help="Start qrendertest with this capture first.")
     parser.add_argument("--exe", type=Path, default=REPO_DIR / "x64" / "Release" / "qrendertest.exe")
     args = parser.parse_args(argv)
@@ -401,6 +456,10 @@ def main(argv: list[str] | None = None) -> int:
                 resource_id, event_id, x, y = spec.split(":")
                 print(f"[pixel_history {spec}]")
                 smoke.check_pixel_history(resource_id, int(event_id), int(x), int(y))
+            for spec in args.debug_pixel:
+                resource_id, event_id, x, y = spec.split(":")
+                print(f"[debug_pixel {spec}]")
+                smoke.check_debug_pixel(resource_id, int(event_id), int(x), int(y))
             smoke.report()
             print("PASS" if not smoke.failures else f"{len(smoke.failures)} check(s) failed")
             return 0 if not smoke.failures else 1

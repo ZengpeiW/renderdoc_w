@@ -42,7 +42,7 @@ def test_tool_annotations_follow_effects() -> None:
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
 
     read_only = {name for name, tool in tools.items() if tool.annotations.readOnlyHint}
-    assert read_only == set(TOOL_NAMES) - {"set_event", "export_texture"}
+    assert read_only == set(TOOL_NAMES) - {"set_event", "export_texture", "debug_pixel"}
     for tool in tools.values():
         assert tool.annotations.destructiveHint is False
         assert tool.annotations.openWorldHint is False
@@ -69,6 +69,7 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "pick_pixel": {"resource_id": "1001", "x": 1, "y": 2},
             "get_texture_stats": {"resource_id": "1001"},
             "pixel_history": {"resource_id": "1001", "x": 1, "y": 2, "event_id": 30},
+            "debug_pixel": {"x": 1, "y": 2, "event_id": 30},
             "get_buffer_data": {"resource_id": "2001", "offset": 4, "size": 4},
             "get_debug_messages": {},
         }
@@ -81,6 +82,8 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["set_event"]["data"]["eventIdAfter"] == 20
     assert results["get_buffer_data"]["data"]["hex"] == "04050607"
     assert results["pixel_history"]["data"]["summary"]["lastPassedEventId"] == 10
+    assert results["debug_pixel"]["data"]["outputs"][0]["name"] == "SV_Target0"
+    assert Path(results["debug_pixel"]["artifacts"][0]["path"]).is_file()
     artifact = results["export_texture"]["artifacts"][0]
     assert Path(artifact["path"]).read_bytes().startswith(b"\x89PNG")
 

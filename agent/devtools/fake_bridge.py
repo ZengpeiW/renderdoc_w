@@ -578,6 +578,50 @@ class FakeRenderTestBridge:
         )
 
     def _method_get_buffer_data(self, params: dict[str, Any]) -> BridgeResult:
+        return self._buffer_data(params)
+
+    def _method_debug_pixel(self, params: dict[str, Any]) -> BridgeResult:
+        event_id = self._event_id(params)
+        action = self._actions[event_id]
+        shader = (action.get("shaders") or {}).get("pixel")
+        if shader is None:
+            raise AgentBridgeError("INVALID_EVENT", "No pixel shader is bound at this event.",
+                                   details={"event_id": event_id, "stage": "pixel"})
+        x, y = params.get("x"), params.get("y")
+        directory = artifact_directory(
+            str(self.root), self.instance_id, self.capture_session_id, "replay"
+        )
+        path = Path(directory) / f"debug-pixel-e{event_id}-x{x}-y{y}.jsonl"
+        path.write_text('{"record":"header"}\n{"record":"summary","steps":1}\n', encoding="utf-8")
+        artifact = describe_artifact(str(path), "shader-debug-trace", "application/x-ndjson",
+                                     source={"event_id": event_id, "x": x, "y": y})
+        output = {"name": "SV_Target0", "signatureIndex": 0, "type": "Float",
+                  "value": [0.25, 0.5, 0.75, 1.0]}
+        return BridgeResult(
+            _payload(
+                {
+                    "eventId": event_id,
+                    "x": x,
+                    "y": y,
+                    "shader": {"resourceId": shader, "entryPoint": "main"},
+                    "debugged": True,
+                    "steps": 1,
+                    "executionComplete": True,
+                    "traceComplete": True,
+                    "inputs": [],
+                    "outputs": [output],
+                    "lastChanges": [],
+                    "nanOrInfSteps": [],
+                    "sampleSteps": 0,
+                    "debugBreakSteps": [],
+                    "traceArtifact": artifact["path"],
+                },
+                artifacts=[artifact],
+            ),
+            self._read_meta(event_id),
+        )
+
+    def _buffer_data(self, params: dict[str, Any]) -> BridgeResult:
         resource = self._resource(params, "buffer")
         offset = params.get("offset", 0)
         size = params.get("size", 256)

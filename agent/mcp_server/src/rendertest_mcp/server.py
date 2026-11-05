@@ -22,6 +22,7 @@ ResourceKind = Literal["texture", "buffer", "shader", "pipeline", "sampler", "ot
 TextureFormat = Literal["png", "exr", "dds"]
 TextureChannels = Literal["rgba", "rgb", "r", "g", "b", "a", "depth", "stencil"]
 HistoryOrder = Literal["newest", "oldest"]
+MaxSteps = Annotated[int, Field(ge=1, le=200000, description="Shader steps to execute at most.")]
 
 EventId = Annotated[int, Field(ge=0, description="RenderDoc event ID (EID).")]
 OptionalEventId = Annotated[
@@ -43,7 +44,8 @@ Limit = Annotated[int, Field(ge=1, le=1000, description="Maximum number of items
 NonNegativeInt = Annotated[int, Field(ge=0)]
 BufferSize = Annotated[int, Field(ge=1, le=16 * 1024 * 1024)]
 
-_LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data", "pixel_history"})
+_LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data", "pixel_history",
+                                   "debug_pixel"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -418,6 +420,39 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                 include_fragments=include_fragments,
                 cursor=cursor,
                 limit=limit,
+            ),
+            instance_id=instance_id,
+        )
+
+    @tool()
+    async def debug_pixel(
+        x: NonNegativeInt,
+        y: NonNegativeInt,
+        event_id: OptionalEventId = None,
+        sample: NonNegativeInt | None = None,
+        primitive: NonNegativeInt | None = None,
+        view: NonNegativeInt | None = None,
+        max_steps: MaxSteps = 20000,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Run the pixel shader of a draw at one pixel in RenderDoc's shader debugger.
+
+        Coordinates are framebuffer pixels with a top-left origin. Returns the shader, its inputs,
+        the final values of its outputs (SV_Target etc.), the last changed variables and steps that
+        generated NaN/Inf. The full step-by-step trace is written to a JSONL artifact. primitive
+        picks a fragment when several overlap (see pixel_history primitiveIds); omit it for the
+        fragment RenderDoc chooses.
+        """
+        return await invoke(
+            "debug_pixel",
+            _clean_params(
+                x=x,
+                y=y,
+                event_id=event_id,
+                sample=sample,
+                primitive=primitive,
+                view=view,
+                max_steps=max_steps,
             ),
             instance_id=instance_id,
         )

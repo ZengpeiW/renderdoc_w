@@ -231,7 +231,7 @@ def build_questions(event_id: int, target: dict[str, Any], x: int, y: int,
             "q3-shader-cbuffer",
             "RenderTest 里打开着一个 capture。检查当前 Draw 的 Pixel Shader 和 CBuffer，"
             "找出可能影响颜色的参数。",
-            (frozenset({"get_shader"}), frozenset({"get_cbuffer"})),
+            (frozenset({"get_shader", "debug_pixel"}), frozenset({"get_cbuffer", "debug_pixel"})),
             (str(event_id),),
         ),
     ]
@@ -284,10 +284,15 @@ def main(argv: list[str] | None = None) -> int:
         x, y = probe.pick_pixel_location(target["resourceId"], int(target["width"]),
                                          int(target["height"]), event_id, writes)
         writer = probe.last_change(target["resourceId"], x, y, event_id, writes)
+        history = probe.call("pixel_history", resource_id=target["resourceId"], x=x, y=y,
+                             event_id=event_id, limit=1)["data"]["summary"]
+        if history.get("lastChangedEventId") is not None:
+            writer = history["lastChangedEventId"]
         truth = {"instanceId": instance_id, "eventId": event_id,
                  "action": inspected["action"]["name"], "renderTarget": target,
                  "pixel": [x, y], "pixelValue": probe.value(target["resourceId"], x, y, event_id),
-                 "lastChangingWrite": writer, "writeEvents": len(writes)}
+                 "lastChangingWrite": writer, "writeEvents": len(writes),
+                 "pixelHistory": history}
         print("ground truth:", json.dumps(truth, ensure_ascii=False))
 
         run_dir = root / time.strftime("%Y%m%d-%H%M%S")

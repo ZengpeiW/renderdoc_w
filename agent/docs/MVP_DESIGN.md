@@ -449,7 +449,7 @@ args = ["-m", "rendertest_mcp"]
 | 工具 | 效果 | 主要参数 | 返回内容 |
 | --- | --- | --- | --- |
 | `pixel_history` | read | `resource_id`, `x`, `y`, `event_id?`, `mip?`, `slice?`, `sample?`, `order?`, `include_fragments?`, `cursor?`, `limit?` | 截至目标 EID 的像素修改历史，按事件分组（片元/失败原因计数、前后值），附 summary 和 discard 事件（M4 已实现） |
-| `debug_pixel` | artifact | `event_id`, `x`, `y`, `sample?`, `primitive?`, `max_steps?` | 调试摘要、关键变量、完整 trace artifact |
+| `debug_pixel` | artifact | `event_id?`, `x`, `y`, `sample?`, `primitive?`, `view?`, `max_steps?` | 调试摘要（输入、最终输出、最后改变的变量、NaN/Inf 步骤）、完整 JSONL trace artifact（M4 已实现） |
 | `debug_vertex` | artifact | `event_id`, `vertex`, `instance?`, `view?`, `max_steps?` | 调试摘要、输出变量、完整 trace artifact |
 | `get_mesh_data` | read/artifact | `event_id`, `stage`, `cursor?`, `limit?` | Post-VS 输入输出布局和顶点数据 |
 
@@ -671,6 +671,12 @@ M4 `pixel_history` 实机验收（`--pixel-history RESOURCE:EID:X:Y` 可追加�
 - 目标 EID 之后没有 discard 时，`summary.finalValue` 与同一位置 `pick_pixel` 一致。
 - nanite capture 实测（D3D12）：RT 116618（Lumen.CardCaptureAlbedoAtlas）(1,1) 截至 EID 1513 有 2 个事件：1474 全屏 `DrawInstanced` 写 0（未改变值），1513 有 80 个片元、5 个通过、75 个 `depthTestFailed`，最终值 [69,69,68,0]/255；(256,256) 不在 1513 的 8×16 viewport 内，历史为空并提示 EID 1459 的 discard。首次约 0.3 s，缓存后翻页约 0.05 s，默认响应约 2 KB。
 
+M4 `debug_pixel` 实机验收（`--debug-pixel RESOURCE:EID:X:Y`；`--all-p0` 也会对自动挑选的 Draw 跑一次）：
+
+- 自动从 `pixel_history` 取该 EID 最后一个通过片元的 primitive；`debugged=true` 时 trace JSONL 的 summary 步数与结果一致，UI EID 不变。
+- 输出 `SV_Target0` 与 `pixel_history` 同一片元的 `shaderOut` 一致（UNORM 目标允许量化误差）。
+- nanite capture 实测：EID 1513 (1,1) primitive 30161，417 步执行完成，约 2.5 s；`SV_Target0`=[0.2553,0.2549,0.2516,0] 与 `shaderOut` 一致，trace 约 145 KB，响应约 2.7 KB。(256,256)、(3,5) 不被该 Draw 覆盖，返回 `debugged=false` 并提示用 `pixel_history`。
+
 参考耗时目标：
 
 | 操作 | 目标 |
@@ -735,7 +741,7 @@ M4 `pixel_history` 实机验收（`--pixel-history RESOURCE:EID:X:Y` 可追加�
 4. **M3：Agent 工作流**
    - 4 个 Skills、Codex 配置和端到端问题验收。
 5. **M4：P1 调试工具**
-   - Pixel History（已完成）、Pixel/Vertex Debug 和 Mesh 数据。
+   - Pixel History、Pixel Debug（已完成）、Vertex Debug 和 Mesh 数据。
 
 完成 M3 后即可形成可用 MVP。M4 完成后再评估是否进入 Shader 替换、CBuffer 修改和 qrenderdoc 内嵌 AI 面板。
 

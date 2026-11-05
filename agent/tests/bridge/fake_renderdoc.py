@@ -131,10 +131,25 @@ class TextureSave:
         self.alpha = AlphaMapping.Discard
 
 
+class DebugPixelInputs:
+    def __init__(self) -> None:
+        self.sample = 0xFFFFFFFF
+        self.primitive = 0xFFFFFFFF
+        self.view = 0xFFFFFFFF
+
+
+class DebugVariableType(enum.IntEnum):
+    Undefined = 0
+    Input = 1
+    Constant = 2
+    Variable = 6
+
+
 def module() -> types.ModuleType:
     rd = types.ModuleType("renderdoc")
     for value in (ResourceId, ShaderStage, ActionFlags, CompType, FileType, AlphaMapping,
-                  ResourceType, DescriptorType, VarType, Subresource, TextureSave):
+                  ResourceType, DescriptorType, VarType, Subresource, TextureSave,
+                  DebugPixelInputs, DebugVariableType):
         setattr(rd, value.__name__, value)
     return rd
 
@@ -311,6 +326,10 @@ class FakeController:
         self.saved: list[tuple[Any, Any, str]] = []
         self.history_calls: list[tuple[int, int, int, int]] = []
         self.pixel_history_supported = True
+        self.debug_calls: list[tuple[int, int, int, Any]] = []
+        self.freed: list[Any] = []
+        self.debug_steps = 3
+        self.debug_misses = False
         self.on_callback: Callable[[], None] | None = None
         self.textures = [NS(resourceId=ResourceId(100), width=4, height=4, depth=1, mips=2,
                             arraysize=1, msSamp=1, msQual=0, cubemap=False, dimension=2,
@@ -369,7 +388,48 @@ class FakeController:
                 NS(eventId=8, usage=NS(name="CS_Resource"))]
 
     def GetAPIProperties(self) -> Any:
-        return NS(pixelHistory=self.pixel_history_supported)
+        return NS(pixelHistory=self.pixel_history_supported, shaderDebugging=True)
+
+    def DebugPixel(self, x: int, y: int, inputs: Any) -> Any:
+        self.debug_calls.append((self.current, x, y, inputs.primitive))
+        if self.debug_misses:
+            return NS(debugger=None)
+
+        def var(name: str, *values: float) -> Any:
+            return NS(name=name, type=VarType.Float, rows=1, columns=len(values), members=[],
+                      value=shader_value(f32v=list(values)))
+
+        empty = NS(name="", type=VarType.Float, rows=0, columns=0, members=[],
+                   value=shader_value())
+        steps = []
+        for index in range(self.debug_steps):
+            value = float(index + 1)
+            changes = [NS(before=empty if index == 0 else var("r0", value - 1, 0.0),
+                          after=var("r0", value, float("nan") if index == 1 else 0.0))]
+            if index == self.debug_steps - 1:
+                changes.append(NS(before=empty, after=var("o0", 0.25, 0.5, 0.75, 1.0)))
+                changes.append(NS(before=var("r0", value, 0.0), after=empty))
+            steps.append(NS(stepIndex=index + 1, nextInstruction=index + 1,
+                            flags=2 if index == 1 else (1 if index == 0 else 0),
+                            changes=changes, callstack=[]))
+        batches = [steps[:2], steps[2:], []]
+        mapping = NS(name="SV_Target0", type=VarType.Float, signatureIndex=0,
+                     variables=[NS(name="o0", type=DebugVariableType.Variable, component=item)
+                                for item in range(4)])
+        internal = NS(name="tmp", type=VarType.Float, signatureIndex=-1,
+                      variables=[NS(name="r0", type=DebugVariableType.Variable, component=0)])
+        info = [NS(instruction=0, lineInfo=NS(disassemblyLine=1, fileIndex=-1, lineStart=0,
+                                              lineEnd=0)),
+                NS(instruction=2, lineInfo=NS(disassemblyLine=5, fileIndex=0, lineStart=3,
+                                              lineEnd=3))]
+        return NS(debugger=NS(batches=batches), inputs=[var("uv", 0.5, 0.25)],
+                  sourceVars=[mapping, internal], instInfo=info)
+
+    def ContinueDebug(self, debugger: Any) -> list[Any]:
+        return debugger.batches.pop(0) if debugger.batches else []
+
+    def FreeTrace(self, trace: Any) -> None:
+        self.freed.append(trace)
 
     def PixelHistory(self, texture: ResourceId, x: int, y: int, sub: Subresource,
                      cast: CompType) -> list[Any]:
