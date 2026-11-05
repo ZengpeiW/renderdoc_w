@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+mcp_server/.venv/
+mcp_server/build/
+mcp_server/dist/
+mcp_server/src/*.egg-info/
+.pytest_cache/
+.pytest-tmp/
+.agent-data/
