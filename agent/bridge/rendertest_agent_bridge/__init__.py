@@ -30,6 +30,7 @@ def start(version, ctx):
     from .runtime import AgentBridgeRuntime
 
     runtime = AgentBridgeRuntime(renderdoc_version=version)
+    runtime.attach(ctx)
     runtime.start()
     viewer = None
     try:

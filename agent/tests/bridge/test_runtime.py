@@ -130,7 +130,7 @@ def test_start_without_capture_serves_status(fake_qrenderdoc: None, agent_root: 
     data = manifest(agent_root)
     assert data["captureLoaded"] is False
     assert data["renderdocVersion"] == "1.47"
-    assert data["methods"] == ["get_context", "get_status", "ping"]
+    assert {"get_context", "get_status", "ping", "list_actions"} <= set(data["methods"])
 
     api = client(agent_root)
     assert api.call("ping").result["data"]["pong"] is True
@@ -140,6 +140,10 @@ def test_start_without_capture_serves_status(fake_qrenderdoc: None, agent_root: 
 
     with pytest.raises(RenderTestAgentError) as error:
         api.call("list_actions", {})
+    assert error.value.code == "NO_CAPTURE"
+
+    with pytest.raises(RenderTestAgentError) as error:
+        api.call("pixel_history", {})
     assert error.value.code == "UNKNOWN_METHOD"
 
 

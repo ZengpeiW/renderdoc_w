@@ -58,9 +58,12 @@ Codex / Claude / IDE Agent
 - `replay` 类方法在 worker 中调用 `ctx.Replay().BlockInvoke()`，不得在 Qt 线程中调用。
 - 带 `event_id` 的只读工具在同一次 replay 调用里：
   1. 保存当前 replay EID；
-  2. `SetFrameEvent(event_id, True)`；
+  2. `SetFrameEvent(event_id, False)`（EID 不变时不重放）；
   3. 读取数据；
-  4. 在 `finally` 中恢复原 EID。
+  4. 在 `finally` 中恢复到 UI 快照里的当前 EID。
+- `CaptureContext::SetEventID` 先改 UI 的 EID，再把 `SetFrameEvent` 异步排进 replay 队列，所以只读工具恢复时看到的快照可能落后。恢复后再对照一次最新快照，若 UI 已经切到别的 EID，就跟随过去（reconcile），保证只读工具结束后 replay EID 与 UI 一致。
+- replay 线程未运行时 `BlockInvoke` 不会执行回调，Bridge 检测到后返回 `CAPTURE_CHANGED`；回调内的异常全部捕获并转成结构化错误，不抛回 C++。
+- 调试消息读 `ctx.DebugMessages()`（UI 线程上的副本），不调用 controller 的 `GetDebugMessages()`：后者会清空队列，抢走 UI 的消息。
 - 只读工具不得调用 `ctx.SetEventID()`，因此不改变用户在 UI 中选中的事件。
 - `set_event` 是唯一会改变 UI 选中事件的 MVP 工具。
 
@@ -639,8 +642,13 @@ M1 生命周期由 `agent/devtools/live_lifecycle.py` 自动验收：启动 qren
 
 ```powershell
 cd agent/mcp_server
-.\.venv\Scripts\python.exe ..\scripts\smoke_live.py --all-p0
+# 对已打开的 qrendertest
+.\.venv\Scripts\python.exe ..\devtools\smoke_live.py --all-p0
+# 或自动启动 qrendertest 打开 capture，跑完后 WM_CLOSE 退出
+.\.venv\Scripts\python.exe ..\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc"
 ```
+
+`smoke_live.py --all-p0` 会自动挑一个绑定了颜色 RT 的 Draw，依次调用全部 P0 工具（含无效 EID/ResourceId/坐标的错误路径），检查分页无重复、只读工具不改变 UI EID、`set_event` 生效、PNG 尺寸与资源一致、响应小于 8 MiB，并打印每个工具的耗时。
 
 通过条件：
 

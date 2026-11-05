@@ -1,10 +1,15 @@
+"""Artifact files written under ``<root>/artifacts/<instanceId>/<session>/<category>``."""
+
 import hashlib
 import os
 import re
+import struct
+import uuid
 
 from .paths import artifacts_root
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _safe_component(value, label):
@@ -50,3 +55,31 @@ def describe_artifact(path, kind, media_type, source=None, extra=None):
     if extra:
         value.update(extra)
     return value
+
+
+def artifact_path(runtime, session, prefix, extension, category="replay"):
+    directory = artifact_directory(runtime.root, runtime.instance_id, session or "nosession",
+                                   category)
+    name = _UNSAFE_NAME.sub("_", str(prefix)).strip("._") or "artifact"
+    return os.path.join(directory, "%s-%s.%s" % (name[:96], uuid.uuid4().hex[:8], extension))
+
+
+def describe(path, kind, media_type, source=None, **extra):
+    return describe_artifact(path, kind, media_type, source=source, extra=extra)
+
+
+def write_bytes(runtime, session, prefix, extension, data, kind, media_type, source=None,
+                **extra):
+    path = artifact_path(runtime, session, prefix, extension)
+    with open(path, "wb") as stream:
+        stream.write(data)
+    return describe(path, kind, media_type, source=source, **extra)
+
+
+def png_size(path):
+    """Return ``(width, height)`` from a PNG header, or None if the file is not a PNG."""
+    with open(path, "rb") as stream:
+        header = stream.read(24)
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        return None
+    return struct.unpack(">II", header[16:24])

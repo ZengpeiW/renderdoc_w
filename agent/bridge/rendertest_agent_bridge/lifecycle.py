@@ -53,6 +53,10 @@ class CaptureState(object):
                 "currentAction": dict(self._current_action) if self._current_action else None,
             }
 
+    def current_event_id(self):
+        with self._lock:
+            return self._current_event_id if self._loaded else None
+
     def capture_loaded(self, path, api, selected=None, current=None):
         with self._lock:
             self._clear()

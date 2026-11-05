@@ -1,9 +1,8 @@
 import os
 
-
-def _payload(data):
-    return {"data": data, "artifacts": [], "warnings": [], "nextCursor": None,
-            "truncated": False}
+from ..ipc import AgentBridgeError
+from .common import action_index, payload, resource_index
+from .pipeline import read_pipeline_summary
 
 
 def _capture_summary(state):
@@ -21,11 +20,11 @@ def _capture_summary(state):
 
 
 def ping(runtime, context):
-    return _payload({"pong": True, "instanceId": runtime.instance_id})
+    return payload({"pong": True, "instanceId": runtime.instance_id})
 
 
 def get_status(runtime, context):
-    return _payload({
+    return payload({
         "bridge": {
             "instanceId": runtime.instance_id,
             "version": runtime.bridge_version,
@@ -37,19 +36,34 @@ def get_status(runtime, context):
     })
 
 
+def _pipeline_summary(runtime, context):
+    if runtime.replay.manager is None:
+        return None, []
+    try:
+        actions = action_index(runtime, context)
+        resources = resource_index(runtime, context)
+        node = actions.action_for(context.state.get("currentEventId"))
+        summary = runtime.replay.call(
+            context, lambda controller: read_pipeline_summary(controller, resources, node)[0])
+        return summary, []
+    except AgentBridgeError as error:
+        return None, ["Pipeline summary unavailable: %s: %s" % (error.code, error.message)]
+
+
 def get_context(runtime, context):
     state = context.state
     if not state.get("captureLoaded"):
-        return _payload({"captureLoaded": False, "action": None, "pipeline": None})
-    return _payload({
+        return payload({"captureLoaded": False, "action": None, "pipeline": None})
+    pipeline, warnings = _pipeline_summary(runtime, context)
+    return payload({
         "captureLoaded": True,
         "api": state.get("api") or "",
         "currentEventId": state.get("currentEventId"),
         "selectedEventId": state.get("selectedEventId"),
         "action": state.get("currentAction"),
         "selectedAction": state.get("selectedAction"),
-        "pipeline": None,
-    })
+        "pipeline": pipeline,
+    }, warnings=warnings)
 
 
 HANDLERS = {

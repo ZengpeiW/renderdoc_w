@@ -6,10 +6,12 @@ import time
 import uuid
 
 from .constants import BRIDGE_VERSION
+from .indexes import SessionCache
 from .ipc import AgentBridgeError, MailboxServer, read_json_file
 from .lifecycle import CaptureState
 from .methods import HANDLERS
-from .paths import agent_root, instances_root
+from .paths import agent_root, artifacts_root, instances_root
+from .replay import ReplayRunner, UiInvoker
 
 POLL_INTERVAL_SECONDS = 0.05
 STOP_TIMEOUT_SECONDS = 5.0
@@ -75,6 +77,7 @@ def prune_instances(root, keep_instance_id, now=None):
         age = now - heartbeat
         if (stopped and age > PRUNE_STOPPED_AFTER_SECONDS) or age > PRUNE_SILENT_AFTER_SECONDS:
             shutil.rmtree(directory, ignore_errors=True)
+            shutil.rmtree(os.path.join(artifacts_root(root), name), ignore_errors=True)
             removed.append(name)
     return removed
 
@@ -94,12 +97,28 @@ class AgentBridgeRuntime(object):
         self.methods = tuple(sorted(self.handlers))
         self.log = BridgeLog(os.path.join(self.root, "logs", "bridge-%s.log" % self.instance_id),
                              echo)
+        self.ctx = None
+        self.replay = ReplayRunner(self.state, self.log)
+        self.ui = UiInvoker(self.log)
+        self.cache = SessionCache()
         self.server = MailboxServer(self.root, self.instance_id, self._handle,
                                     self.state.snapshot, methods=self.methods,
                                     renderdoc_version=self.renderdoc_version, log=self.log)
         self._poll_stop = threading.Event()
         self._poll_thread = None
         self.running = False
+
+    def attach(self, ctx):
+        """Bind the qrenderdoc capture context. Must run on the UI thread."""
+        self.ctx = ctx
+        try:
+            self.replay.manager = ctx.Replay()
+        except Exception as error:
+            self.log("Replay manager unavailable: %s" % error)
+        try:
+            self.ui.helper = ctx.Extensions().GetMiniQtHelper()
+        except Exception as error:
+            self.log("UI helper unavailable: %s" % error)
 
     def start(self):
         if self.running:
@@ -123,6 +142,7 @@ class AgentBridgeRuntime(object):
     def stop(self, timeout=STOP_TIMEOUT_SECONDS):
         if not self.running:
             return True
+        self.ui.close()
         self._poll_stop.set()
         stopped = True
         if self._poll_thread is not None:
@@ -139,6 +159,8 @@ class AgentBridgeRuntime(object):
         return stopped
 
     def notify_state_changed(self):
+        if not self.state.snapshot().get("captureLoaded"):
+            self.cache.clear()
         try:
             self.server.notify_activity()
         except Exception as error:
