@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QCoreApplication>
+#include <QJsonObject>
 #include <QString>
 
 // Owns the built-in RenderTest agent bridge: a fixed Python package shipped next to the
@@ -23,9 +24,19 @@ public:
   const QString &LastError() const { return m_LastError; }
 
   static QString PackageRoot();
+  // agent data root shared with the bridge and MCP server (RENDERTEST_AGENT_ROOT or
+  // %LOCALAPPDATA%/RenderTest/agent).
+  static QString AgentRoot();
+  // picks the live bridge instance published by process pid from an instances directory.
+  static QString SelectInstanceId(const QString &instancesDir, qint64 pid);
+  // the bridge instance id of this process, read from the bridge manifest.
+  QString InstanceId();
+  // the current manifest of this process' bridge instance, or an empty object.
+  QJsonObject ReadManifest();
 
 private:
   bool m_Running = false;
   bool m_Disabled = false;
   QString m_LastError;
+  QString m_InstanceId;
 };

@@ -50,6 +50,8 @@ agent/
   devtools/codex_e2e.py             # codex exec 跑 3 个端到端验收问题
   devtools/live_lifecycle.py        # 启动 qrendertest，自动验收加载/选中/关闭/重载/退出
   devtools/ui_lifecycle_script.py   # live_lifecycle.py 使用的 --ui-script
+  devtools/fake_app_server.py       # 按场景回放的 fake codex app-server，测试 AI 面板
+  devtools/chat_panel_e2e.py        # AI 面板验收：fake 场景 A1–A6，或 --real 接真实 codex
   tests/                            # 协议、实例选择、工具契约和 stdio 冒烟测试
   docs/MVP_DESIGN.md
 ```
@@ -123,6 +125,32 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_config.py
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "E:\Captures\some.rdc" --dry-run
 # 真正提问；回答和事件流保存在 agent/.agent-data/e2e/<时间>/
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "E:\Captures\some.rdc"
+```
+
+## qrendertest 内的 AI 面板（M5a）
+
+菜单 `Window → AI Assistant` 打开可停靠面板。第一次发送消息时，面板启动 `codex app-server`，并把 rendertest MCP 绑定到本窗口的 Bridge 实例；不需要改 `~/.codex/config.toml`。
+
+- 前提：已经安装 Codex CLI（`npm install -g @openai/codex`），并执行过 `codex login`；`agent/mcp_server/.venv` 已创建。
+- 只读：thread 使用 `read-only` 沙箱和 `never` 审批，所有审批请求都会被拒绝；默认关闭 shell、web search 和其它 MCP server。
+- 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息会新建 thread。“New Chat”清空对话。
+- 每条消息前会附上 `<rendertest_context>`（实例 id、capture、当前 EID），这是发送时的快照。
+- 日志：`<agent root>/logs/chat-<instanceId>.log`，包含启动参数和 app-server 的 stderr 尾部。
+
+环境变量：
+
+- `RENDERTEST_AGENT_CODEX_COMMAND`：替换 codex 命令（按空格拆分，支持引号），默认查找 npm 安装的 `codex.exe`，再查 PATH。
+- `RENDERTEST_MCP_PYTHON`：MCP Server 使用的 Python，默认是 exe 上层目录中的 `agent/mcp_server/.venv/Scripts/python.exe`。
+- `RENDERTEST_AGENT_ISOLATE=0`：不关闭用户自己的 Codex feature 和 MCP server。
+- `RENDERTEST_AGENT_CHAT_AUTOTEST`：测试钩子（JSON 或 JSON 文件路径），由 `chat_panel_e2e.py` 使用。
+
+验收：
+
+```powershell
+# fake app-server，不调用模型
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py
+# 真实 codex：选中 EID 后提问、第二问中途 Stop、退出后检查进程树（会把 capture 数据发给模型）
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --real --capture "E:\Captures\some.rdc" --event 1513
 ```
 
 ## 用 fake Bridge 手动试用

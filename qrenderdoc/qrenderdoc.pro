@@ -171,6 +171,10 @@ SOURCES += Code/qrenderdoc.cpp \
     Code/ReplayManager.cpp \
     Code/CaptureContext.cpp \
     Code/Agent/RenderTestAgentIntegration.cpp \
+    Code/Agent/AgentConversation.cpp \
+    Code/Agent/AgentLaunchConfig.cpp \
+    Code/Agent/AgentMarkdown.cpp \
+    Code/Agent/CodexAppServerClient.cpp \
     Code/ScintillaSyntax.cpp \
     Code/QRDUtils.cpp \
     Code/MiniQtHelper.cpp \
@@ -235,6 +239,7 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/LogView.cpp \
     Windows/CommentView.cpp \
     Windows/StatisticsViewer.cpp \
+    Windows/AgentChatPanel.cpp \
     Windows/TimelineBar.cpp \
     Windows/Dialogs/SettingsDialog.cpp \
     Widgets/OrderedListEditor.cpp \
@@ -262,6 +267,10 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/Dialogs/ProjectionGuessDialog.cpp
 HEADERS += Code/CaptureContext.h \
     Code/Agent/RenderTestAgentIntegration.h \
+    Code/Agent/AgentConversation.h \
+    Code/Agent/AgentLaunchConfig.h \
+    Code/Agent/AgentMarkdown.h \
+    Code/Agent/CodexAppServerClient.h \
     Code/qprocessinfo.h \
     Code/ReplayManager.h \
     Code/ScintillaSyntax.h \
@@ -328,6 +337,7 @@ HEADERS += Code/CaptureContext.h \
     Windows/LogView.h \
     Windows/CommentView.h \
     Windows/StatisticsViewer.h \
+    Windows/AgentChatPanel.h \
     Windows/TimelineBar.h \
     Windows/Dialogs/SettingsDialog.h \
     Widgets/OrderedListEditor.h \

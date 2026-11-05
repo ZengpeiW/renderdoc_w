@@ -37,6 +37,7 @@
 #include <QShortcut>
 #include <QToolButton>
 #include <QToolTip>
+#include "Code/CaptureContext.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Code/pyrenderdoc/PythonContext.h"
@@ -44,6 +45,7 @@
 #include "Widgets/Extended/RDMenu.h"
 #include "Widgets/Extended/RDToolButton.h"
 #include "Widgets/ReplayOptionsSelector.h"
+#include "Windows/AgentChatPanel.h"
 #include "Windows/Dialogs/AboutDialog.h"
 #include "Windows/Dialogs/CaptureDialog.h"
 #include "Windows/Dialogs/CrashDialog.h"
@@ -3045,6 +3047,25 @@ void MainWindow::on_action_Resource_Inspector_triggered()
     ToolWindowManager::raiseToolWindow(resourceInspector);
   else
     ui->toolWindowManager->addToolWindow(resourceInspector, mainToolArea());
+}
+
+void MainWindow::on_action_AI_Assistant_triggered()
+{
+  // the AI panel is a C++-only built-in window, so it is not part of ICaptureContext
+  QWidget *chat = static_cast<CaptureContext &>(m_Ctx).GetAgentChatPanel()->Widget();
+
+  if(ui->toolWindowManager->toolWindows().contains(chat))
+  {
+    ToolWindowManager::raiseToolWindow(chat);
+    return;
+  }
+
+  ToolWindowManager::AreaReference area = mainToolArea();
+  if(area.area())
+    ui->toolWindowManager->addToolWindow(
+        chat, ToolWindowManager::AreaReference(ToolWindowManager::RightOf, area.area(), 0.3f));
+  else
+    ui->toolWindowManager->addToolWindow(chat, area);
 }
 
 void MainWindow::on_action_Send_Error_Report_triggered()

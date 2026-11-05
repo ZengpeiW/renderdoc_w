@@ -129,6 +129,18 @@
     <ClCompile Include="Code\Agent\RenderTestAgentIntegration.cpp">
       <Filter>Code\Agent</Filter>
     </ClCompile>
+    <ClCompile Include="Code\Agent\AgentConversation.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\Agent\AgentLaunchConfig.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\Agent\AgentMarkdown.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\Agent\CodexAppServerClient.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
     <ClCompile Include="Widgets\TextureGoto.cpp">
       <Filter>Widgets</Filter>
     </ClCompile>
@@ -387,6 +399,9 @@
     <ClCompile Include="Windows\DescriptorViewer.cpp">
       <Filter>Windows</Filter>
     </ClCompile>
+    <ClCompile Include="Windows\AgentChatPanel.cpp">
+      <Filter>Windows</Filter>
+    </ClCompile>
     <ClCompile Include="Windows\StatisticsViewer.cpp">
       <Filter>Windows</Filter>
     </ClCompile>
@@ -523,6 +538,12 @@
       <Filter>Generated Files</Filter>
     </ClCompile>
     <ClCompile Include="$(IntDir)generated\moc_ShaderViewer.cpp">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)generated\moc_CodexAppServerClient.cpp">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)generated\moc_AgentChatPanel.cpp">
       <Filter>Generated Files</Filter>
     </ClCompile>
     <ClCompile Include="$(IntDir)generated\moc_StatisticsViewer.cpp">
@@ -819,6 +840,15 @@
       <Filter>Code</Filter>
     </ClInclude>
     <ClInclude Include="Code\Agent\RenderTestAgentIntegration.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\AgentConversation.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\AgentLaunchConfig.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\AgentMarkdown.h">
       <Filter>Code\Agent</Filter>
     </ClInclude>
     <ClInclude Include="Code\qprocessinfo.h">
@@ -1350,6 +1380,12 @@
       <Filter>Windows</Filter>
     </CustomBuild>
     <CustomBuild Include="Windows\ShaderViewer.h">
+      <Filter>Windows</Filter>
+    </CustomBuild>
+    <CustomBuild Include="Code\Agent\CodexAppServerClient.h">
+      <Filter>Code\Agent</Filter>
+    </CustomBuild>
+    <CustomBuild Include="Windows\AgentChatPanel.h">
       <Filter>Windows</Filter>
     </CustomBuild>
     <CustomBuild Include="Windows\StatisticsViewer.h">

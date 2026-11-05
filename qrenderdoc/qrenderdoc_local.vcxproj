@@ -634,6 +634,8 @@
     <ClCompile Include="$(IntDir)generated\moc_PipelineStateViewer.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_PythonContext.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_QRDUtils.cpp" />
+    <ClCompile Include="$(IntDir)generated\moc_CodexAppServerClient.cpp" />
+    <ClCompile Include="$(IntDir)generated\moc_AgentChatPanel.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_PipelineFlowChart.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_RangeHistogram.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_AnnotationDisplay.cpp" />
@@ -735,6 +737,10 @@
     <ClCompile Include="Widgets\MarkerBreadcrumbs.cpp" />
     <ClCompile Include="Code\CaptureContext.cpp" />
     <ClCompile Include="Code\Agent\RenderTestAgentIntegration.cpp" />
+    <ClCompile Include="Code\Agent\AgentConversation.cpp" />
+    <ClCompile Include="Code\Agent\AgentLaunchConfig.cpp" />
+    <ClCompile Include="Code\Agent\AgentMarkdown.cpp" />
+    <ClCompile Include="Code\Agent\CodexAppServerClient.cpp" />
     <ClCompile Include="Styles\RDStyle\RDStyle.cpp" />
     <ClCompile Include="Styles\StyleData.cpp" />
     <ClCompile Include="Styles\RDTweakedNativeStyle\RDTweakedNativeStyle.cpp" />
@@ -787,6 +793,7 @@
     <ClCompile Include="Windows\PixelHistoryView.cpp" />
     <ClCompile Include="Windows\PerformanceCounterViewer.cpp" />
     <ClCompile Include="Windows\StatisticsViewer.cpp" />
+    <ClCompile Include="Windows\AgentChatPanel.cpp" />
     <ClCompile Include="Windows\TimelineBar.cpp" />
     <ClCompile Include="Windows\TextureViewer.cpp" />
     <ClCompile Include="3rdparty\toolwindowmanager\ToolWindowManager.cpp">
@@ -1002,6 +1009,9 @@
     <ClInclude Include="Code\RGPInterop.h" />
     <ClInclude Include="Code\CaptureContext.h" />
     <ClInclude Include="Code\Agent\RenderTestAgentIntegration.h" />
+    <ClInclude Include="Code\Agent\AgentConversation.h" />
+    <ClInclude Include="Code\Agent\AgentLaunchConfig.h" />
+    <ClInclude Include="Code\Agent\AgentMarkdown.h" />
     <ClInclude Include="Styles\StyleData.h" />
     <ClInclude Include="Code\qprocessinfo.h" />
     <ClInclude Include="Code\MiniQtHelper.h" />
@@ -1435,6 +1445,18 @@
       <Outputs>$(IntDir)generated\moc_%(Filename).cpp</Outputs>
     </CustomBuild>
     <CustomBuild Include="Windows\PerformanceCounterViewer.h">
+      <AdditionalInputs>%(Fullpath);$(QtBinDir)\moc.exe;%(AdditionalInputs)</AdditionalInputs>
+      <Command>"$(QtBinDir)\moc.exe" -DUNICODE -DWIN32 -DWIN64 -D_WIN32 -D_WIN64 -DRENDERDOC_PLATFORM_WIN32 -DSCINTILLA_QT=1 -DSCI_LEXER=1 -DQT_NO_DEBUG -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB -D_MSC_VER=1900 -I"$(ProjectDir)." -I"$(SolutionDir)\renderdoc\api\replay" -I"$(QtIncludeDir)" -I"$(QtIncludeDir)\QtWidgets" -I"$(QtIncludeDir)\QtGui" -I"$(QtIncludeDir)\QtCore" "%(Fullpath)" -o "$(IntDir)generated\moc_%(Filename).cpp"</Command>
+      <Message>MOC %(Filename).h</Message>
+      <Outputs>$(IntDir)generated\moc_%(Filename).cpp</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="Code\Agent\CodexAppServerClient.h">
+      <AdditionalInputs>%(Fullpath);$(QtBinDir)\moc.exe;%(AdditionalInputs)</AdditionalInputs>
+      <Command>"$(QtBinDir)\moc.exe" -DUNICODE -DWIN32 -DWIN64 -D_WIN32 -D_WIN64 -DRENDERDOC_PLATFORM_WIN32 -DSCINTILLA_QT=1 -DSCI_LEXER=1 -DQT_NO_DEBUG -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB -D_MSC_VER=1900 -I"$(ProjectDir)." -I"$(SolutionDir)\renderdoc\api\replay" -I"$(QtIncludeDir)" -I"$(QtIncludeDir)\QtWidgets" -I"$(QtIncludeDir)\QtGui" -I"$(QtIncludeDir)\QtCore" "%(Fullpath)" -o "$(IntDir)generated\moc_%(Filename).cpp"</Command>
+      <Message>MOC %(Filename).h</Message>
+      <Outputs>$(IntDir)generated\moc_%(Filename).cpp</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="Windows\AgentChatPanel.h">
       <AdditionalInputs>%(Fullpath);$(QtBinDir)\moc.exe;%(AdditionalInputs)</AdditionalInputs>
       <Command>"$(QtBinDir)\moc.exe" -DUNICODE -DWIN32 -DWIN64 -D_WIN32 -D_WIN64 -DRENDERDOC_PLATFORM_WIN32 -DSCINTILLA_QT=1 -DSCI_LEXER=1 -DQT_NO_DEBUG -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB -D_MSC_VER=1900 -I"$(ProjectDir)." -I"$(SolutionDir)\renderdoc\api\replay" -I"$(QtIncludeDir)" -I"$(QtIncludeDir)\QtWidgets" -I"$(QtIncludeDir)\QtGui" -I"$(QtIncludeDir)\QtCore" "%(Fullpath)" -o "$(IntDir)generated\moc_%(Filename).cpp"</Command>
       <Message>MOC %(Filename).h</Message>

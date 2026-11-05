@@ -29,10 +29,13 @@
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMetaObject>
+#include <QProcessEnvironment>
 #include <QProgressDialog>
 #include <QRegularExpression>
 #include <QTimer>
@@ -41,6 +44,7 @@
 #include "Code/pyrenderdoc/PythonContext.h"
 #include "Widgets/AnnotationDisplay.h"
 #include "Windows/APIInspector.h"
+#include "Windows/AgentChatPanel.h"
 #include "Windows/BufferViewer.h"
 #include "Windows/CommentView.h"
 #include "Windows/DebugMessageView.h"
@@ -314,6 +318,30 @@ CaptureContext::CaptureContext(PersistentConfig &cfg) : m_Config(cfg)
   // the built-in agent bridge is loaded from the application directory after user extensions
   m_AgentIntegration = new RenderTestAgentIntegration();
   m_AgentIntegration->Initialize();
+
+  // test hook for the AI panel: a JSON object, or a path to a JSON file
+  // read through QProcessEnvironment so non-ASCII text survives on Windows
+  QString chatAutotest =
+      QProcessEnvironment::systemEnvironment().value(lit("RENDERTEST_AGENT_CHAT_AUTOTEST")).trimmed();
+  if(!chatAutotest.isEmpty())
+  {
+    QTimer::singleShot(0, m_MainWindow, [this, chatAutotest]() {
+      QByteArray json = chatAutotest.toUtf8();
+      if(!chatAutotest.startsWith(QLatin1Char('{')))
+      {
+        QFile file(chatAutotest);
+        json = file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+      }
+      QJsonObject config = QJsonDocument::fromJson(json).object();
+      if(config.isEmpty())
+      {
+        qCritical() << "RENDERTEST_AGENT_CHAT_AUTOTEST is not a JSON object";
+        return;
+      }
+      ShowAgentChatPanel();
+      GetAgentChatPanel()->RunAutotest(config);
+    });
+  }
 }
 
 CaptureContext::~CaptureContext()
@@ -2526,6 +2554,18 @@ IStatisticsViewer *CaptureContext::GetStatisticsViewer()
   return m_StatisticsViewer;
 }
 
+AgentChatPanel *CaptureContext::GetAgentChatPanel()
+{
+  if(m_AgentChatPanel)
+    return m_AgentChatPanel;
+
+  m_AgentChatPanel = new AgentChatPanel(*this, m_MainWindow);
+  m_AgentChatPanel->setObjectName(lit("agentChat"));
+  setupDockWindow(m_AgentChatPanel, true);
+
+  return m_AgentChatPanel;
+}
+
 ITimelineBar *CaptureContext::GetTimelineBar()
 {
   if(m_TimelineBar)
@@ -2620,6 +2660,11 @@ void CaptureContext::ShowPerformanceCounterViewer()
 void CaptureContext::ShowStatisticsViewer()
 {
   m_MainWindow->showStatisticsViewer();
+}
+
+void CaptureContext::ShowAgentChatPanel()
+{
+  m_MainWindow->showAgentChatPanel();
 }
 
 void CaptureContext::ShowTimelineBar()
@@ -2879,6 +2924,10 @@ QWidget *CaptureContext::CreateBuiltinWindow(const rdcstr &objectName)
   {
     return GetPerformanceCounterViewer()->Widget();
   }
+  else if(objectName == "agentChat")
+  {
+    return GetAgentChatPanel()->Widget();
+  }
 
   return NULL;
 }
@@ -2913,6 +2962,8 @@ void CaptureContext::BuiltinWindowClosed(QWidget *window)
     m_ResourceInspector = NULL;
   else if(m_PerformanceCounterViewer && m_PerformanceCounterViewer->Widget() == window)
     m_PerformanceCounterViewer = NULL;
+  else if(m_AgentChatPanel && m_AgentChatPanel->Widget() == window)
+    m_AgentChatPanel = NULL;
   else
     qCritical() << "Unrecognised window being closed: " << window;
 }

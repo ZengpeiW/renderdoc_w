@@ -168,6 +168,8 @@
     <addaction name="action_Texture_Viewer"/>
     <addaction name="action_Timeline"/>
     <addaction name="separator"/>
+    <addaction name="action_AI_Assistant"/>
+    <addaction name="separator"/>
     <addaction name="extension_dummy_Window"/>
    </widget>
    <widget class="QMenu" name="menu_Help">
@@ -411,6 +413,11 @@
   <action name="action_Clear_Capture_Settings_History">
    <property name="text">
     <string>Clear History</string>
+   </property>
+  </action>
+  <action name="action_AI_Assistant">
+   <property name="text">
+    <string>AI &amp;Assistant</string>
    </property>
   </action>
   <action name="action_Statistics_Viewer">
