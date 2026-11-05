@@ -621,6 +621,54 @@ class FakeRenderTestBridge:
             self._read_meta(event_id),
         )
 
+    def _method_debug_vertex(self, params: dict[str, Any]) -> BridgeResult:
+        event_id = self._event_id(params)
+        action = self._actions[event_id]
+        shader = (action.get("shaders") or {}).get("vertex")
+        if shader is None:
+            raise AgentBridgeError("INVALID_EVENT", "No vertex shader is bound at this event.",
+                                   details={"event_id": event_id, "stage": "vertex"})
+        vertex = params.get("vertex")
+        if type(vertex) is not int or not 0 <= vertex < action.get("numIndices", 0):
+            raise AgentBridgeError("INVALID_REQUEST", "vertex is outside the draw.")
+        instance = params.get("instance", 0)
+        directory = artifact_directory(
+            str(self.root), self.instance_id, self.capture_session_id, "replay"
+        )
+        path = Path(directory) / f"debug-vertex-e{event_id}-v{vertex}-i{instance}.jsonl"
+        path.write_text('{"record":"header"}\n{"record":"summary","steps":1}\n', encoding="utf-8")
+        artifact = describe_artifact(str(path), "shader-debug-trace", "application/x-ndjson",
+                                     source={"event_id": event_id, "vertex": vertex,
+                                             "instance": instance, "stage": "vertex"})
+        output = {"name": "SV_Position", "signatureIndex": 0, "type": "Float",
+                  "value": [-1.0, 1.0, 0.0, 1.0]}
+        return BridgeResult(
+            _payload(
+                {
+                    "eventId": event_id,
+                    "vertex": vertex,
+                    "instance": instance,
+                    "view": params.get("view", 0),
+                    "index": vertex,
+                    "indexBufferValue": None,
+                    "shader": {"resourceId": shader, "entryPoint": "main"},
+                    "debugged": True,
+                    "steps": 1,
+                    "executionComplete": True,
+                    "traceComplete": True,
+                    "inputs": [],
+                    "outputs": [output],
+                    "lastChanges": [],
+                    "nanOrInfSteps": [],
+                    "sampleSteps": 0,
+                    "debugBreakSteps": [],
+                    "traceArtifact": artifact["path"],
+                },
+                artifacts=[artifact],
+            ),
+            self._read_meta(event_id),
+        )
+
     def _buffer_data(self, params: dict[str, Any]) -> BridgeResult:
         resource = self._resource(params, "buffer")
         offset = params.get("offset", 0)

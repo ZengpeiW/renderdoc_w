@@ -392,6 +392,13 @@ class FakeController:
 
     def DebugPixel(self, x: int, y: int, inputs: Any) -> Any:
         self.debug_calls.append((self.current, x, y, inputs.primitive))
+        return self._debug_trace("SV_Target0")
+
+    def DebugVertex(self, vertex: int, instance: int, index: int, view: int) -> Any:
+        self.debug_calls.append((self.current, vertex, instance, index, view))
+        return self._debug_trace("SV_Position")
+
+    def _debug_trace(self, output: str) -> Any:
         if self.debug_misses:
             return NS(debugger=None)
 
@@ -413,7 +420,7 @@ class FakeController:
                             flags=2 if index == 1 else (1 if index == 0 else 0),
                             changes=changes, callstack=[]))
         batches = [steps[:2], steps[2:], []]
-        mapping = NS(name="SV_Target0", type=VarType.Float, signatureIndex=0,
+        mapping = NS(name=output, type=VarType.Float, signatureIndex=0,
                      variables=[NS(name="o0", type=DebugVariableType.Variable, component=item)
                                 for item in range(4)])
         internal = NS(name="tmp", type=VarType.Float, signatureIndex=-1,
@@ -496,6 +503,9 @@ class FakeController:
         return NS(code=0)
 
     def GetBufferData(self, buffer: ResourceId, offset: int, length: int) -> bytes:
+        if buffer == ResourceId(201):
+            indices = b"".join(struct.pack("<H", index + 10) for index in range(36))
+            return indices[offset:offset + length]
         data = b"".join(struct.pack("<f", float(index)) for index in range(32 * 1024))
         return data[offset:offset + length]
 

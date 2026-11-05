@@ -45,7 +45,7 @@ NonNegativeInt = Annotated[int, Field(ge=0)]
 BufferSize = Annotated[int, Field(ge=1, le=16 * 1024 * 1024)]
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data", "pixel_history",
-                                   "debug_pixel"})
+                                   "debug_pixel", "debug_vertex"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -451,6 +451,35 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                 event_id=event_id,
                 sample=sample,
                 primitive=primitive,
+                view=view,
+                max_steps=max_steps,
+            ),
+            instance_id=instance_id,
+        )
+
+    @tool()
+    async def debug_vertex(
+        vertex: NonNegativeInt,
+        event_id: OptionalEventId = None,
+        instance: NonNegativeInt = 0,
+        view: NonNegativeInt = 0,
+        max_steps: MaxSteps = 20000,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Run the vertex shader of a draw for one vertex in RenderDoc's shader debugger.
+
+        vertex is the 0-based position in the draw (the VTX column of the Mesh Viewer, below
+        numIndices); for indexed draws the bridge reads the index buffer and reports index (the
+        fetched vertex, base vertex applied). Returns the shader, its inputs, the final outputs
+        (SV_Position etc.), the last changed variables and steps that generated NaN/Inf. The
+        full step-by-step trace is written to a JSONL artifact.
+        """
+        return await invoke(
+            "debug_vertex",
+            _clean_params(
+                vertex=vertex,
+                event_id=event_id,
+                instance=instance,
                 view=view,
                 max_steps=max_steps,
             ),

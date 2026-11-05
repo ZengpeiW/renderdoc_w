@@ -450,7 +450,7 @@ args = ["-m", "rendertest_mcp"]
 | --- | --- | --- | --- |
 | `pixel_history` | read | `resource_id`, `x`, `y`, `event_id?`, `mip?`, `slice?`, `sample?`, `order?`, `include_fragments?`, `cursor?`, `limit?` | 截至目标 EID 的像素修改历史，按事件分组（片元/失败原因计数、前后值），附 summary 和 discard 事件（M4 已实现） |
 | `debug_pixel` | artifact | `event_id?`, `x`, `y`, `sample?`, `primitive?`, `view?`, `max_steps?` | 调试摘要（输入、最终输出、最后改变的变量、NaN/Inf 步骤）、完整 JSONL trace artifact（M4 已实现） |
-| `debug_vertex` | artifact | `event_id`, `vertex`, `instance?`, `view?`, `max_steps?` | 调试摘要、输出变量、完整 trace artifact |
+| `debug_vertex` | artifact | `event_id?`, `vertex`, `instance?`, `view?`, `max_steps?` | 调试摘要（实际取顶点的 `index`、输入、最终输出含 `SV_Position`、NaN/Inf 步骤）、完整 JSONL trace artifact（M4 已实现） |
 | `get_mesh_data` | read/artifact | `event_id`, `stage`, `cursor?`, `limit?` | Post-VS 输入输出布局和顶点数据 |
 
 #### P2：MVP 后再做
@@ -677,6 +677,12 @@ M4 `debug_pixel` 实机验收（`--debug-pixel RESOURCE:EID:X:Y`；`--all-p0` �
 - 输出 `SV_Target0` 与 `pixel_history` 同一片元的 `shaderOut` 一致（UNORM 目标允许量化误差）。
 - nanite capture 实测：EID 1513 (1,1) primitive 30161，417 步执行完成，约 2.5 s；`SV_Target0`=[0.2553,0.2549,0.2516,0] 与 `shaderOut` 一致，trace 约 145 KB，响应约 2.7 KB。(256,256)、(3,5) 不被该 Draw 覆盖，返回 `debugged=false` 并提示用 `pixel_history`。
 
+M4 `debug_vertex` 实机验收（`--debug-vertex EID:VERTEX[:INSTANCE]`；`--all-p0` 也会对自动挑选的 Draw 跑 vertex 0，并检查 `vertex=numIndices` 返回 `INVALID_REQUEST`）：
+
+- Indexed Draw 的 `index` 与用 `get_buffer_data` 读 index buffer（`indexOffset`、`baseVertex`）算出的值一致；`DebugVertex(vertid, instid, idx, view)` 的 `idx` 与 qrenderdoc Mesh Viewer 的取法相同。
+- 输出有有限的位置（`SV_Position`），trace summary 步数与结果一致，UI EID 不变。
+- nanite capture 实测：EID 1513（DrawIndexedInstanced，VS 53059）vertex 0 → index 899，351 步，`SV_Position`=[-0.7156,0.1725,0.3099,1]；vertex 5 → index 904，`SV_Position`=[-0.6994,0.1158,0.3181,1]，每次约 1.6–1.9 s，trace 约 136 KB，响应约 3 KB。EID 1474（非 Indexed 全屏 DrawInstanced，VS 4862）vertex 1 → 58 步，`SV_Position`=[-0.96875,1,0,1]。
+
 参考耗时目标：
 
 | 操作 | 目标 |
@@ -741,7 +747,7 @@ M4 `debug_pixel` 实机验收（`--debug-pixel RESOURCE:EID:X:Y`；`--all-p0` �
 4. **M3：Agent 工作流**
    - 4 个 Skills、Codex 配置和端到端问题验收。
 5. **M4：P1 调试工具**
-   - Pixel History、Pixel Debug（已完成）、Vertex Debug 和 Mesh 数据。
+   - Pixel History、Pixel Debug、Vertex Debug（已完成）和 Mesh 数据。
 
 完成 M3 后即可形成可用 MVP。M4 完成后再评估是否进入 Shader 替换、CBuffer 修改和 qrenderdoc 内嵌 AI 面板。
 

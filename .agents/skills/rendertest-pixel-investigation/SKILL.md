@@ -13,6 +13,10 @@ Follow `rendertest-core`.
 - Coordinates are pixels of that mip with the origin at the top left. Confirm mip, slice and sample (MSAA); coordinates outside the mip return `INVALID_REQUEST`.
 - Target EID: the user's, otherwise the current event. `pick_pixel(event_id=...)` reads the value after that event executes.
 
+## Value at the target EID
+
+Always read the value with `pick_pixel(resource_id=..., x=..., y=..., event_id=...)` before answering, even when the question only asks who wrote the pixel. `pixel_history` does not give the value when its history is empty, and `finalValue` is the value after the last recorded event, not necessarily at the target EID. Report the measured value; never infer what replay shows from a discard or clear.
+
 ## Last event that changed it
 
 Use `pixel_history(resource_id=..., x=..., y=..., event_id=...)`. It replays the frame up to the target EID and returns one entry per event that touched the texel, newest first.
@@ -22,7 +26,7 @@ Use `pixel_history(resource_id=..., x=..., y=..., event_id=...)`. It replays the
 - `changed=false` with passing fragments means the event wrote the same value (or blending kept it). An event that only failed tests did not write the pixel; its `failureCounts` say why.
 - Add `include_fragments=true` (with a small `limit`) only when per-fragment detail matters, such as which primitive won the depth test.
 - Pixel history skips `Discard` events. Its `discardEventIds` and warnings list them; content after a discard is undefined, not rendered.
-- An empty history means no draw, clear or copy wrote the pixel up to the target EID. If `discardEventIds` is non-empty, the latest discard there is the last event that changed the value (RenderDoc replays it as a fill pattern); report that event, and say the target draw does not cover the pixel. Otherwise check `get_resource_usage` for the remaining writes and compare `pick_pixel` before and after them.
+- An empty history means no draw, clear or copy wrote the pixel up to the target EID. If `discardEventIds` is non-empty, the latest discard there is the last event that changed the value; report that event with the `pick_pixel` value, and say the target draw does not cover the pixel. Otherwise check `get_resource_usage` for the remaining writes and compare `pick_pixel` before and after them.
 - If `pixel_history` returns `UNSUPPORTED`, fall back to that same comparison over the write events from `get_resource_usage`, and say the result is approximate.
 
 ## Cause

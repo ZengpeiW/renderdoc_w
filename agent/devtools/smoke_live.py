@@ -213,6 +213,11 @@ class P0Smoke:
                                     "y": 0}, expect_error="INVALID_REQUEST")
         if "pixel" in pipeline["shaders"]:
             self.check_debug_pixel(rt_id, event_id, width // 2, height // 2)
+        if "vertex" in pipeline["shaders"]:
+            self.check_debug_vertex(event_id, 0)
+            self.call("debug_vertex", {"event_id": event_id,
+                                       "vertex": int(inspected["action"]["numIndices"])},
+                      expect_error="INVALID_REQUEST")
         stats = self.call("get_texture_stats", {"resource_id": rt_id, "event_id": event_id})
         if stats:
             print("  min:", json.dumps(stats["data"]["min"]), "max:", json.dumps(stats["data"]["max"]))
@@ -373,6 +378,68 @@ class P0Smoke:
             print(f"   NOTE: {target['name']} {target['value']} vs pixel_history shaderOut "
                   f"{shader_out} (UNORM targets quantise the shader output)")
 
+    def expected_vertex_index(self, event_id: int, vertex: int) -> int | None:
+        action = self.call("inspect_event", {"event_id": event_id})["data"]["action"]
+        if "Indexed" not in action["flags"]:
+            return vertex
+        state = self.call("get_pipeline_state", {"event_id": event_id,
+                                                 "include_bindings": False})
+        buffer = ((state or {}).get("data", {}).get("inputAssembly") or {}).get("indexBuffer")
+        if not buffer:
+            self.fail(f"EID {event_id} is indexed but has no index buffer")
+            return None
+        stride = buffer["byteStride"]
+        offset = buffer["byteOffset"] + (action["indexOffset"] + vertex) * stride
+        raw = self.call("get_buffer_data", {"resource_id": buffer["resourceId"],
+                                            "offset": offset, "size": stride,
+                                            "event_id": event_id})
+        if raw is None:
+            return None
+        value = int.from_bytes(bytes.fromhex(raw["data"]["hex"]), "little")
+        return max(0, value + action["baseVertex"])
+
+    def check_debug_vertex(self, event_id: int, vertex: int, instance: int = 0) -> None:
+        expected = self.expected_vertex_index(event_id, vertex)
+        before = self.ui_events()
+        result = self.call("debug_vertex", {"event_id": event_id, "vertex": vertex,
+                                            "instance": instance}, timeout=300)
+        if self.ui_events() != before:
+            self.fail("debug_vertex changed the UI event")
+        if result is None:
+            return
+        data = result["data"]
+        print(f"  debug_vertex EID {event_id} vertex {vertex} instance {instance}: "
+              f"index={data.get('index')} (raw {data.get('indexBufferValue')}, "
+              f"get_buffer_data {expected}) debugged={data['debugged']} "
+              f"steps={data.get('steps')} complete={data.get('executionComplete')}")
+        if expected is not None and data.get("index") != expected:
+            self.fail(f"debug_vertex index {data.get('index')} != index buffer {expected}")
+        if not data["debugged"]:
+            self.fail(f"debug_vertex could not debug vertex {vertex} at EID {event_id}")
+            return
+        print("   shader:", json.dumps(data["shader"], ensure_ascii=False))
+        print("   inputs:", json.dumps([{key: item.get(key) for key in ("name", "value")}
+                                        for item in data["inputs"]], ensure_ascii=False)[:1200])
+        print("   outputs:", json.dumps(data["outputs"], ensure_ascii=False)[:1200])
+        position = next((item for item in data["outputs"]
+                         if item["name"].upper() in ("SV_POSITION", "GL_POSITION")
+                         or item["name"].upper().endswith("POSITION")), None)
+        if position is None:
+            self.fail("debug_vertex outputs have no position")
+        elif any(not isinstance(item, (int, float)) for item in position["value"]):
+            self.fail(f"debug_vertex position is not finite: {position['value']}")
+        elif position["value"][3] != 0:
+            ndc = [round(item / position["value"][3], 4) for item in position["value"][:3]]
+            print(f"   position NDC {ndc}")
+        artifact = result["artifacts"][0]
+        lines = Path(artifact["path"]).read_text(encoding="utf-8").splitlines()
+        summary = json.loads(lines[-1])
+        if summary.get("record") != "summary" or summary.get("steps") != data["steps"]:
+            self.fail(f"vertex trace summary {summary} does not match {data['steps']} steps")
+        if len(lines) != data["steps"] + 2 and data["traceComplete"]:
+            self.fail(f"vertex trace has {len(lines)} lines for {data['steps']} steps")
+        print(f"   trace {artifact['path']} {artifact['bytes']} bytes")
+
     def first_buffer(self, state: dict | None) -> str | None:
         data = (state or {}).get("data", {})
         assembly = data.get("inputAssembly") or {}
@@ -425,6 +492,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--debug-pixel", action="append", default=[],
                         metavar="RESOURCE:EID:X:Y",
                         help="Also run debug_pixel for this pixel (repeatable).")
+    parser.add_argument("--debug-vertex", action="append", default=[],
+                        metavar="EID:VERTEX[:INSTANCE]",
+                        help="Also run debug_vertex for this vertex (repeatable).")
     parser.add_argument("--launch", type=Path, help="Start qrendertest with this capture first.")
     parser.add_argument("--exe", type=Path, default=REPO_DIR / "x64" / "Release" / "qrendertest.exe")
     args = parser.parse_args(argv)
@@ -460,6 +530,10 @@ def main(argv: list[str] | None = None) -> int:
                 resource_id, event_id, x, y = spec.split(":")
                 print(f"[debug_pixel {spec}]")
                 smoke.check_debug_pixel(resource_id, int(event_id), int(x), int(y))
+            for spec in args.debug_vertex:
+                parts = [int(item) for item in spec.split(":")]
+                print(f"[debug_vertex {spec}]")
+                smoke.check_debug_vertex(*parts)
             smoke.report()
             print("PASS" if not smoke.failures else f"{len(smoke.failures)} check(s) failed")
             return 0 if not smoke.failures else 1

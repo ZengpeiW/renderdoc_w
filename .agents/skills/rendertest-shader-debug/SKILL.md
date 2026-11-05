@@ -26,9 +26,18 @@ To see what the pixel shader actually computed at one pixel, use `debug_pixel(ev
 - `executionComplete=false` means `max_steps` stopped it; outputs are then partial.
 - The full step trace is the `traceArtifact` JSONL file (one `step` record per step with `instruction`, `line` and variable `changes`). Search it for a specific register or instruction instead of reading it whole.
 
+## Stepping a vertex shader
+
+Use `debug_vertex(event_id=..., vertex=..., instance=...)` for wrong positions, exploding or missing geometry, or wrong vertex outputs. It returns the same fields as `debug_pixel`.
+
+- `vertex` is the 0-based position in the draw (the VTX column of the Mesh Viewer) and must be below the draw's `numIndices`. For indexed draws the result's `index` is the vertex fetched from the index buffer with base vertex applied, and `indexBufferValue` is the raw index.
+- `instance` defaults to 0 and must be below `numInstances`; `view` is only for multiview.
+- `outputs` include `SV_Position` (clip space; divide xyz by w for NDC) and the other outputs passed to later stages. `inputs` are the fetched vertex attributes and system values.
+- Post-transform mesh data for many vertices at once (`get_mesh_data`) is not available yet (M4); debug a few representative vertices instead.
+
 ## Judgement
 
 - Disassembly (DXIL, DXBC, SPIR-V...) is not source code; do not call it source. Names may be missing, so cite registers or byte offsets together with your inferred meaning.
 - For "which parameters affect the colour", trace back from the output write: which inputs, texture samples and constant fields feed it. Then list their actual values and anything suspicious: 0, NaN, Inf, extreme values, mismatches with similar draws, sRGB formats read as data.
 - To check a suspicious parameter, find other draws using the same shader with `find_actions` and compare their `get_cbuffer` values.
-- Editing constant buffers and editing or replacing shaders are not available, and vertex debugging (`debug_vertex`) is planned for M4. When a conclusion needs an experiment, describe the experiment instead of claiming it was run.
+- Editing constant buffers and editing or replacing shaders are not available. When a conclusion needs an experiment, describe the experiment instead of claiming it was run.

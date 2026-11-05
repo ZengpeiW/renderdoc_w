@@ -2,12 +2,13 @@ import bisect
 import hashlib
 import json
 import os
+import struct
 
 from ..artifacts import artifact_path, describe
 from ..ipc import AgentBridgeError
 from ..values import enum_name, flags_value
-from .common import (action_index, get_int, renderdoc_module, resolve_event, resource_index,
-                     result, session_of)
+from .common import (action_index, get_int, invalid, renderdoc_module, resolve_event,
+                     resource_index, result, session_of, stage_enum)
 from .pipeline import _bound_shader, convert_variable
 
 DEFAULT_MAX_STEPS = 20000
@@ -20,6 +21,9 @@ LAST_CHANGES = 16
 EVENT_STEP_LIMIT = 16
 NO_PREFERENCE = 0xFFFFFFFF
 SHADER_EVENTS = (("SampleLoadGather", 0x1), ("GeneratedNanOrInf", 0x2), ("DebugBreak", 0x4))
+INDEX_FORMATS = {1: "<B", 2: "<H", 4: "<I"}
+DRAW_FLAG = "Drawcall"
+INDEXED_FLAG = "Indexed"
 
 
 def _event_names(flags):
@@ -169,6 +173,91 @@ def _run(context, controller, trace, max_steps, lines, writer):
     return variables, steps, stopped, events, list(reversed(last))
 
 
+def _debuggable_shader(controller, pipe, rd, stage_name, event_id, resources):
+    properties = getattr(controller, "GetAPIProperties", None)
+    if properties is not None and not getattr(properties(), "shaderDebugging", True):
+        raise AgentBridgeError("UNSUPPORTED", "This capture's API does not support shader "
+                               "debugging.")
+    _, _, key, reflection = _bound_shader(pipe, rd, stage_name, event_id)
+    debug_info = reflection.debugInfo
+    shader = {"resourceId": key, "name": resources.name(key),
+              "entryPoint": pipe.GetShaderEntryPoint(stage_enum(rd, stage_name)),
+              "encoding": enum_name(debug_info.encoding),
+              "sourceDebugInformation": bool(getattr(debug_info, "sourceDebugInformation",
+                                                     False))}
+    if not bool(getattr(debug_info, "debuggable", True)):
+        raise AgentBridgeError("UNSUPPORTED", "The %s shader cannot be debugged: %s"
+                               % (stage_name, getattr(debug_info, "debugStatus", "")),
+                               details={"shader": shader})
+    return shader, debug_info
+
+
+def _trace(context, controller, trace, path, invocation, shader, debug_info, max_steps):
+    """Step a trace to completion, write its JSONL artifact and free it."""
+    try:
+        if trace is None or trace.debugger is None:
+            return {"shader": shader, "debugged": False}
+        files = [str(item.filename) for item in debug_info.files]
+        writer = _TraceWriter(path, {"record": "header",
+                                     "schema": "rendertest-shader-debug-trace/v1",
+                                     "invocation": invocation, "shader": shader,
+                                     "files": files})
+        try:
+            variables, steps, stopped, events, last = _run(
+                context, controller, trace, max_steps, _LineTable(trace, files), writer)
+            writer.finish({"record": "summary", "steps": steps,
+                           "executionComplete": not stopped,
+                           "traceComplete": not writer.full})
+        except BaseException:
+            writer.abort()
+            raise
+        budget = [INPUT_LIMIT * 16]
+        shader_inputs = [item for item in (convert_variable(variable, budget)
+                                           for variable in list(trace.inputs)[:INPUT_LIMIT])
+                         if item is not None]
+        return {
+            "shader": shader,
+            "debugged": True,
+            "steps": steps,
+            "executionComplete": not stopped,
+            "traceComplete": not writer.full,
+            "inputs": shader_inputs,
+            "outputs": _outputs(trace, variables),
+            "lastChanges": last,
+            "nanOrInfSteps": events["GeneratedNanOrInf"],
+            "sampleSteps": events["SampleLoadGather"],
+            "debugBreakSteps": events["DebugBreak"],
+        }
+    finally:
+        if trace is not None:
+            controller.FreeTrace(trace)
+
+
+def _finish(data, invocation, path, source, max_steps, miss_warning, meta):
+    payload = dict(invocation)
+    payload.update(data)
+    warnings = []
+    artifacts = []
+    if not data["debugged"]:
+        warnings.append(miss_warning)
+    else:
+        artifact = describe(path, "shader-debug-trace", "application/x-ndjson", source=source,
+                            steps=data["steps"], executionComplete=data["executionComplete"],
+                            traceComplete=data["traceComplete"])
+        artifacts.append(artifact)
+        payload["traceArtifact"] = artifact["path"]
+        if not data["executionComplete"]:
+            warnings.append("Stopped after max_steps=%d; outputs are the values at that point."
+                            % max_steps)
+        if not data["traceComplete"]:
+            warnings.append("The trace artifact hit its size limit; later steps are missing from "
+                            "the file but were still executed.")
+        if not data["outputs"]:
+            warnings.append("The trace has no output signature mapping; see lastChanges for the "
+                            "values written last.")
+    return result(payload, meta=meta, artifacts=artifacts, warnings=warnings)
+
+
 def debug_pixel(runtime, context):
     params = context.params
     x = get_int(params, "x", required=True)
@@ -187,93 +276,96 @@ def debug_pixel(runtime, context):
 
     def read(controller):
         rd = renderdoc_module()
-        properties = getattr(controller, "GetAPIProperties", None)
-        if properties is not None and not getattr(properties(), "shaderDebugging", True):
-            raise AgentBridgeError("UNSUPPORTED", "This capture's API does not support shader "
-                                   "debugging.")
         pipe = controller.GetPipelineState()
-        _, _, key, reflection = _bound_shader(pipe, rd, "pixel", event_id)
-        debug_info = reflection.debugInfo
-        shader = {"resourceId": key, "name": resources.name(key),
-                  "entryPoint": pipe.GetShaderEntryPoint(rd.ShaderStage.Pixel),
-                  "encoding": enum_name(debug_info.encoding),
-                  "sourceDebugInformation": bool(getattr(debug_info, "sourceDebugInformation",
-                                                         False))}
-        if not bool(getattr(debug_info, "debuggable", True)):
-            raise AgentBridgeError("UNSUPPORTED", "The pixel shader cannot be debugged: %s"
-                                   % getattr(debug_info, "debugStatus", ""),
-                                   details={"shader": shader})
+        shader, debug_info = _debuggable_shader(controller, pipe, rd, "pixel", event_id,
+                                                resources)
         inputs = rd.DebugPixelInputs()
         inputs.sample = NO_PREFERENCE if sample is None else sample
         inputs.primitive = NO_PREFERENCE if primitive is None else primitive
         inputs.view = NO_PREFERENCE if view is None else view
         trace = controller.DebugPixel(x, y, inputs)
-        try:
-            if trace is None or trace.debugger is None:
-                return {"shader": shader, "debugged": False}, None
-            files = [str(item.filename) for item in debug_info.files]
-            writer = _TraceWriter(path, {"record": "header",
-                                         "schema": "rendertest-shader-debug-trace/v1",
-                                         "invocation": invocation, "shader": shader,
-                                         "files": files})
-            try:
-                variables, steps, stopped, events, last = _run(
-                    context, controller, trace, max_steps, _LineTable(trace, files), writer)
-                writer.finish({"record": "summary", "steps": steps,
-                               "executionComplete": not stopped,
-                               "traceComplete": not writer.full})
-            except BaseException:
-                writer.abort()
-                raise
-            budget = [INPUT_LIMIT * 16]
-            shader_inputs = [item for item in (convert_variable(variable, budget)
-                                               for variable in list(trace.inputs)[:INPUT_LIMIT])
-                             if item is not None]
-            return {
-                "shader": shader,
-                "debugged": True,
-                "steps": steps,
-                "executionComplete": not stopped,
-                "traceComplete": not writer.full,
-                "inputs": shader_inputs,
-                "outputs": _outputs(trace, variables),
-                "lastChanges": last,
-                "nanOrInfSteps": events["GeneratedNanOrInf"],
-                "sampleSteps": events["SampleLoadGather"],
-                "debugBreakSteps": events["DebugBreak"],
-            }, writer
-        finally:
-            if trace is not None:
-                controller.FreeTrace(trace)
+        return _trace(context, controller, trace, path, invocation, shader, debug_info,
+                      max_steps)
 
-    (data, writer), meta = runtime.replay.at_event(context, event_id, read)
-    payload = dict(invocation)
-    payload.update(data)
-    warnings = []
-    artifacts = []
-    if not data["debugged"]:
-        warnings.append("No fragment of this draw reached (%d, %d) for the given sample/primitive. "
-                        "Use pixel_history at this EID to see which fragments touched the pixel "
-                        "and their primitiveIds." % (x, y))
-    else:
-        artifact = describe(path, "shader-debug-trace", "application/x-ndjson",
-                            source={"event_id": event_id, "x": x, "y": y, "stage": "pixel"},
-                            steps=data["steps"], executionComplete=data["executionComplete"],
-                            traceComplete=data["traceComplete"])
-        artifacts.append(artifact)
-        payload["traceArtifact"] = artifact["path"]
-        if not data["executionComplete"]:
-            warnings.append("Stopped after max_steps=%d; outputs are the values at that point."
-                            % max_steps)
-        if not data["traceComplete"]:
-            warnings.append("The trace artifact hit its size limit; later steps are missing from "
-                            "the file but were still executed.")
-        if not data["outputs"]:
-            warnings.append("The trace has no output signature mapping; see lastChanges for the "
-                            "values written last.")
-    return result(payload, meta=meta, artifacts=artifacts, warnings=warnings)
+    data, meta = runtime.replay.at_event(context, event_id, read)
+    return _finish(data, invocation, path,
+                   {"event_id": event_id, "x": x, "y": y, "stage": "pixel"}, max_steps,
+                   "No fragment of this draw reached (%d, %d) for the given sample/primitive. "
+                   "Use pixel_history at this EID to see which fragments touched the pixel and "
+                   "their primitiveIds." % (x, y), meta)
+
+
+def _vertex_index(controller, pipe, node, vertex):
+    """Return the index used to fetch vertex inputs, as qrenderdoc's BufferViewer computes it."""
+    if INDEXED_FLAG not in node["flags"]:
+        return vertex, None
+    buffer = pipe.GetIBuffer()
+    stride = int(buffer.byteStride)
+    if stride not in INDEX_FORMATS:
+        raise AgentBridgeError("INVALID_EVENT", "The indexed draw has no usable index buffer.",
+                               details={"byteStride": stride})
+    offset = (node["indexOffset"] + vertex) * stride
+    if offset + stride > int(buffer.byteSize):
+        raise invalid("vertex %d reads past the end of the bound index buffer." % vertex,
+                      byteSize=int(buffer.byteSize), offset=offset)
+    raw = bytes(controller.GetBufferData(buffer.resourceId, int(buffer.byteOffset) + offset,
+                                         stride))
+    if len(raw) < stride:
+        raise invalid("vertex %d reads past the end of the index buffer." % vertex)
+    value = struct.unpack(INDEX_FORMATS[stride], raw[:stride])[0]
+    if pipe.IsRestartEnabled():
+        restart = int(pipe.GetRestartIndex()) & ((1 << (8 * stride)) - 1)
+        if restart and value == restart:
+            raise invalid("vertex %d is a primitive restart index." % vertex, index=value)
+    base = node["baseVertex"]
+    return max(0, value + base), value
+
+
+def debug_vertex(runtime, context):
+    params = context.params
+    vertex = get_int(params, "vertex", required=True)
+    instance = get_int(params, "instance", 0)
+    view = get_int(params, "view", 0)
+    max_steps = get_int(params, "max_steps", DEFAULT_MAX_STEPS, minimum=1, maximum=MAX_STEPS)
+    actions = action_index(runtime, context)
+    event_id = resolve_event(context, actions)
+    node = actions.action_for(event_id)
+    if node is None or DRAW_FLAG not in node["flags"]:
+        raise AgentBridgeError("INVALID_EVENT", "Event %d is not a draw." % event_id,
+                               details={"event_id": event_id})
+    if vertex >= node["numIndices"]:
+        raise invalid("vertex must be below the draw's vertex/index count %d."
+                      % node["numIndices"], numIndices=node["numIndices"])
+    if instance >= max(1, node["numInstances"]):
+        raise invalid("instance must be below the draw's instance count %d."
+                      % node["numInstances"], numInstances=node["numInstances"])
+    resources = resource_index(runtime, context)
+    session = session_of(context)
+    path = artifact_path(runtime, session, "debug-vertex-e%d-v%d-i%d" % (event_id, vertex,
+                                                                          instance), "jsonl")
+    invocation = {"eventId": event_id, "vertex": vertex, "instance": instance, "view": view}
+
+    def read(controller):
+        rd = renderdoc_module()
+        pipe = controller.GetPipelineState()
+        shader, debug_info = _debuggable_shader(controller, pipe, rd, "vertex", event_id,
+                                                resources)
+        index, raw = _vertex_index(controller, pipe, node, vertex)
+        trace = controller.DebugVertex(vertex, instance, index, view)
+        data = _trace(context, controller, trace, path, dict(invocation, index=index), shader,
+                      debug_info, max_steps)
+        data["index"] = index
+        data["indexBufferValue"] = raw
+        return data
+
+    data, meta = runtime.replay.at_event(context, event_id, read)
+    return _finish(data, invocation, path,
+                   {"event_id": event_id, "vertex": vertex, "instance": instance,
+                    "stage": "vertex"}, max_steps,
+                   "RenderDoc could not debug vertex %d of this draw." % vertex, meta)
 
 
 HANDLERS = {
     "debug_pixel": debug_pixel,
+    "debug_vertex": debug_vertex,
 }

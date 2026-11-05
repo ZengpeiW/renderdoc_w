@@ -62,7 +62,7 @@ def test_manifest_lists_p0_methods(loaded) -> None:
     methods = call(api, "get_status").result["data"]["bridge"]["methods"]
     assert {"list_actions", "inspect_event", "export_texture", "get_debug_messages"} <= set(methods)
     assert "pixel_history" in methods
-    assert "debug_pixel" in methods and "debug_vertex" not in methods
+    assert "debug_vertex" in methods and "get_mesh_data" not in methods
 
 
 def test_list_and_find_actions(loaded) -> None:
@@ -301,6 +301,34 @@ def test_debug_pixel(loaded) -> None:
     assert "pixel_history" in missed["warnings"][0]
     assert error_code(api, "debug_pixel", x=0, y=0, event_id=8) == "INVALID_EVENT"
     assert error_code(api, "debug_pixel", x=0, y=0, event_id=5, max_steps=0) == "INVALID_REQUEST"
+
+
+def test_debug_vertex(loaded) -> None:
+    ctx, api = loaded
+    controller = ctx.controller
+    response = call(api, "debug_vertex", vertex=4, event_id=5)
+    result = response.result
+    data = result["data"]
+    assert controller.debug_calls == [(5, 4, 0, 14, 0)]
+    assert len(controller.freed) == 1 and controller.current == 9
+    assert response.meta["replayEventRestored"] is True
+    assert data["vertex"] == 4 and data["instance"] == 0 and data["view"] == 0
+    assert data["index"] == 14 and data["indexBufferValue"] == 14
+    assert data["shader"]["resourceId"] == "302" and data["debugged"] is True
+    assert data["outputs"] == [{"name": "SV_Position", "signatureIndex": 0, "type": "Float",
+                                "value": [0.25, 0.5, 0.75, 1.0]}]
+    artifact = result["artifacts"][0]
+    assert artifact["source"]["stage"] == "vertex" and "debug-vertex-e5-v4-i0" in artifact["path"]
+    header = json.loads(Path(artifact["path"]).read_text(encoding="utf-8").splitlines()[0])
+    assert header["invocation"]["index"] == 14
+
+    controller.debug_misses = True
+    missed = call(api, "debug_vertex", vertex=0, event_id=5).result
+    assert missed["data"]["debugged"] is False and missed["artifacts"] == []
+    assert error_code(api, "debug_vertex", vertex=36, event_id=5) == "INVALID_REQUEST"
+    assert error_code(api, "debug_vertex", vertex=0, instance=1, event_id=5) == "INVALID_REQUEST"
+    assert error_code(api, "debug_vertex", vertex=0, event_id=8) == "INVALID_EVENT"
+    assert error_code(api, "debug_vertex", event_id=5) == "INVALID_REQUEST"
 
 
 def test_export_rgb_png_drops_alpha(loaded) -> None:
