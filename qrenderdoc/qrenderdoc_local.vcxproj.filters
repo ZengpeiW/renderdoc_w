@@ -132,6 +132,12 @@
     <ClCompile Include="Code\Agent\AgentConversation.cpp">
       <Filter>Code\Agent</Filter>
     </ClCompile>
+    <ClCompile Include="Code\Agent\AgentCaptureIdentity.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\Agent\AgentHistory.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
     <ClCompile Include="Code\Agent\AgentLaunchConfig.cpp">
       <Filter>Code\Agent</Filter>
     </ClCompile>
@@ -852,6 +858,12 @@
       <Filter>Code\Agent</Filter>
     </ClInclude>
     <ClInclude Include="Code\Agent\AgentConversation.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\AgentCaptureIdentity.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\AgentHistory.h">
       <Filter>Code\Agent</Filter>
     </ClInclude>
     <ClInclude Include="Code\Agent\AgentLaunchConfig.h">

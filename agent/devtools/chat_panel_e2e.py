@@ -1,7 +1,8 @@
-"""End-to-end checks for the qrendertest AI panel (M5a-M5c).
+"""End-to-end checks for the qrendertest AI panel (M5a-M5d).
 
 Usage:
-    python devtools/chat_panel_e2e.py [--scenario all|A1|A2|...] [--exe qrendertest.exe]
+    python devtools/chat_panel_e2e.py [--scenario all|M5d|A1|A2|...] [--exe qrendertest.exe]
+    python devtools/chat_panel_e2e.py --history-capture --capture FILE.rdc [--event EID]
     python devtools/chat_panel_e2e.py --real --capture FILE.rdc [--question TEXT] [--ask-pixel]
 
 Fake mode points the panel at ``fake_app_server.py`` through RENDERTEST_AGENT_CODEX_COMMAND, drives
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -121,15 +123,27 @@ class Run:
         self.failures: list[str] = []
         self.transcript: dict[str, Any] = {}
         self.process: subprocess.Popen | None = None
+        self.log_offset = 0
 
     def check(self, condition: bool, message: str) -> None:
         if not condition:
             self.failures.append(message)
 
-    def launch(self, autotest: dict[str, Any], env: dict[str, str], args: list[str] | None = None) -> None:
-        if self.root.exists():
+    def launch(self, autotest: dict[str, Any], env: dict[str, str], args: list[str] | None = None,
+               *, preserve: bool = False) -> None:
+        if self.process and self.process.poll() is None:
+            raise RuntimeError("close the previous qrendertest before relaunching")
+        # Never recursively remove a caller-supplied location outside this test workspace.
+        allowed = (AGENT_DIR / ".agent-data").resolve()
+        target = self.root.resolve()
+        if target == allowed or allowed not in target.parents:
+            raise ValueError(f"test root must be below {allowed}: {target}")
+        if self.root.exists() and not preserve:
             shutil.rmtree(self.root)
-        self.root.mkdir(parents=True)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.transcript_path.unlink(missing_ok=True)
+        self.transcript = {}
+        self.log_offset = len(read_jsonl(self.fake_log))
         autotest = dict(autotest, transcript=str(self.transcript_path))
         environ = dict(os.environ)
         environ.pop("RENDERTEST_AGENT_CODEX_COMMAND", None)
@@ -180,10 +194,21 @@ class Run:
         return self.transcript.get("session", {})
 
     def received(self) -> list[dict[str, Any]]:
-        return [entry["message"] for entry in read_jsonl(self.fake_log) if entry.get("event") == "recv"]
+        return [entry["message"] for entry in read_jsonl(self.fake_log)[self.log_offset:]
+                if entry.get("event") == "recv"]
 
     def fake_pids(self) -> list[int]:
-        return [entry["pid"] for entry in read_jsonl(self.fake_log) if entry.get("event") == "start"]
+        return [entry["pid"] for entry in read_jsonl(self.fake_log)[self.log_offset:]
+                if entry.get("event") == "start"]
+
+    def history_records(self) -> list[dict[str, Any]]:
+        records = []
+        for path in (self.root / "agent-root" / "conversations").glob("*.json"):
+            try:
+                records.append(json.loads(path.read_text(encoding="utf-8")))
+            except (ValueError, OSError):
+                pass
+        return records
 
     def check_no_survivors(self, pids: list[int], within: float = 3.0) -> None:
         deadline = time.time() + within
@@ -202,6 +227,14 @@ def methods(messages: list[dict[str, Any]]) -> list[str]:
     return [message["method"] for message in messages if "method" in message]
 
 
+def check_thread_rebound(run: Run, trigger: str) -> None:
+    ids = run.session().get("threadIds", [])
+    run.check(len(ids) == 2 and ids[0] == ids[1], f"{trigger} did not resume its original thread: {ids}")
+    run.check(methods(run.received()).count("thread/start") == 1 and
+              methods(run.received()).count("thread/resume") == 1,
+              f"{trigger} created a replacement thread instead of resuming")
+
+
 def scenario_a1(run: Run) -> None:
     run.launch({"questions": ["hello"]}, fake_env(run, "stream"))
     if not run.wait_transcript(60):
@@ -217,7 +250,7 @@ def scenario_a1(run: Run) -> None:
     run.check(bool(instance), "panel did not find the bridge instance id")
     run.check(start.get("sandbox") == "read-only" and start.get("approvalPolicy") == "never",
               f"thread/start sandbox/approval {start.get('sandbox')}/{start.get('approvalPolicy')}")
-    run.check(start.get("ephemeral") is True, "thread/start is not ephemeral")
+    run.check(start.get("ephemeral") is False, "thread/start is not persistent")
     run.check(bool(instance) and instance in start.get("developerInstructions", ""),
               "developerInstructions lack the instance id")
     run.check(start.get("config", {}).get("mcp_servers.blender.enabled") is False,
@@ -303,7 +336,7 @@ def scenario_a4_hang(run: Run) -> None:
     run.check(len(pids) == 2, f"expected a restarted app-server, pids {pids}")
     if pids:
         run.check(not alive(pids[0]), f"hung app-server {pids[0]} still alive")
-    run.check(len(run.session().get("threadIds", [])) == 2, "no new thread after forced stop")
+    check_thread_rebound(run, "forced stop")
 
 
 def scenario_a5(run: Run) -> None:
@@ -314,7 +347,7 @@ def scenario_a5(run: Run) -> None:
     run.check([r.get("status") for r in results] == ["failed", "completed"], f"results {results}")
     notices = " ".join(i.get("text", "") for i in run.items("notice"))
     run.check("simulated crash" in notices, "stderr tail not shown after crash")
-    run.check(len(run.session().get("threadIds", [])) == 2, "no new thread after crash")
+    check_thread_rebound(run, "crash")
     run.check(len(run.fake_pids()) == 2, f"app-server not restarted: {run.fake_pids()}")
 
 
@@ -454,18 +487,21 @@ def scenario_start_timeout(run: Run) -> None:
     run.check(len(pids) == 2, f"accepted remote turn was not terminated: {pids}")
     if pids:
         run.check(not alive(pids[0]), f"old process {pids[0]} still running")
-    run.check(len(run.session().get("threadIds", [])) == 2, "no fresh thread after timeout")
+    check_thread_rebound(run, "timeout")
 
 
 def scenario_capture_change(run: Run) -> None:
-    run.launch({"questions": ["first", "second"], "captureChangeAfterMs": 500}, fake_env(run, "hang"))
+    run.launch({"questions": ["first", "second"], "captureChangeAfterMs": 500,
+                "newChatBeforeQuestion": [1]}, fake_env(run, "hang"))
     if not run.wait_transcript(60):
         return
     run.check([r.get("status") for r in run.results()] == ["interrupted", "completed"], f"results {run.results()}")
     pids = run.fake_pids()
     run.check(len(pids) == 2 and not alive(pids[0]), f"capture change did not kill old process: {pids}")
-    run.check(len(run.session().get("threadIds", [])) == 2, "capture change reused old thread")
-    tools = run.items("tool")
+    ids = run.session().get("threadIds", [])
+    run.check(len(ids) == 2 and ids[0] != ids[1], "capture change reused old thread")
+    tools = [item for record in run.history_records()
+             for item in record.get("conversation", {}).get("items", []) if item.get("kind") == "tool"]
     run.check(tools and tools[0].get("status") == "interrupted", f"pending tools {tools}")
 
 
@@ -674,6 +710,170 @@ def scenario_tool_artifacts(run: Run) -> None:
                   "unsafe artifact was never clicked")
 
 
+def seed_history(run: Run) -> dict[str, Any] | None:
+    """Finish and close one real UI process; retain only this test's local fake/history files."""
+    run.launch({"questions": ["saved first question"]}, fake_env(run, "persistent"))
+    if not run.wait_transcript(60):
+        return None
+    run.check([r.get("status") for r in run.results()] == ["completed"], f"seed results {run.results()}")
+    saved = {"historyId": run.session().get("historyId"), "threadId": run.transcript.get("threadId"),
+             "instanceId": run.session().get("instanceId")}
+    pids = run.fake_pids()
+    run.close()
+    run.check_no_survivors(pids)
+    run.check(bool(saved["historyId"]) and bool(saved["threadId"]), f"seed has no durable identity: {saved}")
+    records = run.history_records()
+    record = next((entry for entry in records if entry.get("metadata", {}).get("id") == saved["historyId"]), None)
+    run.check(record is not None, "completed conversation was not saved to disk")
+    if record:
+        run.check(record["metadata"].get("captureIdentity", {}).get("kind") == "none",
+                  "plain chat was not saved with an explicit no-capture identity")
+        run.check(record["metadata"].get("threadId") == saved["threadId"], "saved thread id differs from live binding")
+    return saved if saved["historyId"] and record else None
+
+
+def check_resume_config(run: Run, saved: dict[str, Any], *, capture_tools: bool = False) -> None:
+    received = run.received()
+    order = methods(received)
+    resumes = [entry.get("params", {}) for entry in received if entry.get("method") == "thread/resume"]
+    run.check(len(resumes) == 1, f"resume requests {resumes}")
+    run.check("thread/start" not in order, "history restore silently created a different thread")
+    if not resumes:
+        return
+    params = resumes[0]
+    run.check(params.get("threadId") == saved["threadId"] and params.get("excludeTurns") is True,
+              f"resume did not request the saved thread without server history: {params}")
+    run.check(params.get("sandbox") == "read-only" and params.get("approvalPolicy") == "never",
+              "resume inherited unsafe sandbox or approval policy")
+    run.check(bool(params.get("cwd")), "resume omitted the current integration cwd")
+    config = params.get("config", {})
+    run.check(config.get("mcp_servers.blender.enabled") is False and
+              config.get("mcp_servers.rendertest.enabled") is capture_tools,
+              f"resume failed to reapply MCP isolation/capture binding: {config}")
+    instance = run.session().get("instanceId")
+    run.check(instance and instance != saved["instanceId"] and instance in params.get("developerInstructions", ""),
+              "resumed process did not use its current instance instructions")
+    run.check("config/read" in order and order.index("config/read") < order.index("thread/resume"),
+              "resume skipped the current effective config check")
+
+
+def scenario_history_new_chat(run: Run) -> None:
+    run.launch({"questions": ["first chat", "second chat"], "newChatBeforeQuestion": [1]},
+               fake_env(run, "persistent"))
+    if not run.wait_transcript(60):
+        return
+    run.check([r.get("status") for r in run.results()] == ["completed", "completed"], f"results {run.results()}")
+    ids = run.session().get("threadIds", [])
+    run.check(len(ids) == 2 and ids[0] != ids[1], f"New chat reused the previous thread: {ids}")
+    run.check(len(run.items("user")) == 1 and run.items("user")[0].get("text") == "second chat",
+              "New chat did not clear the displayed conversation")
+    records = run.history_records()
+    run.check(len(records) == 2 and {entry.get("metadata", {}).get("threadId") for entry in records} == set(ids),
+              "New chat discarded or overwrote the previous saved conversation")
+    texts = {item.get("text") for record in records for item in record.get("conversation", {}).get("items", [])
+             if item.get("kind") == "user"}
+    run.check(texts == {"first chat", "second chat"}, f"saved questions {texts}")
+
+
+def scenario_history_restore(run: Run) -> None:
+    saved = seed_history(run)
+    if not saved:
+        return
+    replay = run.name == "D-resume-replay"
+    run.launch({"loadHistoryId": "latest", "questions": ["continued second question"],
+                "settings": {"model": "fake-deep", "reasoningEffort": "ultra"},
+                "clickLinks": ["first-event"]}, fake_env(run, "resume-replay" if replay else "persistent"),
+               preserve=True)
+    if not run.wait_transcript(60):
+        return
+    check_resume_config(run, saved)
+    run.check(run.session().get("historyId") == saved["historyId"], "resume changed the saved conversation id")
+    run.check(run.session().get("historyLoaded") is True and run.session().get("historyReadOnly") is False,
+              f"matching plain-chat history cannot continue: {run.session().get('historyError')}")
+    run.check(run.transcript.get("threadId") == saved["threadId"], "resume changed the conversation thread")
+    run.check([r.get("status") for r in run.results()] == ["completed"], f"results {run.results()}")
+    run.check([item.get("text") for item in run.items("user")] == ["saved first question", "continued second question"],
+              "restoring history duplicated, discarded or reordered user messages")
+    agents = run.items("agent")
+    run.check(len(agents) == 2 and all(item.get("text") == ANSWER for item in agents),
+              "server-resumed items duplicated or replaced the saved local transcript")
+    run.check(agents and not agents[0].get("referenceToken"), "loaded capture reference retained live navigation authority")
+    run.check(len(agents) == 2 and bool(agents[1].get("referenceToken")), "new message lost its current reference identity")
+    clicks = run.transcript.get("autotest", {}).get("linkClicks", [])
+    run.check(len(clicks) == 1 and clicks[0].get("ok") is False, "restored stale reference was allowed to navigate")
+    order = methods(run.received())
+    run.check("thread/resume" in order and "mcpServerStatus/list" in order and "turn/start" in order and
+              order.index("thread/resume") < order.index("mcpServerStatus/list") < order.index("turn/start"),
+              "resumed MCP runtime status was not checked before sending the new turn")
+    statuses = [m["params"] for m in run.received() if m.get("method") == "mcpServerStatus/list"]
+    run.check(statuses and all(p.get("threadId") == saved["threadId"] for p in statuses),
+              "MCP status was checked for a different thread")
+    resume = next((m["params"] for m in run.received() if m.get("method") == "thread/resume"), {})
+    turn = next((m["params"] for m in run.received() if m.get("method") == "turn/start"), {})
+    run.check(resume.get("model") == "fake-deep" and turn.get("effort") == "ultra", "resume ignored current model/effort settings")
+
+
+def scenario_history_view(run: Run) -> None:
+    saved = seed_history(run)
+    if not saved:
+        return
+    bad = run.name == "D-bad-history"
+    invalid_id = "abcdefab-1234-4123-8123-abcdefabcdef"
+    if bad:
+        (run.root / "agent-root" / "conversations" / f"{invalid_id}.json").write_text("{broken", encoding="utf-8")
+    run.launch({"loadHistoryId": "latest", "questions": []}, fake_env(run, "persistent"), preserve=True)
+    if not run.wait_transcript(60):
+        return
+    run.check(not run.fake_pids() and not run.received(), "viewing local history unnecessarily started app-server")
+    run.check(run.session().get("historyId") == saved["historyId"] and run.session().get("historyLoaded") is True,
+              "saved local history was not loaded")
+    run.check([item.get("text") for item in run.items("agent")] == [ANSWER], "local transcript was not preserved")
+    run.check(all(not item.get("referenceToken") for item in run.items("agent")), "loaded references remained navigable")
+    if bad:
+        entries = run.session().get("historyEntries", [])
+        run.check(any(entry.get("id") == saved["historyId"] for entry in entries) and
+                  all(entry.get("id") != invalid_id for entry in entries), "bad history blocked or polluted the history list")
+
+
+def scenario_history_rejected(run: Run) -> None:
+    saved = seed_history(run)
+    if not saved:
+        return
+    mismatch = run.name == "D-capture-mismatch"
+    history_path = run.root / "agent-root" / "conversations" / f"{saved['historyId']}.json"
+    if mismatch:
+        record = json.loads(history_path.read_text(encoding="utf-8"))
+        record["metadata"]["captureIdentity"] = {
+            "schema": "rendertest-agent-capture-identity/v1", "kind": "local-file", "verified": True,
+            "canonicalPath": str((run.root / "different-capture.rdc").resolve()), "bytes": "1",
+            "modifiedUnixMs": "1700000000000", "sha256": "a" * 64}
+        record["metadata"]["mode"] = "capture"
+        history_path.write_text(json.dumps(record), encoding="utf-8")
+    before = history_path.read_bytes()
+    scenario = "persistent" if mismatch else run.name.removeprefix("D-")
+    run.launch({"loadHistoryId": "latest", "questions": ["must not run"]}, fake_env(run, scenario), preserve=True)
+    if not run.wait_transcript(60):
+        return
+    run.check(run.session().get("historyReadOnly") is True and bool(run.session().get("historyError")),
+              "unavailable/unsafe history did not retain a read-only explanation")
+    run.check(run.session().get("historyId") == saved["historyId"], "resume rejection discarded the selected history")
+    run.check([item.get("text") for item in run.items("agent")] == [ANSWER], "resume rejection discarded saved answers")
+    order = methods(run.received())
+    run.check("turn/start" not in order and "thread/start" not in order, "rejected history started a model or replacement thread")
+    if mismatch:
+        run.check(not run.fake_pids() and "thread/resume" not in order, "capture mismatch started app-server")
+        run.check([result.get("status") for result in run.results()] == ["blocked"], f"mismatch results {run.results()}")
+    else:
+        if run.name == "D-resume-config-error":
+            run.check("config/read" in order and "thread/resume" not in order,
+                      "failed config verification did not stop resume")
+        else:
+            check_resume_config(run, saved)
+        run.check(not run.session().get("appServerRunning"), "failed resume left an unsafe process running")
+        run.check([result.get("status") for result in run.results()] == ["failed"], f"rejected resume results {run.results()}")
+    run.check(history_path.read_bytes() == before, "read-only rejection rewrote the original saved history")
+
+
 SCENARIOS: dict[str, Callable[[Run], None]] = {
     "A1": scenario_a1,
     "A2": scenario_a2,
@@ -709,8 +909,118 @@ SCENARIOS: dict[str, Callable[[Run], None]] = {
     "C-model-error": scenario_model_settings,
     "C-tool-artifacts": scenario_tool_artifacts,
     "C-tool-artifacts-rejected": scenario_tool_artifacts,
+    "D-new-chat": scenario_history_new_chat,
+    "D-restart-restore": scenario_history_restore,
+    "D-resume-replay": scenario_history_restore,
+    "D-history-view": scenario_history_view,
+    "D-bad-history": scenario_history_view,
+    "D-capture-mismatch": scenario_history_rejected,
+    "D-resume-failure": scenario_history_rejected,
+    "D-resume-config-error": scenario_history_rejected,
+    "D-resume-foreign": scenario_history_rejected,
+    "D-resume-unsafe": scenario_history_rejected,
     "exit": scenario_exit,
 }
+
+
+def scenario_history_capture(run: Run, args: argparse.Namespace) -> None:
+    """Exercise a real capture/bridge/UI with the persistent fake; never invoke a real model."""
+    capture = args.capture.resolve()
+    digest = hashlib.sha256()
+    with capture.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    expected_digest = digest.hexdigest()
+    stat = capture.stat()
+    common = {"waitForCapture": True, "selectEvent": args.event,
+              "captureTimeoutMs": int(args.timeout * 1000)}
+    first_png, restored_png, history_png = (run.root / name for name in
+                                          ("panel-first.png", "panel-restored.png", "history.png"))
+    run.launch(dict(common, questions=["saved capture question"], screenshot=str(first_png)),
+               fake_env(run, "persistent"), [str(capture)])
+    if not run.wait_transcript(args.timeout):
+        return
+    run.check([result.get("status") for result in run.results()] == ["completed"], f"first results {run.results()}")
+    run.check(run.session().get("captureTools") is True, "first capture conversation disabled capture tools")
+    saved = {"historyId": run.session().get("historyId"), "threadId": run.transcript.get("threadId"),
+             "instanceId": run.session().get("instanceId"), "captureSessionId": run.session().get("captureSessionId")}
+    run.check(all(saved.values()), f"first capture conversation has incomplete identity: {saved}")
+    (run.root / "first-transcript.json").write_text(json.dumps(run.transcript, indent=2), encoding="utf-8")
+    pids = run.fake_pids()
+    run.close()
+    run.check_no_survivors(pids)
+    record = next((entry for entry in run.history_records()
+                   if entry.get("metadata", {}).get("id") == saved["historyId"]), None)
+    run.check(record is not None, "capture conversation did not persist")
+    if not record or not all(saved.values()):
+        return
+    identity = record["metadata"].get("captureIdentity", {})
+    run.check(identity.get("kind") == "local-file" and identity.get("verified") is True,
+              f"capture identity was not verified: {identity}")
+    run.check(identity.get("sha256") == expected_digest and identity.get("bytes") == str(stat.st_size),
+              "saved capture identity does not contain the independently checked full-file SHA-256/size")
+    run.check(identity.get("modifiedUnixMs") == str(stat.st_mtime_ns // 1_000_000),
+              "saved capture identity has a different modification time")
+    run.check(os.path.normcase(os.path.normpath(identity.get("canonicalPath", ""))) ==
+              os.path.normcase(os.path.normpath(str(capture))), "saved capture identity has a different canonical path")
+
+    run.launch(dict(common, loadHistoryId="latest", questions=["continued capture question"],
+                    clickLinks=["first-event"], screenshot=str(restored_png), historyScreenshot=str(history_png)),
+               fake_env(run, "persistent"), [str(capture)], preserve=True)
+    if not run.wait_transcript(args.timeout):
+        return
+    check_resume_config(run, saved, capture_tools=True)
+    session = run.session()
+    run.check(session.get("historyId") == saved["historyId"] and run.transcript.get("threadId") == saved["threadId"],
+              "capture restore changed the history/thread id")
+    run.check(session.get("historyLoaded") is True and session.get("historyReadOnly") is False,
+              f"same capture could not resume: {session.get('historyError')}")
+    run.check(session.get("captureTools") is True and session.get("mcpStatus") == "connected",
+              "resumed capture tools were not enabled and verified")
+    run.check(session.get("captureSessionId") and session["captureSessionId"] != saved["captureSessionId"],
+              "reopened capture reused the old bridge capture session")
+    run.check([result.get("status") for result in run.results()] == ["completed"], f"resumed results {run.results()}")
+    run.check([item.get("text") for item in run.items("user")] == ["saved capture question", "continued capture question"],
+              "capture restore duplicated or lost the two user questions")
+    agents = run.items("agent")
+    run.check(len(agents) == 2 and all(item.get("text") == ANSWER for item in agents),
+              "capture restore duplicated or lost the two assistant answers")
+    run.check(agents and not agents[0].get("referenceToken") and
+              len(agents) == 2 and agents[1].get("referenceToken") == session.get("referenceToken"),
+              "old capture links retained authority or new answers lack the new reference identity")
+    texts = turn_texts(run)
+    run.check(len(texts) == 1 and f"instanceId: {session.get('instanceId')}" in texts[0] and
+              f"captureSessionId: {session.get('captureSessionId')}" in texts[0] and
+              "captureToolsAvailable: true" in texts[0] and texts[0].endswith("continued capture question"),
+              "resumed turn did not send the current instance/capture-session context")
+    order = methods(run.received())
+    run.check("thread/resume" in order and "mcpServerStatus/list" in order and "turn/start" in order and
+              order.index("thread/resume") < order.index("mcpServerStatus/list") < order.index("turn/start"),
+              "capture resume did not verify MCP runtime status before sending")
+    auto = run.transcript.get("autotest", {})
+    clicks = auto.get("linkClicks", [])
+    run.check(len(clicks) == 1 and clicks[0].get("link", "").startswith("rt://event/1513") and
+              clicks[0].get("ok") is False, "loaded old event link navigated the reopened capture")
+    run.check(auto.get("eventBefore") == auto.get("eventAfter") == args.event,
+              "old-link click changed the selected event")
+    dialog = auto.get("historyDialog", {})
+    run.check(dialog.get("count", 0) >= 1 and dialog.get("screenshotSaved") is True,
+              f"history dialog did not list the saved capture conversation: {dialog}")
+    run.check(all(path.is_file() and path.stat().st_size > 0 for path in (first_png, restored_png, history_png)),
+              "panel/history screenshots were not saved")
+    pids = run.fake_pids()
+    run.close()
+    run.check_no_survivors(pids)
+
+
+def run_history_capture(args: argparse.Namespace) -> int:
+    run = Run("history-capture", args.exe, DATA_DIR / "history-capture")
+    try:
+        scenario_history_capture(run, args)
+    finally:
+        run.close()
+    report(run)
+    return 1 if run.failures else 0
 
 
 def run_real(args) -> int:
@@ -834,9 +1144,11 @@ def split_turns(run: Run) -> list[tuple[list[str], str]]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scenario", default="all", help="all or one of: " + ", ".join(SCENARIOS))
+    parser.add_argument("--scenario", default="all", help="all, M5d, or one of: " + ", ".join(SCENARIOS))
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--real", action="store_true")
+    parser.add_argument("--history-capture", action="store_true",
+                        help="real capture, fake app-server: verify history restore across two UI processes")
     parser.add_argument("--ask-pixel", action="store_true", help="real mode: Q2/Q3 via the Ask AI pixel entry")
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--question", default=DEFAULT_REAL_QUESTION)
@@ -845,12 +1157,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=900)
     args = parser.parse_args(argv)
 
+    if args.history_capture:
+        if args.real or not args.capture or not args.capture.is_file():
+            parser.error("--history-capture requires an existing --capture and cannot use --real")
+        return run_history_capture(args)
+
     if args.real:
         if not args.capture:
             parser.error("--real needs --capture")
         return run_real_ask(args) if args.ask_pixel else run_real(args)
 
-    names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
+    if args.scenario == "all":
+        names = list(SCENARIOS)
+    elif args.scenario == "M5d":
+        names = [name for name in SCENARIOS if name.startswith("D-")]
+    elif args.scenario in SCENARIOS:
+        names = [args.scenario]
+    else:
+        parser.error("unknown scenario " + args.scenario)
     failed = 0
     for name in names:
         run = Run(name, args.exe, DATA_DIR / name)

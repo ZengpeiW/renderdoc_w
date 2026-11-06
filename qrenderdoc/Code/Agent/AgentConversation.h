@@ -77,6 +77,9 @@ public:
 
   const QList<AgentItem> &Items() const { return m_Items; }
   QJsonObject ToJson() const;
+  // Atomically restores our local snapshot. Never restores a running turn or reference tokens;
+  // historical EID/resource links remain invalid even when the capture itself matches.
+  bool Load(const QJsonObject &snapshot, QString &error);
 
 private:
   AgentItem *Find(const QString &id);

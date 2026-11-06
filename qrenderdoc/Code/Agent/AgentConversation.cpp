@@ -1,13 +1,63 @@
 #include "AgentConversation.h"
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QRegularExpression>
 #include <QVariant>
+#include <cmath>
 
 namespace
 {
 const int MaxArgumentsBytes = 8192;
 const int MaxResultBytes = 4096;
 const int MaxArtifacts = 8;
+const int MaxSnapshotBytes = 16 * 1024 * 1024;
+const int MaxSnapshotItems = 10000;
+const int MaxSnapshotTurns = 2000;
+const int MaxItemTextBytes = 2 * 1024 * 1024;
+const char *SnapshotSchema = "rendertest-agent-conversation/v1";
+
+bool ReadString(const QJsonObject &json, const QString &key, int maxBytes, QString &value)
+{
+  const QJsonValue entry = json[key];
+  if(entry.isUndefined())
+  {
+    value.clear();
+    return true;
+  }
+  if(!entry.isString())
+    return false;
+  value = entry.toString();
+  return value.toUtf8().size() <= maxBytes;
+}
+
+bool ReadInteger(const QJsonObject &json, const QString &key, qint64 fallback, qint64 minimum,
+                 qint64 &value)
+{
+  const QJsonValue entry = json[key];
+  if(entry.isUndefined())
+  {
+    value = fallback;
+    return true;
+  }
+  const double number = entry.toDouble(-1.0);
+  if(!entry.isDouble() || !std::isfinite(number) || number < double(minimum) ||
+     number > 9007199254740991.0 || std::floor(number) != number)
+    return false;
+  value = qint64(number);
+  return true;
+}
+
+bool ReadKind(const QString &name, AgentItem::Kind &kind)
+{
+  if(name == lit("user")) kind = AgentItem::Kind::User;
+  else if(name == lit("agent")) kind = AgentItem::Kind::Agent;
+  else if(name == lit("reasoning")) kind = AgentItem::Kind::Reasoning;
+  else if(name == lit("tool")) kind = AgentItem::Kind::Tool;
+  else if(name == lit("notice")) kind = AgentItem::Kind::Notice;
+  else if(name == lit("other")) kind = AgentItem::Kind::Other;
+  else return false;
+  return true;
+}
 
 QString Compact(const QJsonValue &value, int maxBytes)
 {
@@ -86,6 +136,7 @@ void AgentConversation::Clear()
   m_Model.clear();
   m_TurnId.clear();
   m_LastTurnStatus.clear();
+  m_ReferenceToken.clear();
   m_TurnRunning = false;
   m_TotalTokens = 0;
 }
@@ -233,9 +284,13 @@ void AgentConversation::UpdateFromItem(AgentItem &item, const QJsonObject &json,
                value[lit("path")].toString().size() <= 4096)
             {
               QJsonObject metadata;
-              metadata[lit("path")] = value[lit("path")];
+              metadata[lit("path")] = value[lit("path")].toString();
               metadata[lit("mediaType")] = value[lit("mediaType")].toString().left(64);
-              metadata[lit("bytes")] = value[lit("bytes")];
+              const double bytes = value[lit("bytes")].toDouble(-1);
+              metadata[lit("bytes")] = std::isfinite(bytes) && bytes >= 0.0 &&
+                                                bytes <= 9007199254740991.0
+                                            ? bytes
+                                            : -1.0;
               metadata[lit("sha256")] = value[lit("sha256")].toString().left(65);
               item.artifacts << metadata;
             }
@@ -440,10 +495,168 @@ QJsonObject AgentConversation::ToJson() const
     turns << turn;
 
   QJsonObject result;
+  result[lit("schema")] = QString::fromLatin1(SnapshotSchema);
   result[lit("threadId")] = m_ThreadId;
   result[lit("model")] = m_Model;
   result[lit("turns")] = turns;
   result[lit("items")] = items;
   result[lit("totalTokens")] = double(m_TotalTokens);
+  result[lit("turnRunning")] = m_TurnRunning;
+  result[lit("turnId")] = m_TurnId;
+  result[lit("lastTurnStatus")] = m_LastTurnStatus;
   return result;
+}
+
+bool AgentConversation::Load(const QJsonObject &snapshot, QString &error)
+{
+  auto fail = [&error](const QString &message) { error = message; return false; };
+  if(snapshot[lit("schema")].toString() != QString::fromLatin1(SnapshotSchema) ||
+     !snapshot[lit("items")].isArray() || !snapshot[lit("turns")].isArray() ||
+     !snapshot[lit("turnRunning")].isBool())
+    return fail(lit("The saved conversation has an unsupported or incomplete format."));
+  if(snapshot[lit("items")].toArray().size() > MaxSnapshotItems ||
+     snapshot[lit("turns")].toArray().size() > MaxSnapshotTurns ||
+     QJsonDocument(snapshot).toJson(QJsonDocument::Compact).size() > MaxSnapshotBytes)
+    return fail(lit("The saved conversation exceeds the history size limit."));
+
+  AgentConversation restored;
+  QString savedTurnId;
+  if(!ReadString(snapshot, lit("threadId"), 1024, restored.m_ThreadId) ||
+     !ReadString(snapshot, lit("model"), 1024, restored.m_Model) ||
+     !ReadString(snapshot, lit("turnId"), 1024, savedTurnId) ||
+     !ReadString(snapshot, lit("lastTurnStatus"), 64, restored.m_LastTurnStatus) ||
+     !ReadInteger(snapshot, lit("totalTokens"), 0, 0, restored.m_TotalTokens))
+    return fail(lit("The saved conversation contains invalid identifiers or token usage."));
+
+  bool interrupted = snapshot[lit("turnRunning")].toBool();
+  QSet<QString> itemIds;
+  for(const QJsonValue &value : snapshot[lit("items")].toArray())
+  {
+    if(!value.isObject())
+      return fail(lit("A saved conversation item is invalid."));
+    const QJsonObject json = value.toObject();
+    AgentItem item;
+    if(!ReadKind(json[lit("kind")].toString(), item.kind) ||
+       !ReadString(json, lit("type"), 128, item.type) ||
+       !ReadString(json, lit("id"), 1024, item.id) ||
+       !ReadString(json, lit("turnId"), 1024, item.turnId) ||
+       !ReadString(json, lit("text"), MaxItemTextBytes, item.text) ||
+       !ReadString(json, lit("status"), 64, item.status) ||
+       !ReadString(json, lit("server"), 256, item.server) ||
+       !ReadString(json, lit("tool"), 256, item.tool) ||
+       !ReadString(json, lit("arguments"), MaxArgumentsBytes, item.arguments) ||
+       !ReadString(json, lit("progress"), MaxItemTextBytes, item.progress) ||
+       !ReadString(json, lit("error"), MaxResultBytes, item.error) ||
+       !ReadString(json, lit("result"), MaxResultBytes, item.result) ||
+       !ReadString(json, lit("artifactInstanceId"), 128, item.artifactInstanceId) ||
+       !ReadString(json, lit("artifactCaptureSessionId"), 128, item.artifactCaptureSessionId) ||
+       !ReadInteger(json, lit("durationMs"), -1, -1, item.durationMs))
+      return fail(lit("A saved conversation item contains invalid or oversized fields."));
+    if(!item.id.isEmpty())
+    {
+      if(itemIds.contains(item.id))
+        return fail(lit("The saved conversation contains duplicate item identifiers."));
+      itemIds.insert(item.id);
+    }
+    if(!item.turnId.isEmpty())
+      restored.m_ClosedTurnIds.insert(item.turnId);
+    // Never copy a stored token: disk content cannot grant permission to act on the current UI.
+    item.referenceToken.clear();
+    if(item.status == lit("inProgress"))
+    {
+      item.status = lit("interrupted");
+      item.progress.clear();
+      interrupted = true;
+    }
+    if(json.contains(lit("context")))
+    {
+      if(!json[lit("context")].isArray() || json[lit("context")].toArray().size() > 64)
+        return fail(lit("The saved message context is invalid."));
+      for(const QJsonValue &context : json[lit("context")].toArray())
+      {
+        const QJsonObject chip = context.toObject();
+        if(!context.isObject() || !chip[lit("label")].isString() ||
+           QJsonDocument(chip).toJson(QJsonDocument::Compact).size() > 64 * 1024)
+          return fail(lit("A saved context chip is invalid or too large."));
+      }
+      item.context = json[lit("context")].toArray();
+    }
+    if(json.contains(lit("artifacts")))
+    {
+      if(!json[lit("artifacts")].isArray() || json[lit("artifacts")].toArray().size() > MaxArtifacts)
+        return fail(lit("Saved artifact metadata is invalid."));
+      for(const QJsonValue &artifact : json[lit("artifacts")].toArray())
+      {
+        const QJsonObject metadata = artifact.toObject();
+        QString path, mediaType, digest;
+        const double bytes = metadata[lit("bytes")].toDouble(-1);
+        if(!artifact.isObject() || !ReadString(metadata, lit("path"), 16384, path) ||
+           !ReadString(metadata, lit("mediaType"), 256, mediaType) ||
+           !ReadString(metadata, lit("sha256"), 256, digest) ||
+           !std::isfinite(bytes) || bytes < -1.0 || bytes > 9007199254740991.0)
+          return fail(lit("A saved artifact has invalid metadata."));
+        QJsonObject bounded;
+        bounded[lit("path")] = path;
+        bounded[lit("mediaType")] = mediaType;
+        bounded[lit("bytes")] = bytes;
+        bounded[lit("sha256")] = digest;
+        item.artifacts << bounded;
+      }
+    }
+    restored.m_Items << item;
+  }
+
+  bool savedTurnRecorded = false;
+  QSet<QString> turnIds;
+  for(const QJsonValue &value : snapshot[lit("turns")].toArray())
+  {
+    const QJsonObject json = value.toObject();
+    QString id, status, message;
+    if(!value.isObject() || !ReadString(json, lit("id"), 1024, id) ||
+       !ReadString(json, lit("status"), 64, status) ||
+       !ReadString(json, lit("error"), MaxItemTextBytes, message) ||
+       (!id.isEmpty() && turnIds.contains(id)))
+      return fail(lit("Saved turn metadata is invalid."));
+    if(status == lit("inProgress"))
+    {
+      status = lit("interrupted");
+      interrupted = true;
+    }
+    if(status != lit("completed") && status != lit("interrupted") && status != lit("failed"))
+      return fail(lit("The saved conversation contains an unknown turn state."));
+    QJsonObject turn;
+    turn[lit("id")] = id;
+    turn[lit("status")] = status;
+    if(!message.isEmpty())
+      turn[lit("error")] = message;
+    restored.m_Turns << turn;
+    if(!id.isEmpty())
+    {
+      turnIds.insert(id);
+      restored.m_ClosedTurnIds.insert(id);
+    }
+    savedTurnRecorded = savedTurnRecorded || (!savedTurnId.isEmpty() && id == savedTurnId);
+  }
+  if(interrupted)
+  {
+    if(!savedTurnRecorded)
+    {
+      QJsonObject turn;
+      turn[lit("id")] = savedTurnId;
+      turn[lit("status")] = lit("interrupted");
+      turn[lit("error")] = lit("The conversation was saved before the turn finished.");
+      restored.m_Turns << turn;
+    }
+    restored.m_LastTurnStatus = lit("interrupted");
+  }
+  if(!savedTurnId.isEmpty())
+    restored.m_ClosedTurnIds.insert(savedTurnId);
+  if(restored.m_LastTurnStatus.isEmpty() && !restored.m_Turns.isEmpty())
+    restored.m_LastTurnStatus = restored.m_Turns.last()[lit("status")].toString();
+  restored.m_TurnRunning = false;
+  restored.m_TurnId.clear();
+  restored.m_ReferenceToken.clear();
+  *this = restored;
+  error.clear();
+  return true;
 }

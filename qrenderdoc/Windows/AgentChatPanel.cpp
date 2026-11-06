@@ -18,6 +18,8 @@
 #include <QScrollBar>
 #include <QTextBrowser>
 #include <QTextDocument>
+#include <QTreeWidget>
+#include <QThread>
 #include <QTimer>
 #include <QToolButton>
 #include <QUrl>
@@ -25,6 +27,7 @@
 #include <QUuid>
 #include <QVBoxLayout>
 #include "Code/Agent/AgentMarkdown.h"
+#include "Code/Agent/AgentCaptureIdentity.h"
 #include "Code/Agent/AgentSettingsDialog.h"
 #include "Code/Agent/AgentToolView.h"
 #include "Code/Agent/CodexAppServerClient.h"
@@ -43,6 +46,27 @@ public:
   explicit AgentTextBrowser(QWidget *parent) : QTextBrowser(parent) {}
 protected:
   QVariant loadResource(int, const QUrl &) override { return QVariant(); }
+};
+
+// Read large captures off the GUI thread. Completion connections are canceled with the panel;
+// the shared flag lets capture changes and shutdown stop the read between chunks.
+class CaptureIdentityThread : public QThread
+{
+public:
+  CaptureIdentityThread(const QString &filename, bool local, bool temporary,
+                        const std::shared_ptr<std::atomic<bool>> &cancel)
+      : m_Filename(filename), m_Local(local), m_Temporary(temporary), m_Cancel(cancel) {}
+  QJsonObject result;
+protected:
+  void run() override
+  {
+    result = AgentCaptureIdentity::Inspect(m_Filename, m_Local, m_Temporary, m_Cancel.get());
+  }
+private:
+  QString m_Filename;
+  bool m_Local;
+  bool m_Temporary;
+  std::shared_ptr<std::atomic<bool>> m_Cancel;
 };
 
 const int InitializeTimeoutMs = 30000;
@@ -137,7 +161,13 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   m_Status->setWordWrap(true);
 
   m_NewChat = new QPushButton(tr("New Chat"), this);
-  m_NewChat->setToolTip(tr("Discard this conversation and start a new one"));
+  m_NewChat->setToolTip(tr("Save this conversation and start a new one"));
+  m_History = new AgentHistory(RenderTestAgentIntegration::AgentRoot());
+  m_HistoryButton = new QPushButton(tr("History"), this);
+  m_HistoryNotice = new QLabel(this);
+  m_HistoryNotice->setWordWrap(true);
+  m_HistoryNotice->setTextFormat(Qt::PlainText);
+  m_HistoryNotice->hide();
 
   m_Settings = new QPushButton(tr("Settings"), this);
   m_Login = new QPushButton(tr("Log in"), this);
@@ -161,6 +191,7 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   QHBoxLayout *top = new QHBoxLayout();
   top->addWidget(m_Status, 1);
   top->addWidget(m_Login);
+  top->addWidget(m_HistoryButton);
   top->addWidget(m_NewChat);
   top->addWidget(m_Settings);
 
@@ -176,6 +207,7 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   QVBoxLayout *layout = new QVBoxLayout(this);
   layout->setContentsMargins(3, 3, 3, 3);
   layout->addLayout(top);
+  layout->addWidget(m_HistoryNotice);
   layout->addWidget(m_View, 1);
   layout->addWidget(m_ContextBar);
   layout->addLayout(bottom);
@@ -190,6 +222,11 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   m_StopTimer->setInterval(StopGraceMs);
   connect(m_StopTimer, &QTimer::timeout, this, &AgentChatPanel::ForceStop);
 
+  m_HistoryTimer = new QTimer(this);
+  m_HistoryTimer->setSingleShot(true);
+  m_HistoryTimer->setInterval(2000);
+  connect(m_HistoryTimer, &QTimer::timeout, this, &AgentChatPanel::SaveHistory);
+
   m_Client = new CodexAppServerClient(this);
   connect(m_Client, &CodexAppServerClient::serverRequestAnswered, this,
           &AgentChatPanel::OnServerRequest);
@@ -198,11 +235,14 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   connect(m_Send, &QPushButton::clicked, this, &AgentChatPanel::Send);
   connect(m_StopButton, &QPushButton::clicked, this, &AgentChatPanel::Stop);
   connect(m_NewChat, &QPushButton::clicked, this, &AgentChatPanel::NewChat);
+  connect(m_HistoryButton, &QPushButton::clicked, this, &AgentChatPanel::ShowHistory);
   connect(m_Settings, &QPushButton::clicked, this, &AgentChatPanel::EditSettings);
   connect(m_Login, &QPushButton::clicked, this, &AgentChatPanel::Login);
   connect(m_View, &QTextBrowser::anchorClicked, this, &AgentChatPanel::OpenLink);
 
   m_Ctx.AddCaptureViewer(this);
+  if(m_LoadedIdentity.isEmpty() && !m_IdentityPending)
+    RefreshCaptureIdentity(m_Ctx.IsCaptureLoaded());
 
   Render();
   UpdateChips();
@@ -211,8 +251,17 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
 
 AgentChatPanel::~AgentChatPanel()
 {
+  if(m_IdentityCancel)
+    *m_IdentityCancel = true;
+  if(m_Conversation.TurnRunning())
+  {
+    m_Conversation.EndTurn(lit("interrupted"), tr("RenderTest closed during this turn."));
+    m_HistoryDirty = true;
+  }
+  SaveHistory();
   m_Client->disconnect(this);
   m_Client->Kill();
+  delete m_History;
 
   m_Ctx.BuiltinWindowClosed(this);
   m_Ctx.RemoveCaptureViewer(this);
@@ -221,16 +270,20 @@ AgentChatPanel::~AgentChatPanel()
 void AgentChatPanel::OnCaptureLoaded()
 {
   CaptureChanged(tr("A capture was loaded. The next question starts a new conversation."));
+  RefreshCaptureIdentity(true);
   m_Chips.clear();
   m_IncludeEvent = true;
   UpdateChips();
+  UpdateControls();
 }
 
 void AgentChatPanel::OnCaptureClosed()
 {
   CaptureChanged(tr("The capture was closed. Its conversation and links are no longer active."));
+  RefreshCaptureIdentity(false);
   m_Chips.clear();
   UpdateChips();
+  UpdateControls();
 }
 
 void AgentChatPanel::CaptureChanged(const QString &message)
@@ -244,7 +297,250 @@ void AgentChatPanel::CaptureChanged(const QString &message)
     m_Conversation.EndTurn(lit("interrupted"), message);
   else if(!m_Conversation.Items().isEmpty())
     m_Conversation.AddNotice(lit("info"), message);
+  m_HistoryDirty = true;
+  SaveHistory();
+  if(!m_HistoryRecord.metadata.id.isEmpty())
+    MakeHistoryReadOnly(tr("Capture changed. This conversation is read-only. Open it from History "
+                           "with the matching capture, or start a new chat."));
   QuestionFinished();
+  ScheduleRender();
+  UpdateControls();
+}
+
+void AgentChatPanel::RefreshCaptureIdentity(bool loaded)
+{
+  if(m_IdentityCancel)
+    *m_IdentityCancel = true;
+  const int generation = ++m_IdentityGeneration;
+  m_VerifyHistoryAfterIdentity = false;
+  m_LoadedIdentity = QJsonObject();
+  m_IdentityPending = loaded;
+  if(!m_IdentityPending)
+  {
+    m_LoadedIdentity = AgentCaptureIdentity::NoCapture();
+    return;
+  }
+  m_IdentityCancel = std::make_shared<std::atomic<bool>>(false);
+  CaptureIdentityThread *worker = new CaptureIdentityThread(
+      QString(m_Ctx.GetCaptureFilename()), m_Ctx.IsCaptureLocal(), m_Ctx.IsCaptureTemporary(),
+      m_IdentityCancel);
+  connect(worker, &QThread::finished, this, [this, worker, generation]() {
+    if(generation != m_IdentityGeneration)
+      return;
+    m_LoadedIdentity = worker->result;
+    m_IdentityPending = false;
+    if(m_VerifyHistoryAfterIdentity && m_HistoryLoaded && !m_HistoryRecord.metadata.id.isEmpty())
+      VerifyHistoryIdentity();
+    UpdateControls();
+    if(m_Autotest.active)
+      QTimer::singleShot(0, this, &AgentChatPanel::AutotestNext);
+  });
+  connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+  worker->start();
+}
+
+bool AgentChatPanel::CaptureFileUnchanged() const
+{
+  if(m_LoadedIdentity[lit("kind")].toString() == lit("none"))
+    return !m_Ctx.IsCaptureLoaded();
+  if(!m_LoadedIdentity[lit("verified")].toBool())
+    return true;    // Unverifiable captures can chat now, but can never resume saved history.
+  return m_Ctx.IsCaptureLoaded() && !m_Ctx.IsCaptureLoading() &&
+         AgentCaptureIdentity::FileUnchanged(m_LoadedIdentity, QString(m_Ctx.GetCaptureFilename()));
+}
+
+void AgentChatPanel::EnsureHistory(const QString &title)
+{
+  if(!m_HistoryRecord.metadata.id.isEmpty())
+    return;
+  m_HistoryRecord = AgentHistoryRecord();
+  m_HistoryRecord.metadata.id = AgentHistory::NewId();
+  m_HistoryRecord.metadata.title = title.simplified().left(120);
+  m_HistoryRecord.metadata.mode = m_Ctx.IsCaptureLoaded() ? lit("capture") : lit("chat");
+  m_HistoryRecord.metadata.captureIdentity = m_LoadedIdentity;
+  QString error;
+  if(!m_History->Acquire(m_HistoryRecord.metadata.id, error))
+  {
+    m_LastSaveError = error;
+    m_Conversation.AddNotice(lit("error"), tr("Could not save conversation history: %1").arg(error));
+  }
+}
+
+void AgentChatPanel::SaveHistory()
+{
+  if(!m_History || m_HistoryReadOnly || m_ResumeValidationPending || !m_HistoryDirty ||
+     m_HistoryRecord.metadata.id.isEmpty() || m_Conversation.Items().isEmpty())
+    return;
+  m_HistoryTimer->stop();
+  m_HistoryRecord.conversation = m_Conversation.ToJson();
+  // Killing an app-server clears the live binding, but must not erase its durable thread id.
+  m_HistoryRecord.conversation[lit("threadId")] = m_HistoryRecord.metadata.threadId;
+  m_HistoryRecord.metadata.model = m_Conversation.Model();
+  QString error;
+  // Never replace a recoverable snapshot with content our own reader would reject.
+  AgentConversation validation;
+  if(!validation.Load(m_HistoryRecord.conversation, error) || !m_History->Save(m_HistoryRecord, error))
+  {
+    if(error != m_LastSaveError)
+    {
+      m_LastSaveError = error;
+      m_Conversation.AddNotice(lit("error"), tr("Could not save conversation history: %1").arg(error));
+      ScheduleRender();
+    }
+    m_HistoryDirty = true;
+  }
+  else
+  {
+    m_LastSaveError.clear();
+    m_HistoryDirty = false;
+  }
+}
+
+void AgentChatPanel::MakeHistoryReadOnly(const QString &reason)
+{
+  m_HistoryReadOnly = true;
+  m_HistoryError = reason;
+  m_HistoryDirty = false;
+  m_HistoryTimer->stop();
+  m_History->Release();
+  UpdateControls();
+}
+
+void AgentChatPanel::ShowHistory()
+{
+  if(m_Conversation.TurnRunning() || m_State == SessionState::Starting || m_LoginStarting ||
+     !m_LoginId.isEmpty())
+    return;
+  SaveHistory();
+  QString warning;
+  const QList<AgentHistoryEntry> entries = m_History->List(warning);
+  if(!warning.isEmpty())
+  {
+    m_Conversation.AddNotice(lit("warning"), warning);
+    ScheduleRender();
+  }
+  const QString id = AgentHistory::Select(entries, this);
+  if(!id.isEmpty())
+    LoadHistory(id);
+}
+
+bool AgentChatPanel::LoadHistory(const QString &id)
+{
+  AgentHistoryRecord record;
+  AgentConversation conversation;
+  QString error;
+  if(!m_History->Load(id, record, error) || !conversation.Load(record.conversation, error))
+  {
+    m_HistoryError = error;
+    m_Conversation.AddNotice(lit("error"), tr("Could not open conversation history: %1").arg(error));
+    ScheduleRender();
+    return false;
+  }
+  SaveHistory();
+  if(!m_LastSaveError.isEmpty())
+    return false;
+  KillSession();
+  m_History->Release();
+  m_PendingText.clear();
+  m_Chips.clear();
+  m_Input->clear();
+  m_ExpandedTools.clear();
+  AgentToolView::ClearCache();
+  m_ReferenceToken = AgentHistory::NewId();
+  m_Conversation = conversation;
+  m_HistoryRecord = record;
+  m_HistoryLoaded = true;
+  m_LastSaveError.clear();
+  m_ResumeValidationPending = false;
+  m_HadThread = !record.metadata.threadId.isEmpty();
+  MakeHistoryReadOnly(tr("Checking the capture before allowing this conversation to continue..."));
+  ReadCaptureBinding(m_InstanceId, m_CaptureSessionId);
+  VerifyHistoryIdentity();
+  UpdateChips();
+  ScheduleRender();
+  return true;
+}
+
+void AgentChatPanel::VerifyHistoryIdentity()
+{
+  if(m_IdentityPending)
+  {
+    m_VerifyHistoryAfterIdentity = true;
+    return;
+  }
+  m_VerifyHistoryAfterIdentity = false;
+  QString reason;
+  if(!AgentCaptureIdentity::Matches(m_HistoryRecord.metadata.captureIdentity, m_LoadedIdentity, &reason))
+  {
+    MakeHistoryReadOnly(reason);
+    return;
+  }
+  if(m_LoadedIdentity[lit("kind")].toString() == lit("none"))
+  {
+    EnableHistoryContinuation(m_LoadedIdentity);
+    return;
+  }
+  // A second full read checks that the on-disk capture still matches the one loaded for replay.
+  const int generation = ++m_IdentityGeneration;
+  const QString id = m_HistoryRecord.metadata.id;
+  if(m_IdentityCancel)
+    *m_IdentityCancel = true;
+  m_IdentityCancel = std::make_shared<std::atomic<bool>>(false);
+  m_IdentityPending = true;
+  CaptureIdentityThread *worker = new CaptureIdentityThread(
+      QString(m_Ctx.GetCaptureFilename()), m_Ctx.IsCaptureLocal(), m_Ctx.IsCaptureTemporary(),
+      m_IdentityCancel);
+  connect(worker, &QThread::finished, this, [this, worker, generation, id]() {
+    if(generation != m_IdentityGeneration)
+      return;
+    m_IdentityPending = false;
+    if(m_VerifyHistoryAfterIdentity && m_HistoryLoaded && !m_HistoryRecord.metadata.id.isEmpty())
+      VerifyHistoryIdentity();
+    else if(m_HistoryRecord.metadata.id == id)
+      EnableHistoryContinuation(worker->result);
+    UpdateControls();
+    if(m_Autotest.active)
+      QTimer::singleShot(0, this, &AgentChatPanel::AutotestNext);
+  });
+  connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+  worker->start();
+  UpdateControls();
+}
+
+void AgentChatPanel::EnableHistoryContinuation(const QJsonObject &identity)
+{
+  QString error;
+  if(!AgentCaptureIdentity::Matches(m_LoadedIdentity, identity, &error) ||
+     !AgentCaptureIdentity::Matches(m_HistoryRecord.metadata.captureIdentity, identity, &error))
+  {
+    MakeHistoryReadOnly(error);
+    return;
+  }
+  if(m_HistoryRecord.metadata.threadId.isEmpty())
+  {
+    MakeHistoryReadOnly(tr("This saved conversation has no Codex thread to resume. Start a new chat."));
+    return;
+  }
+  if(!m_History->Acquire(m_HistoryRecord.metadata.id, error))
+  {
+    MakeHistoryReadOnly(error);
+    return;
+  }
+  // Another window may have updated the snapshot before we acquired its lock.
+  AgentHistoryRecord latest;
+  AgentConversation conversation;
+  if(!m_History->Load(m_HistoryRecord.metadata.id, latest, error) ||
+     !conversation.Load(latest.conversation, error) ||
+     !AgentCaptureIdentity::Matches(latest.metadata.captureIdentity, identity, &error))
+  {
+    MakeHistoryReadOnly(error);
+    return;
+  }
+  m_HistoryRecord = latest;
+  m_Conversation = conversation;
+  m_HistoryReadOnly = false;
+  m_HistoryError.clear();
+  m_HistoryDirty = false;
   ScheduleRender();
   UpdateControls();
 }
@@ -517,7 +813,8 @@ bool AgentChatPanel::eventFilter(QObject *watched, QEvent *event)
 void AgentChatPanel::Send()
 {
   QString text = m_Input->toPlainText().trimmed();
-  if(text.isEmpty() || m_Conversation.TurnRunning() || m_LoginStarting || !m_LoginId.isEmpty())
+  if(!m_Send->isEnabled() || text.isEmpty() || m_Conversation.TurnRunning() || m_LoginStarting || !m_LoginId.isEmpty() ||
+     m_HistoryReadOnly || m_IdentityPending)
     return;
   m_Input->clear();
   SendText(text);
@@ -525,14 +822,30 @@ void AgentChatPanel::Send()
 
 void AgentChatPanel::SendText(const QString &text)
 {
+  if(m_HistoryReadOnly || m_IdentityPending || m_Ctx.IsCaptureLoading() ||
+     (m_Ctx.IsCaptureLoaded() && m_LoadedIdentity[lit("kind")].toString() == lit("none")))
+    return;
+  if(!CaptureFileUnchanged())
+  {
+    SaveHistory();
+    MakeHistoryReadOnly(tr("The capture file changed on disk. Reopen it and start a new chat."));
+    return;
+  }
   QString instance, session;
   ReadCaptureBinding(instance, session);
   if(m_InstanceId != instance || m_CaptureSessionId != session)
   {
-    CaptureChanged(tr("The capture binding changed. Started a new conversation."));
+    if(!m_HistoryRecord.metadata.id.isEmpty())
+      CaptureChanged(tr("The capture binding changed. Open History or start a new conversation."));
     m_InstanceId = instance;
     m_CaptureSessionId = session;
   }
+  if(m_HistoryReadOnly)
+    return;
+  EnsureHistory(text);
+  m_ResumeValidationPending = !m_HistoryRecord.metadata.threadId.isEmpty() &&
+                              (m_State != SessionState::Ready || !m_Client->IsRunning() ||
+                               m_Conversation.ThreadId().isEmpty());
   QList<AgentContextChip> context = ContextSnapshot();
   QJsonArray contextJson;
   for(const AgentContextChip &chip : context)
@@ -546,6 +859,8 @@ void AgentChatPanel::SendText(const QString &text)
   m_Conversation.BeginTurn(m_ReferenceToken);
   m_QuestionActive = true;
   m_StopRequested = false;
+  m_HistoryDirty = true;
+  SaveHistory();
 
   if(m_State == SessionState::Ready && m_Client->IsRunning())
   {
@@ -959,23 +1274,36 @@ void AgentChatPanel::StartThread(int generation, const QStringList &disabledServ
   params[lit("cwd")] = m_Launch.workingDir;
   params[lit("sandbox")] = lit("read-only");
   params[lit("approvalPolicy")] = lit("never");
-  params[lit("ephemeral")] = true;
-  params[lit("serviceName")] = lit("qrendertest");
+  const QString resumeId = m_HistoryRecord.metadata.threadId;
+  const bool resume = !resumeId.isEmpty();
+  if(resume)
+  {
+    params[lit("threadId")] = resumeId;
+    params[lit("excludeTurns")] = true;    // The local snapshot supplies UI history exactly once.
+  }
+  else
+  {
+    params[lit("ephemeral")] = false;
+    params[lit("serviceName")] = lit("qrendertest");
+  }
   params[lit("developerInstructions")] = AgentLaunchConfig::DeveloperInstructions(m_InstanceId);
   if(!m_Launch.model.isEmpty())
     params[lit("model")] = m_Launch.model;
   if(!config.isEmpty())
     params[lit("config")] = config;
 
-  m_Client->Request(lit("thread/start"), params, ThreadTimeoutMs,
-                    [this, generation](const QJsonValue &result, const QJsonObject &error) {
+  m_Client->Request(resume ? lit("thread/resume") : lit("thread/start"), params, ThreadTimeoutMs,
+                    [this, generation, resume, resumeId](const QJsonValue &result, const QJsonObject &error) {
                       if(generation != m_Generation)
                         return;
                       if(!error.isEmpty())
                       {
-                        SessionFailed(
-                            SessionState::Error,
-                            tr("Could not start a Codex thread: %1").arg(ErrorMessage(error)));
+                        const QString message = resume
+                            ? tr("Could not resume the Codex thread: %1. The saved conversation remains read-only; start a new chat to continue.").arg(ErrorMessage(error))
+                            : tr("Could not start a Codex thread: %1").arg(ErrorMessage(error));
+                        SessionFailed(SessionState::Error, message);
+                        if(resume)
+                          MakeHistoryReadOnly(message);
                         return;
                       }
                       QJsonObject data = result.toObject();
@@ -991,12 +1319,19 @@ void AgentChatPanel::StartThread(int generation, const QStringList &disabledServ
                         return;
                       }
                       QString threadId = data[lit("thread")].toObject()[lit("id")].toString();
-                      if(m_HadThread && !m_Conversation.Items().isEmpty())
-                        m_Conversation.AddNotice(
-                            lit("info"), tr("Started a new Codex thread; earlier messages in this "
-                                            "panel are not visible to the model."));
+                      if(threadId.isEmpty() || (resume && threadId != resumeId))
+                      {
+                        const QString message = tr("Codex returned a different or empty thread identity; refusing to continue.");
+                        SessionFailed(SessionState::Error, message);
+                        if(resume)
+                          MakeHistoryReadOnly(message);
+                        return;
+                      }
                       m_HadThread = true;
                       m_Conversation.SetThread(threadId, data[lit("model")].toString());
+                      m_HistoryRecord.metadata.threadId = threadId;
+                      m_HistoryDirty = true;
+                      SaveHistory();
                       m_ThreadIds << threadId;
                       PollMcpStatus(generation, 0);
                     });
@@ -1102,6 +1437,8 @@ void AgentChatPanel::PollMcpStatus(int generation, int attempt, const QString &c
         }
 
         SetState(SessionState::Ready);
+        m_ResumeValidationPending = false;
+        SaveHistory();
         ScheduleRender();
         if(m_Conversation.TurnRunning() && !m_PendingText.isEmpty())
           StartTurn();
@@ -1114,7 +1451,7 @@ void AgentChatPanel::StartTurn()
 {
   QString instance, session;
   ReadCaptureBinding(instance, session);
-  if(instance != m_InstanceId || session != m_CaptureSessionId)
+  if(m_HistoryReadOnly || !CaptureFileUnchanged() || instance != m_InstanceId || session != m_CaptureSessionId)
   {
     SessionFailed(SessionState::Error,
                   tr("The capture changed while connecting. Send the question again."));
@@ -1164,6 +1501,8 @@ void AgentChatPanel::SessionFailed(SessionState state, const QString &message)
     m_Conversation.EndTurn(lit("failed"), message);
   else
     m_Conversation.AddNotice(lit("error"), message);
+  if(m_ResumeValidationPending)
+    MakeHistoryReadOnly(message);
   ScheduleRender();
   QuestionFinished();
 }
@@ -1213,8 +1552,7 @@ void AgentChatPanel::ForceStop()
   KillSession();
   m_PendingText.clear();
   m_Conversation.EndTurn(lit("interrupted"),
-                         tr("Stopped. Codex was restarted, so the next message starts a new "
-                            "thread."));
+                         tr("Stopped. The next message reconnects to this saved conversation."));
   ScheduleRender();
   UpdateControls();
   QuestionFinished();
@@ -1224,6 +1562,23 @@ void AgentChatPanel::NewChat()
 {
   if(m_Conversation.TurnRunning())
     return;
+  SaveHistory();
+  if(!m_LastSaveError.isEmpty())
+  {
+    UpdateControls();
+    return;
+  }
+  KillSession();
+  m_History->Release();
+  m_HistoryRecord = AgentHistoryRecord();
+  m_HistoryReadOnly = false;
+  m_HistoryLoaded = false;
+  m_HistoryDirty = false;
+  m_ResumeValidationPending = false;
+  m_VerifyHistoryAfterIdentity = false;
+  m_HistoryError.clear();
+  m_LastSaveError.clear();
+  m_ReferenceToken = AgentHistory::NewId();
   m_Conversation.Clear();
   m_ExpandedTools.clear();
   AgentToolView::ClearCache();
@@ -1304,6 +1659,8 @@ void AgentChatPanel::OnNotification(const QString &method, const QJsonObject &pa
   if(m_State != SessionState::Ready || !m_Conversation.TurnRunning())
     return;
   bool changed = m_Conversation.Apply(method, params);
+  if(changed)
+    m_HistoryDirty = true;
 
   if(m_Autotest.active && !m_Autotest.stopOnTool.isEmpty() &&
      m_Autotest.index - 1 == m_Autotest.stopQuestion && method == lit("item/started"))
@@ -1361,12 +1718,16 @@ void AgentChatPanel::OnProcessExited(int exitCode, bool killed, const QString &r
     m_Conversation.EndTurn(lit("failed"), message);
   else
     m_Conversation.AddNotice(lit("error"), message);
+  if(m_ResumeValidationPending)
+    MakeHistoryReadOnly(message);
   ScheduleRender();
   QuestionFinished();
 }
 
 void AgentChatPanel::QuestionFinished()
 {
+  m_HistoryDirty = true;
+  SaveHistory();
   if(!m_QuestionActive)
     return;
   m_QuestionActive = false;
@@ -1391,10 +1752,27 @@ void AgentChatPanel::UpdateControls()
 {
   const bool running = m_Conversation.TurnRunning();
   const bool loginBusy = m_LoginStarting || !m_LoginId.isEmpty();
-  m_Send->setEnabled(!running && !loginBusy);
+  const bool captureTransition = m_Ctx.IsCaptureLoading() ||
+      (m_Ctx.IsCaptureLoaded() && m_LoadedIdentity[lit("kind")].toString() == lit("none"));
+  m_Send->setEnabled(!running && !loginBusy && !m_HistoryReadOnly && !m_IdentityPending && !captureTransition);
+  m_Input->setReadOnly(m_HistoryReadOnly);
   m_StopButton->setEnabled(running);
   m_NewChat->setEnabled(!running && !loginBusy);
   m_Settings->setEnabled(!running && m_State != SessionState::Starting && !loginBusy);
+  m_HistoryButton->setEnabled(!running && m_State != SessionState::Starting && !loginBusy);
+  QString historyNotice;
+  if(m_IdentityPending)
+    historyNotice = tr("Verifying the capture file for conversation history...");
+  else if(m_HistoryReadOnly)
+    historyNotice = m_HistoryError;
+  else if(!m_LastSaveError.isEmpty())
+    historyNotice = tr("History could not be saved: %1").arg(m_LastSaveError);
+  else if(m_HistoryLoaded)
+    historyNotice = m_State == SessionState::Ready
+                        ? tr("Saved conversation resumed. Earlier capture links remain inactive.")
+                        : tr("Saved conversation opened. Send a message to resume; old capture links remain inactive.");
+  m_HistoryNotice->setText(historyNotice);
+  m_HistoryNotice->setVisible(!historyNotice.isEmpty());
   m_Login->setVisible(m_State == SessionState::NotLoggedIn);
   m_Login->setEnabled(m_Client->IsRunning() && !m_LoginStarting);
   m_Login->setText(m_LoginId.isEmpty() ? tr("Log in") : tr("Cancel login"));
@@ -1448,6 +1826,11 @@ void AgentChatPanel::UpdateControls()
 
 void AgentChatPanel::ScheduleRender()
 {
+  if(m_HistoryDirty && !m_HistoryReadOnly && !m_HistoryRecord.metadata.id.isEmpty())
+  {
+    if(!m_HistoryTimer->isActive())
+      m_HistoryTimer->start();
+  }
   if(!m_RenderTimer->isActive())
     m_RenderTimer->start();
 }
@@ -1548,11 +1931,14 @@ void AgentChatPanel::RunAutotest(const QJsonObject &config)
 {
   m_Autotest = Autotest();
   m_Autotest.active = true;
+  m_Autotest.loadHistoryId = config[lit("loadHistoryId")].toString();
+  m_Autotest.newChatBeforeQuestion = config[lit("newChatBeforeQuestion")].toArray();
   m_Autotest.settings = config[lit("settings")].toObject();
   m_Autotest.autoLogin = config[lit("autoLogin")].toBool(false);
   m_Autotest.cancelLoginAfterMs = config[lit("cancelLoginAfterMs")].toInt(0);
   m_Autotest.screenshot = config[lit("screenshot")].toString();
   m_Autotest.settingsScreenshot = config[lit("settingsScreenshot")].toString();
+  m_Autotest.historyScreenshot = config[lit("historyScreenshot")].toString();
   for(const QJsonValue &question : config[lit("questions")].toArray())
     m_Autotest.questions << question.toString();
   m_Autotest.asks = config[lit("asks")].toArray();
@@ -1578,7 +1964,7 @@ void AgentChatPanel::AutotestNext()
   if(!m_Autotest.active || m_QuestionActive)
     return;
 
-  if(m_LoginStarting || !m_LoginId.isEmpty() || m_State == SessionState::Starting)
+  if(m_LoginStarting || !m_LoginId.isEmpty() || m_State == SessionState::Starting || m_IdentityPending)
     return;
   if(m_Autotest.autoLogin && !m_Autotest.loginAttempted && m_State == SessionState::NotLoggedIn)
   {
@@ -1599,6 +1985,13 @@ void AgentChatPanel::AutotestNext()
     m_Autotest.questions.clear();
   }
 
+  if(m_Ctx.IsCaptureLoaded() && m_LoadedIdentity[lit("kind")].toString() == lit("none"))
+  {
+    // CaptureContext publishes its loaded flag before delivering OnCaptureLoaded to viewers.
+    QTimer::singleShot(250, this, &AgentChatPanel::AutotestNext);
+    return;
+  }
+
   if(!m_Autotest.prepared)
   {
     m_Autotest.prepared = true;
@@ -1607,9 +2000,49 @@ void AgentChatPanel::AutotestNext()
     m_Autotest.eventBefore = m_Ctx.IsCaptureLoaded() ? qint64(m_Ctx.CurEvent()) : -1;
   }
 
+  if(!m_Autotest.historyPrepared)
+  {
+    m_Autotest.historyPrepared = true;
+    QString id = m_Autotest.loadHistoryId;
+    if(id == lit("latest"))
+    {
+      QString warning;
+      const QList<AgentHistoryEntry> entries = m_History->List(warning);
+      id = entries.isEmpty() ? QString() : entries.first().id;
+      if(id.isEmpty())
+      {
+        MakeHistoryReadOnly(warning.isEmpty() ? lit("No saved conversation was found.") : warning);
+        m_Conversation.AddNotice(lit("error"), m_HistoryError);
+      }
+    }
+    if(!id.isEmpty() && !LoadHistory(id))
+      MakeHistoryReadOnly(m_HistoryError);
+    if(m_IdentityPending)
+      return;
+  }
+
+  if(m_Autotest.newChatBeforeQuestion.contains(m_Autotest.index) &&
+     m_Autotest.newChatApplied != m_Autotest.index)
+  {
+    m_Autotest.newChatApplied = m_Autotest.index;
+    NewChat();
+  }
+
   if(m_Autotest.index >= m_Autotest.questions.size())
   {
     AutotestClickLinks();
+    return;
+  }
+
+  if(m_HistoryReadOnly || !CaptureFileUnchanged())
+  {
+    if(!m_HistoryReadOnly)
+      MakeHistoryReadOnly(lit("The capture file changed on disk."));
+    QJsonObject result;
+    result[lit("index")] = m_Autotest.index++;
+    result[lit("status")] = lit("blocked");
+    m_Autotest.results << result;
+    QTimer::singleShot(0, this, &AgentChatPanel::AutotestNext);
     return;
   }
 
@@ -1789,12 +2222,28 @@ void AgentChatPanel::AutotestClickLinks()
     });
     EditSettings();
   }
+  if(!m_Autotest.historyScreenshot.isEmpty())
+  {
+    QTimer::singleShot(100, this, [this]() {
+      QDialog *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+      if(!dialog || dialog->objectName() != lit("agentHistory"))
+        return;
+      QTreeWidget *list = dialog->findChild<QTreeWidget *>(lit("agentHistoryList"));
+      if(list)
+        m_Autotest.historyDialog[lit("count")] = list->topLevelItemCount();
+      QDir().mkpath(QFileInfo(m_Autotest.historyScreenshot).absolutePath());
+      m_Autotest.historyDialog[lit("screenshotSaved")] = dialog->grab().save(m_Autotest.historyScreenshot);
+      dialog->reject();
+    });
+    ShowHistory();
+  }
   WriteTranscript();
   m_Autotest.active = false;
 }
 
 void AgentChatPanel::WriteTranscript()
 {
+  SaveHistory();
   QJsonObject transcript = m_Conversation.ToJson();
 
   QJsonObject session;
@@ -1811,6 +2260,26 @@ void AgentChatPanel::WriteTranscript()
   session[lit("captureSessionId")] = m_CaptureSessionId;
   session[lit("captureTools")] = m_Launch.captureTools;
   session[lit("referenceToken")] = m_ReferenceToken;
+  session[lit("historyId")] = m_HistoryRecord.metadata.id;
+  session[lit("historyReadOnly")] = m_HistoryReadOnly;
+  session[lit("historyLoaded")] = m_HistoryLoaded;
+  session[lit("historyError")] = m_HistoryError;
+  session[lit("historySaveError")] = m_LastSaveError;
+  session[lit("sendEnabled")] = m_Send->isEnabled();
+  QJsonArray historyEntries;
+  QString historyWarning;
+  for(const AgentHistoryEntry &entry : m_History->List(historyWarning))
+  {
+    QJsonObject item;
+    item[lit("id")] = entry.id;
+    item[lit("threadId")] = entry.threadId;
+    item[lit("title")] = entry.title;
+    item[lit("mode")] = entry.mode;
+    item[lit("captureIdentity")] = entry.captureIdentity;
+    historyEntries << item;
+  }
+  session[lit("historyEntries")] = historyEntries;
+  session[lit("historyWarning")] = historyWarning;
   session[lit("accountType")] = m_AccountType;
   session[lit("loginStatus")] = m_LoginStatus;
   session[lit("loginVisible")] = !m_Login->isHidden();
@@ -1842,6 +2311,7 @@ void AgentChatPanel::WriteTranscript()
   autotest[lit("expandedTools")] = QJsonArray::fromStringList(m_ExpandedTools.values());
   autotest[lit("renderedHtml")] = m_View->toHtml();
   autotest[lit("settingsDialog")] = m_Autotest.settingsDialog;
+  autotest[lit("historyDialog")] = m_Autotest.historyDialog;
   transcript[lit("autotest")] = autotest;
 
   if(m_Autotest.transcript.isEmpty())

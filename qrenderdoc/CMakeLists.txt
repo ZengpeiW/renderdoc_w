@@ -376,6 +376,13 @@ add_custom_target(swig-bindings ALL DEPENDS ${swig_output})
 if(ENABLE_QRENDERDOC)
 
 set(QRD_DEPENDENCIES RenderDoc.icns)
+# qmake compiles these sources; list the history components here as well so generators which
+# depend on explicit inputs rerun qmake when the local-history implementation changes.
+list(APPEND QRD_DEPENDENCIES
+    ${CMAKE_CURRENT_SOURCE_DIR}/Code/Agent/AgentHistory.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/Code/Agent/AgentHistory.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/Code/Agent/AgentCaptureIdentity.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/Code/Agent/AgentCaptureIdentity.cpp)
 
 if(APPLE AND CMAKE_GENERATOR STREQUAL "Xcode")
     file(GLOB_RECURSE CODE_FILES Code/*.h Code/*.cpp Code/*.mm Code/*.i)

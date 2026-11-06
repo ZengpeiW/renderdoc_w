@@ -172,6 +172,8 @@ SOURCES += Code/qrenderdoc.cpp \
     Code/CaptureContext.cpp \
     Code/Agent/RenderTestAgentIntegration.cpp \
     Code/Agent/AgentConversation.cpp \
+    Code/Agent/AgentCaptureIdentity.cpp \
+    Code/Agent/AgentHistory.cpp \
     Code/Agent/AgentLaunchConfig.cpp \
     Code/Agent/AgentAsk.cpp \
     Code/Agent/AgentMarkdown.cpp \
@@ -271,6 +273,8 @@ SOURCES += Code/qrenderdoc.cpp \
 HEADERS += Code/CaptureContext.h \
     Code/Agent/RenderTestAgentIntegration.h \
     Code/Agent/AgentConversation.h \
+    Code/Agent/AgentCaptureIdentity.h \
+    Code/Agent/AgentHistory.h \
     Code/Agent/AgentLaunchConfig.h \
     Code/Agent/AgentAsk.h \
     Code/Agent/AgentMarkdown.h \

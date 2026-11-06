@@ -2,7 +2,7 @@
 
 RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打开的 capture。设计见 [docs/MVP_DESIGN.md](docs/MVP_DESIGN.md)。
 
-当前进度：**M4 和 M5a–M5c 已实现，M5 边界修复已接入**。M5c 的登录状态流通过 fake app-server 验证，真实浏览器授权仍需人工验收；M5d（历史恢复）尚未实现。详见 [M5 设计](docs/M5_DESIGN.md)。
+当前进度：**M4 和 M5a–M5d 已实现**，支持本地历史保存与跨进程恢复。登录状态流通过 fake app-server 验证，真实浏览器授权仍需人工验收。详见 [M5 设计](docs/M5_DESIGN.md)。
 
 - M0：MCP Server、文件 mailbox IPC、fake Bridge 和协议测试。
 - M1：qrendertest 启动时从 `integrations/rendertest_agent/python` 固定加载 Bridge，写实例清单和心跳，跟踪 capture 加载、关闭和选中事件，支持 `ping` / `get_status` / `get_context`。
@@ -57,6 +57,8 @@ agent/
   devtools/chat_panel_e2e.py        # AI 面板验收：fake 场景 A1–A6，或 --real 接真实 codex
   devtools/appserver_schema_check.py # 校验本机 Codex 协议和 feature 开关，不调用模型
   devtools/appserver_skills_check.py # 真实 app-server 验证部署后的 Skill 加载，不调用模型
+  devtools/appserver_history_check.py # 真实 app-server + localhost fixture 验证历史恢复
+  tests/native/                     # Qt 原生历史存储、状态恢复和 capture 身份测试
   tests/                            # 协议、实例选择、工具契约和 stdio 冒烟测试
   docs/MVP_DESIGN.md
 ```
@@ -132,16 +134,18 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "E:\Captures\some.rdc"
 ```
 
-## qrendertest 内的 AI 面板（M5a–M5c）
+## qrendertest 内的 AI 面板（M5a–M5d）
 
 菜单 `Window → AI Assistant` 打开可停靠面板。第一次发送消息时，面板启动 `codex app-server`，并把 rendertest MCP 绑定到本窗口的 Bridge 实例；不需要改 `~/.codex/config.toml`。
 
 - 前提：已经安装 Codex CLI（`npm install -g @openai/codex`）；`agent/mcp_server/.venv` 已创建。可沿用已有 Codex 登录，或在未登录提示出现后点面板的 `Log in`，在浏览器完成登录后重新发送问题；等待时可点 `Cancel login`。
 - 设置：点 `Settings` 配置原生 codex 可执行文件、MCP Python、模型、推理强度和隔离开关；设置保存到 RenderTest 配置文件，下一条问题重新建立会话。留空沿用自动查找或 Codex 配置。模型列表由 app-server 分页获取；自定义 provider 可以手填模型与推理强度。
 - 只读：thread 使用 `read-only` 沙箱和 `never` 审批，所有审批请求都会被拒绝；shell 和 web search 始终关闭，其它 MCP server 默认隔离。隔离检查失败会阻止对话。
-- 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息会新建 thread。“New Chat”清空对话。
+- 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息重新连接并恢复 thread。“New Chat”保存当前对话后清空面板，下一问创建独立 thread。
+- 历史：点 `History` 搜索并打开已保存对话；消息在本地显示，发送新问题时才启动 Codex 并恢复上下文。历史位于 `<agent root>/conversations/<UUID>.json`，流式更新每 2 秒保存，回合结束和关闭时立即保存；使用原子写入和会话锁。另一窗口正在使用的记录可只读查看。
+- 续聊要求：本地已保存的 capture 必须匹配规范路径、大小、修改时间和完整 SHA-256；校验在后台完成。不同、远程、临时或缺失的 capture 只能查看历史；纯聊天仅在没有 capture 时恢复。旧消息的 EID/资源跳转链接保持失效，新回复可正常跳转。Codex rollout 不存在或恢复校验失败时保留只读历史，可以 `New Chat` 重新开始。M5a–M5c 的旧 ephemeral thread 不会自动迁移。
 - 每条消息前会附上 `<rendertest_context>`（实例 id、capture、当前 EID），这是发送时的快照。
-- MCP 固定绑定发送时的实例和 capture session，包括 `get_context` / `get_status` 都不能重新绑定。capture 加载/关闭会停止旧会话；下次发送建立新 thread，旧消息仍保留但旧链接失效。没有可验证的 capture 或 bridge 时禁用 rendertest MCP，允许纯聊天，不会自动连接其它窗口。
+- MCP 固定绑定发送时的实例和 capture session，包括 `get_context` / `get_status` 都不能重新绑定。capture 加载/关闭会停止旧会话并将它保存为只读历史；新建对话或从 `History` 打开匹配记录后继续。恢复时重新设置当前实例/session 并检查隔离。没有可验证的 capture 或 bridge 时禁用 rendertest MCP，允许纯聊天，不会自动连接其它窗口。
 - 上下文 chip：输入框上方显示本条消息会带上的上下文。“Current EID”默认附带，点 × 去掉，点 “+ Current EID” 加回；其它 chip 发送后清空，并显示在用户气泡下方。每个 chip 以 `selection: {json}` 写进 `<rendertest_context>`，字段名和 MCP 工具参数一致（`event_id`、`resource_id`、`x`/`y`（左上原点）、`mip`、`slice`、`sample`、`vertex`、`instance`、`view`）。
 - “问 AI”入口（只添加 chip 并预填可编辑的问题，不自动发送）：
   - Event Browser 右键 → `Ask AI about this event`
@@ -170,11 +174,18 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py
 # 本机 Codex 协议与部署检查，不调用模型或登录流程
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_schema_check.py
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_skills_check.py
+# 真实 Codex + 仅 localhost 的 Responses fixture：验证跨进程恢复包含上一问答
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_history_check.py
+# M5d fake 回归；真实 capture + fake server，不调用模型
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --scenario M5d
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --history-capture --capture "E:\Captures\some.rdc"
 # 真实 codex：选中 EID 后提问、第二问中途 Stop、退出后检查进程树（会把 capture 数据发给模型）
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --real --capture "E:\Captures\some.rdc" --event 1513
 # 真实 codex：通过 Texture Viewer 的 Ask AI 像素入口问 Q2 (256,256) / Q3 (1,1)，再点击回答里的第一个 EID 链接
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --real --ask-pixel --capture "E:\Captures\some.rdc" --event 1513
 ```
+
+Qt 原生测试在 `agent/tests/native/`：分别用 Qt 5.9+ 的 `qmake` 构建 `agent_history_test.pro` 和 `agent_conversation_identity_test.pro`，运行生成的可执行文件。覆盖原子保存、锁竞争/崩溃恢复、坏文件/大小限制、完整摘要、短路径以及消息恢复。建议在独立构建目录中运行。
 
 ## 用 fake Bridge 手动试用
 

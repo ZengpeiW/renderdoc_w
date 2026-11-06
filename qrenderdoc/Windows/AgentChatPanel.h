@@ -5,9 +5,12 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QStringList>
+#include <atomic>
+#include <memory>
 #include "Code/Agent/AgentAsk.h"
 #include "Code/Agent/AgentConversation.h"
 #include "Code/Agent/AgentLaunchConfig.h"
+#include "Code/Agent/AgentHistory.h"
 #include "Code/Interface/QRDInterface.h"
 
 class CaptureContext;
@@ -64,6 +67,15 @@ private:
   void SendText(const QString &text);
   void Stop();
   void NewChat();
+  void ShowHistory();
+  bool LoadHistory(const QString &id);
+  void EnableHistoryContinuation(const QJsonObject &identity);
+  void MakeHistoryReadOnly(const QString &reason);
+  void EnsureHistory(const QString &title);
+  void SaveHistory();
+  void RefreshCaptureIdentity(bool loaded);
+  void VerifyHistoryIdentity();
+  bool CaptureFileUnchanged() const;
   void EditSettings();
   void Login();
   void CancelLogin();
@@ -115,6 +127,19 @@ private:
   CodexAppServerClient *m_Client = NULL;
   AgentConversation m_Conversation;
   AgentLaunchConfig m_Launch;
+  AgentHistory *m_History = NULL;
+  AgentHistoryRecord m_HistoryRecord;
+  bool m_HistoryReadOnly = false;
+  bool m_HistoryLoaded = false;
+  bool m_HistoryDirty = false;
+  bool m_ResumeValidationPending = false;
+  QString m_HistoryError;
+  QString m_LastSaveError;
+  QJsonObject m_LoadedIdentity;
+  bool m_IdentityPending = false;
+  bool m_VerifyHistoryAfterIdentity = false;
+  int m_IdentityGeneration = 0;
+  std::shared_ptr<std::atomic<bool>> m_IdentityCancel;
 
   SessionState m_State = SessionState::Idle;
   QString m_StateMessage;
@@ -152,6 +177,8 @@ private:
 
   QLabel *m_Status = NULL;
   QPushButton *m_NewChat = NULL;
+  QPushButton *m_HistoryButton = NULL;
+  QLabel *m_HistoryNotice = NULL;
   QPushButton *m_Settings = NULL;
   QPushButton *m_Login = NULL;
   QTextBrowser *m_View = NULL;
@@ -162,10 +189,15 @@ private:
   QPushButton *m_StopButton = NULL;
   QTimer *m_RenderTimer = NULL;
   QTimer *m_StopTimer = NULL;
+  QTimer *m_HistoryTimer = NULL;
 
   struct Autotest
   {
     bool active = false;
+    QString loadHistoryId;
+    bool historyPrepared = false;
+    QJsonArray newChatBeforeQuestion;
+    int newChatApplied = -1;
     QStringList questions;
     QJsonArray asks;
     QJsonArray clickLinks;
@@ -186,6 +218,8 @@ private:
     QJsonObject settings;
     QString screenshot;
     QString settingsScreenshot;
+    QString historyScreenshot;
+    QJsonObject historyDialog;
     QJsonObject settingsDialog;
     bool waitForCapture = false;
     int captureTimeoutMs = 180000;

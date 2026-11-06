@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 import threading
@@ -37,7 +38,8 @@ SCENARIOS = ("stream", "tool", "approvals", "interrupt", "hang", "crash-once", "
              "status-page-foreign", "status-pages", "status-loop", "turn-timeout-once",
              "late-items", "late-before-start", "late-response", "command-status", "explicit-links",
              "login-success", "login-failure", "login-cancel", "model-pages", "model-error",
-             "login-not-found", "auth-recovered", "account-updated", "tool-artifacts", "tool-artifacts-rejected")
+             "login-not-found", "auth-recovered", "account-updated", "tool-artifacts", "tool-artifacts-rejected",
+             "persistent", "resume-failure", "resume-config-error", "resume-foreign", "resume-unsafe", "resume-replay")
 ANSWER = "Hello from the **fake** app-server.\n\n- EID 1513 draws the scene\n- uses `ResourceId::116618`"
 SERVER_REQUESTS = (
     "item/commandExecution/requestApproval",
@@ -61,6 +63,8 @@ class FakeAppServer:
         self.server_replies: dict[int, threading.Event] = {}
         self.next_server_id = 1000
         self.thread_id = ""
+        self.threads: dict[str, dict[str, Any]] = {}
+        self.was_resumed = False
         self.initialized = False
         self.account_reads = 0
         self.capture_tools_enabled = False
@@ -90,6 +94,17 @@ class FakeAppServer:
             sys.stdout.flush()
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
+        thread = self.threads.get(params.get("threadId", ""))
+        turn_id = params.get("turnId") or params.get("turn", {}).get("id")
+        if thread and turn_id:
+            turn = next((entry for entry in thread["turns"] if entry["id"] == turn_id), None)
+            if turn and method == "item/completed":
+                item = params["item"]
+                turn["items"] = [entry for entry in turn["items"] if entry.get("id") != item.get("id")]
+                turn["items"].append(item)
+            if turn and method == "turn/completed":
+                turn.update(params["turn"])
+                self.persist_thread(thread)
         self.send({"method": method, "params": params})
 
     def respond(self, request_id: Any, result: dict[str, Any]) -> None:
@@ -97,6 +112,27 @@ class FakeAppServer:
 
     def crash_marker(self) -> Path | None:
         return self.state_dir / "crashed-once" if self.state_dir else None
+
+    def thread_path(self, thread_id: str) -> Path | None:
+        if not self.state_dir or not re.fullmatch(r"thr_[0-9]+_[0-9]+", thread_id):
+            return None
+        return self.state_dir / "fake-threads" / f"{thread_id}.json"
+
+    def persist_thread(self, thread: dict[str, Any]) -> None:
+        path = self.thread_path(thread["id"])
+        if not path or thread["ephemeral"] or not thread["turns"]:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(thread), encoding="utf-8")
+        temporary.replace(path)
+
+    def thread_result(self, thread: dict[str, Any], exclude_turns: bool = False) -> dict[str, Any]:
+        public = dict(thread)
+        if exclude_turns:
+            public["turns"] = []
+        return {"thread": public, "model": thread["model"],
+                "sandbox": {"type": "readOnly", "networkAccess": False}, "approvalPolicy": "never"}
 
     def handle(self, message: dict[str, Any]) -> None:
         self.log({"event": "recv", "message": message})
@@ -173,7 +209,7 @@ class FakeAppServer:
         elif method == "skills/extraRoots/set":
             self.respond(request_id, {})
         elif method == "config/read":
-            if self.scenario == "config-error":
+            if self.scenario in ("config-error", "resume-config-error"):
                 self.send({"id": request_id, "error": {"code": -32000, "message": "config unavailable"}})
                 return
             if self.scenario == "config-malformed":
@@ -185,9 +221,29 @@ class FakeAppServer:
             self.capture_tools_enabled = params.get("config", {}).get("mcp_servers.rendertest.enabled", True)
             self.thread_counter += 1
             self.thread_id = f"thr_{self.prefix}_{self.thread_counter}"
-            self.respond(request_id, {"thread": {"id": self.thread_id}, "model": params.get("model") or "fake-model",
-                                      "sandbox": {"type": "readOnly", "networkAccess": False},
-                                      "approvalPolicy": "never"})
+            thread = {"id": self.thread_id, "model": params.get("model") or "fake-model",
+                      "ephemeral": params.get("ephemeral", False), "turns": [],
+                      "modelProvider": "fake-provider", "historyMode": params.get("historyMode", "paginated")}
+            self.threads[self.thread_id] = thread
+            self.respond(request_id, self.thread_result(thread))
+        elif method == "thread/resume":
+            thread_id = params.get("threadId", "")
+            path = self.thread_path(thread_id)
+            if self.scenario == "resume-failure" or not path or not path.is_file():
+                self.send({"id": request_id, "error": {"code": -32600, "message": "fake: saved thread unavailable"}})
+                return
+            thread = json.loads(path.read_text(encoding="utf-8"))
+            if params.get("model"):
+                thread["model"] = params["model"]
+            self.thread_id = thread_id
+            self.threads[thread_id] = thread
+            self.was_resumed = True
+            self.capture_tools_enabled = params.get("config", {}).get("mcp_servers.rendertest.enabled", True)
+            response = self.thread_result(thread, params.get("excludeTurns", False) and self.scenario != "resume-replay")
+            if self.scenario == "resume-unsafe":
+                response["sandbox"] = {"type": "workspaceWrite", "networkAccess": False}
+            self.respond(request_id, response)
+            self.notify("thread/started", {"thread": response["thread"]})
         elif method == "mcpServerStatus/list":
             if self.scenario == "status-error":
                 self.send({"id": request_id, "error": {"code": -32000, "message": "status unavailable"}})
@@ -197,7 +253,7 @@ class FakeAppServer:
                        "tools": {f"tool{i}": {} for i in range(22)} if self.capture_tools_enabled else {},
                        "toolsError": None}
             other = {"name": "blender", "runtimeStatus": "disabled", "tools": {}, "toolsError": None}
-            if self.scenario in ("status-foreign", "status-page-foreign"):
+            if self.scenario in ("status-foreign", "status-page-foreign") or (self.was_resumed and self.scenario == "resume-foreign"):
                 other["runtimeStatus"] = "connected"
             if self.scenario in ("status-page-foreign", "status-pages", "status-loop"):
                 page = [other] if params.get("cursor") else [primary]
@@ -208,6 +264,12 @@ class FakeAppServer:
         elif method == "turn/start":
             self.turn_counter += 1
             turn_id = f"turn_{self.prefix}_{self.turn_counter}"
+            thread = self.threads.get(params.get("threadId", ""))
+            if thread is not None:
+                thread["turns"].append({"id": turn_id, "status": "inProgress", "items": [
+                    {"type": "userMessage", "id": f"{turn_id}_user", "content": params.get("input", [])}],
+                    "error": None, "itemsView": "full"})
+                self.persist_thread(thread)
             self.interrupted.clear()
             marker = self.state_dir / "timed-out-once" if self.state_dir else None
             if self.scenario == "turn-timeout-once" and marker and not marker.exists():

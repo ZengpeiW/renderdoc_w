@@ -51,7 +51,8 @@ qrendertest.exe
   - 连接状态：未启动 / 启动中 / 就绪 / 未登录 / 错误。
   - rendertest MCP 状态取自 `mcpServerStatus/list`：已连接时显示工具数，连接失败时显示 `toolsError`。
 - **发送**：Enter 发送，Shift+Enter 换行。回合进行中，“发送”按钮变为禁用，“停止”按钮可用。M5 不做 steer。
-- **新对话**：丢弃当前 thread，下一次发送时新建。
+- **新对话**：保存当前对话并释放它的锁，清空面板，下一次发送时新建 thread。保存失败时保留当前对话。
+- **历史**：打开可搜索的本地历史列表；选中后立即显示已有消息，发送新问题时再恢复 Codex thread。
 - **⚙**：打开轻量设置对话框，包含 codex 路径、MCP Python 路径、模型、推理强度，以及“隔离其它 MCP server”开关。
 
 ### 2.2 消息渲染
@@ -101,9 +102,19 @@ Qt 5.9.4 没有 `QTextDocument::setMarkdown`（5.14 才加），所以要自带�
 ### 2.5 Capture 生命周期
 
 - 未打开 capture、bridge 不可用或无法核验当前 capture 时可以纯聊天，rendertest MCP 必须禁用，不得回退到其它窗口。面板顶部显示提示。
-- capture 关闭或加载时立即使旧回合、待发送内容和异步回调失效，结束旧 app-server 进程树，丢弃旧 thread；旧消息保留为历史，旧引用不可点击跳转。下一次发送建立新会话。
+- capture 关闭或加载时立即使旧回合、待发送内容和异步回调失效，结束旧 app-server 进程树；保存旧对话并转为只读，旧引用不可点击跳转。用户可以新建对话，或在匹配的 capture 中从历史重新打开它。
 - 发送前读取 manifest，核验本进程实例、存活状态、capture 路径和 session；启动回合前再次核验。固定 session 必须传入 MCP 的强制绑定配置，不能只写进提示词。
-- 关闭 qrendertest 时先 interrupt 当前回合，再结束 app-server 进程树。
+- 关闭 qrendertest 时将当前回合标为中断并保存，再结束 app-server 进程树。
+
+### 2.6 本地历史与恢复（M5d）
+
+- **本地存储**：`<agent root>/conversations/<UUID>.json`，包含版本、标题、时间、模型、Codex thread id、capture 身份及渲染快照。文件目录形成索引；历史列表按更新时间排序，可搜索标题、capture 和模型。`QSaveFile` 原子提交，每条记录持有独立 `QLockFile`，多个窗口不互相覆盖；锁被占用时仍可查看快照。
+- **保存时机**：首问、thread 建立、回合结束、停止、capture 变化和窗口关闭时保存；流式更新每 2 秒保存一次。失败显示原因，不用不完整文件覆盖上一份快照；保存失败时新建/切换对话不会清掉尚未保存的内容。仅读取历史不改写文件。
+- **恢复权限**：纯聊天记录仅在没有 capture 时续聊。已保存的本地 capture 使用规范路径、文件大小、修改时间及完整 SHA-256；打开 capture 后后台计算身份，历史恢复前再次完整校验，避免阻塞 GUI。读取中变化、远程/临时/缺失文件、身份不同或其它窗口占用，均只读查看。修改路径或文件（包括保存修改后的 RDC）后，需要新建对话。文件身份不能替代 replay 的共享文件句柄：外部程序若在 replay 打开后替换 RDC，应重新打开 capture。
+- **恢复消息**：本地快照还原用户消息、上下文 chip、回答、思考摘要、工具卡、artifact 元数据和 token 数。崩溃留下的运行态转为 interrupted；所有历史引用 token 清空，仅新回复的引用可操作当前 capture。artifact 仍需原路径、大小和摘要校验。
+- **恢复 thread**：新建使用 `ephemeral:false`；续聊使用 `thread/resume`，显式重传当前 cwd、实例说明、模型覆盖、read-only、never 和 MCP 隔离配置。恢复响应必须保持同一 thread id，随后重新检查 sandbox 和所有 MCP 状态页，才允许 `turn/start`。MCP 子进程绑定新窗口的实例和当前 capture session，不能沿用历史环境。
+- **失败行为**：恢复期间的新追问先留在内存，校验完成后才保存。thread 不存在、配置读取失败或隔离检查失败时结束进程，历史保留只读，不静默切换到新 thread。Codex 的 `CODEX_HOME`/rollout 被删除时，仍可查看本地内容；继续需新建对话。尚未进行真实回合的 thread 可能没有 rollout，`ephemeral:false` 本身不保证空 thread 能恢复。
+- **边界**：单个历史文件最多 8 MiB、10000 个 item、2000 个 turn；保存前使用同一快照读取器验证可恢复性。列表最多读取 512 条或 64 MiB，损坏/超大文件跳过并提示。M5a–M5c 的 ephemeral thread 不会自动迁移为可恢复历史。
 
 ## 3. 协议接法
 
@@ -135,7 +146,7 @@ codex app-server generate-ts --out <dir>
 
 新增 `agent/devtools/appserver_schema_check.py`。它重新生成 TS 绑定，检查第 3.3–3.6 节用到的 method 和字段是否都还在，用于 codex 升级后的回归检查。
 
-M5c 的可复现检查已入库：schema 脚本在 Codex 0.162.1 上验证 31 个方法、123 个字段、11 个 feature 开关；`appserver_skills_check.py` 使用空的临时 CODEX_HOME，验证部署目录、仓库外空目录，以及不使用 extraRoots 的 cwd 回退三种情况。它们不调用模型，也不启动登录。浏览器登录完成流程仍需人工验收，自动化只验证 fake app-server 的成功、失败、取消和状态恢复。
+可复现检查已入库：schema 脚本在 Codex 0.162.1 上验证 32 个方法、138 个字段、11 个 feature 开关；`appserver_skills_check.py` 使用空的临时 CODEX_HOME，验证部署目录、仓库外空目录，以及不使用 extraRoots 的 cwd 回退三种情况。`appserver_history_check.py` 使用真实 Codex 与 localhost Responses SSE fixture，验证完成回合落盘、跨进程恢复及后续请求包含前一问答，不调用真实模型或账号 API。浏览器登录完成流程仍需人工验收，自动化只验证 fake app-server 的成功、失败、取消和状态恢复。
 
 ### 3.2 进程启动
 
@@ -215,7 +226,7 @@ codex.exe app-server
      "cwd":"<exe>/integrations/rendertest_agent",
      "sandbox":"read-only",
      "approvalPolicy":"never",
-     "ephemeral":true,
+     "ephemeral":false,
      "serviceName":"qrendertest",
      "model":"<可选>",
      "developerInstructions":"<见下>",
@@ -237,7 +248,7 @@ codex.exe app-server
   - 用户消息里的 `<rendertest_context>` 是发送时的快照，调用工具时要显式传 `event_id`。ResourceId 传十进制字符串，不带 `ResourceId::` 前缀。
   - 像素查询传入 `type_cast`，分析的是显示处理前的资源值。
   - 文本 artifact 使用只读 `read_artifact` 分页或字面搜索读取，无需 shell。
-- **一个对话对应一个 thread**。M5a–M5c 使用 `ephemeral:true`。M5d 改为非 ephemeral，再接 `thread/resume`。
+- **一个对话对应一个 thread**。M5d 使用 `ephemeral:false`；`thread/resume` 携带保存的 `threadId` 和 `excludeTurns:true`，显示内容来自本地快照，不重复追加服务端历史。0.162.1 没有 `persistExtendedHistory` 参数。停止时若进程被强制结束，下一问仍尝试恢复同一 thread。
 - **仍保留的内置工具**：实测隔离后仍有 `apply_patch`、`view_image`、`request_user_input`、`tool_search`，以及 MCP resource 读取。
   - `apply_patch` 受 read-only 沙箱和 `never` 审批策略限制，不能写盘。已实测：返回 `patch rejected: writing is blocked by read-only sandbox`，没有发出审批 server request，文件未生成。
   - `request_user_input` 走 server request，按第 3.6 节回复错误。
@@ -274,7 +285,7 @@ codex.exe app-server
 
 - **停止**：发送 `turn/interrupt {"threadId","turnId"}`，等待 `turn/completed(status=interrupted)`。实测 0.1 秒内到达。
   - 2 秒内没有等到，就结束整个进程树，把当前回合标为“已中断”。
-  - 下一次发送时懒重启，新建 thread，并提示上下文已丢失。
+  - 下一次发送时懒重启，重新校验后恢复保存的 thread；恢复失败则只读保留历史。
   - 正在执行的 MCP 工具可能已经在 bridge 里排队；bridge 照常执行完，结果丢弃。
 - **Server request**：必须回复，否则回合会卡住。
 
@@ -309,12 +320,16 @@ codex.exe app-server
 | `qrenderdoc/Code/Agent/AgentMarkdown.{h,cpp}` | 最小 Markdown 转 HTML，加 EID/ResourceId 链接化 | 350 |
 | `qrenderdoc/Code/Agent/AgentSettingsDialog.{h,cpp}` | 保存路径、模型、推理强度与隔离设置；动态模型目录 | 230 |
 | `qrenderdoc/Code/Agent/AgentToolView.{h,cpp}` | 工具卡展开、artifact 校验、缩略图与缓存 | 450 |
+| `qrenderdoc/Code/Agent/AgentHistory.{h,cpp}` | 原子历史存储、会话锁和历史列表 | 480 |
+| `qrenderdoc/Code/Agent/AgentCaptureIdentity.{h,cpp}` | 本地 capture 完整摘要与恢复身份校验 | 230 |
 | `qrenderdoc/Code/Agent/AgentAsk.{h,cpp}` | 各 viewer 调用的 `RequestAgentAsk(ICaptureContext&, AgentAskRequest)` | 80 |
 | `qrenderdoc/Windows/AgentChatPanel.{h,cpp,ui}` | 停靠面板：状态行、对话视图、上下文 chip、输入框、设置对话框，并实现 `ICaptureViewer` | 1000 |
 | `agent/devtools/fake_app_server.py` | 按脚本回放 JSON-RPC 的 fake app-server，并记录收到的消息 | 300 |
 | `agent/devtools/chat_panel_e2e.py` | 启动 qrendertest、注入 fake 或真实 codex，并检查日志和 transcript | 300 |
 | `agent/devtools/appserver_schema_check.py` | 协议回归检查 | 80 |
 | `agent/devtools/appserver_skills_check.py` | 无模型的真实部署 Skill 加载验证 | 180 |
+| `agent/devtools/appserver_history_check.py` | 真实 app-server + localhost fixture 验证跨进程上下文恢复 | 300 |
+| `agent/tests/native/agent_*_test.{cpp,pro}` | Qt 原生历史存储、状态恢复和文件身份测试 | — |
 
 行数为初始估算；构建与验收以实际文件为准。
 
@@ -355,9 +370,9 @@ codex.exe app-server
 
 每个阶段完成后单独提交，沿用 M0–M4 的节奏。
 
-当前 M5a–M5c 已实现，M5d 尚未开始。M5c 已覆盖 fake 登录、模型目录和工具卡回归、真实 app-server 的部署 Skill 加载；真实浏览器授权尚待人工验收，不把 fake 成功等同于实际登录成功。
+当前 M5a–M5d 已实现。M5c 已覆盖 fake 登录、模型目录和工具卡回归、真实 app-server 的部署 Skill 加载；真实浏览器授权尚待人工验收，不把 fake 成功等同于实际登录成功。
 
-2026-11-06 验证：MSBuild Release x64 成功；39 个 fake 界面场景通过；Python 测试 141 通过、2 个符号链接测试跳过；协议检查和 3 种部署 Skill 加载检查通过。已检查设置框与展开工具卡截图。CMake/qmake 同步清单，未在本次实际构建。
+2026-11-06 验证：MSBuild Release x64 成功；49 个 fake 界面场景通过；Python 测试 141 通过、2 个符号链接测试跳过；两组 Qt 原生测试通过。真实 nanite RDC + fake app-server 跨进程恢复通过，当前实例/session 已更新；真实 Codex + localhost fixture 验证上一问答进入恢复后的请求。协议检查通过，M5c 的 3 种部署 Skill 加载检查已通过。已检查历史列表与恢复后的面板截图。CMake/qmake 同步清单，未在本次实际构建。
 
 ## 6. 验收方式
 
@@ -377,7 +392,7 @@ codex.exe app-server
 | A2 工具卡 | `mcpToolCall` 从 started 到 completed，transcript 中有工具名、durationMs 和状态 |
 | A3 审批 | fake 发出 commandExecution、fileChange、permissions、elicitation 四种 server request，日志里收到的都是 decline 或空授权；回合不卡住 |
 | A4 停止 | fake 在收到 `turn/interrupt` 后才回复 interrupted，UI 在 2 秒内回到空闲；fake 故意不回复时，进程树在 2 秒内被结束 |
-| A5 崩溃 | fake 在回合中途 exit(1)，UI 显示失败；下一次发送会重启并新建 thread |
+| A5 崩溃 | fake 在回合中途 exit(1)，UI 显示失败；下一次发送重启进程并恢复保存的 thread |
 | A6 未登录和缺失 | fake 返回 `account:null` 时 UI 显示未登录；codex 路径无效时 UI 显示指引，qrendertest 不崩溃 |
 | A7 归约回放 | 把真实 app-server 的 JSONL 录制下来，回放后得到的 transcript 与快照一致 |
 
@@ -386,6 +401,8 @@ codex.exe app-server
 跨层回归：首次工具前和工具中切换 capture、同 RDC 重开、旧链接失效、固定实例不能覆盖、bridge 禁用时不连接其它实例。像素覆盖 UInt/SInt 类型解释和独立缓存/游标、非法平均 sample；artifact 覆盖分页/搜索、越界路径、旧 session、内容被修改和文件预算。
 
 M5c 回归覆盖：登录成功后重新发送、失败可恢复、取消后迟到成功通知不重启会话；未登录再次发送只重读账户、不重复 initialize；模型分页与 `.model`/`.id` 区分、自定义 provider 字符串、目录查询失败不阻止手填；工具卡展开、截断后的 artifact 元数据、合法 PNG 和越界/损坏/缺失图片。
+
+M5d 回归：`chat_panel_e2e.py --scenario M5d` 覆盖新建分开保存、跨进程续聊、恢复去重、无 app-server 查看、损坏记录跳过、capture 不匹配、远端不存在、配置读取失败、其它 MCP 启用和 sandbox 错误。拒绝恢复必须不改写原历史文件。`--history-capture --capture FILE.rdc` 使用真实 capture + fake app-server，验证同文件重开后保持对话/thread、更新实例/session、拒绝旧链接并检查历史列表截图；不发送 capture 给模型。
 
 另外：
 

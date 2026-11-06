@@ -22,7 +22,7 @@ from typing import Iterable
 METHODS = {
     "ClientRequest.ts": (
         "initialize", "account/read", "account/login/start", "account/login/cancel", "model/list",
-        "skills/extraRoots/set", "skills/list", "config/read", "thread/start", "mcpServerStatus/list",
+        "skills/extraRoots/set", "skills/list", "config/read", "thread/start", "thread/resume", "mcpServerStatus/list",
         "turn/start", "turn/interrupt",
     ),
     "ClientNotification.ts": ("initialized",),
@@ -69,7 +69,10 @@ FIELDS = {
     "v2/ThreadStartParams.ts": ("cwd", "sandbox", "approvalPolicy", "ephemeral", "serviceName",
                                 "model", "developerInstructions", "config"),
     "v2/ThreadStartResponse.ts": ("thread", "model", "sandbox", "approvalPolicy"),
-    "v2/Thread.ts": ("id",),
+    "v2/ThreadResumeParams.ts": ("threadId", "cwd", "model", "approvalPolicy", "sandbox", "config",
+                                 "developerInstructions", "excludeTurns"),
+    "v2/ThreadResumeResponse.ts": ("thread", "model", "sandbox", "approvalPolicy"),
+    "v2/Thread.ts": ("id", "ephemeral", "historyMode", "turns"),
     "v2/ListMcpServerStatusParams.ts": ("threadId", "detail", "limit", "cursor"),
     "v2/ListMcpServerStatusResponse.ts": ("data", "nextCursor"),
     "v2/McpServerStatus.ts": ("name", "runtimeStatus", "tools", "toolsError"),
