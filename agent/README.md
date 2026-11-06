@@ -2,7 +2,7 @@
 
 RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打开的 capture。设计见 [docs/MVP_DESIGN.md](docs/MVP_DESIGN.md)。
 
-当前进度：**M4 和 M5a/M5b 已完成，M5 边界修复已接入**。M5c/M5d（完整设置、登录、历史恢复）仍按 [M5 设计](docs/M5_DESIGN.md) 后续实现。
+当前进度：**M4 和 M5a–M5c 已实现，M5 边界修复已接入**。M5c 的登录状态流通过 fake app-server 验证，真实浏览器授权仍需人工验收；M5d（历史恢复）尚未实现。详见 [M5 设计](docs/M5_DESIGN.md)。
 
 - M0：MCP Server、文件 mailbox IPC、fake Bridge 和协议测试。
 - M1：qrendertest 启动时从 `integrations/rendertest_agent/python` 固定加载 Bridge，写实例清单和心跳，跟踪 capture 加载、关闭和选中事件，支持 `ping` / `get_status` / `get_context`。
@@ -55,6 +55,8 @@ agent/
   devtools/ui_lifecycle_script.py   # live_lifecycle.py 使用的 --ui-script
   devtools/fake_app_server.py       # 按场景回放的 fake codex app-server，测试 AI 面板
   devtools/chat_panel_e2e.py        # AI 面板验收：fake 场景 A1–A6，或 --real 接真实 codex
+  devtools/appserver_schema_check.py # 校验本机 Codex 协议和 feature 开关，不调用模型
+  devtools/appserver_skills_check.py # 真实 app-server 验证部署后的 Skill 加载，不调用模型
   tests/                            # 协议、实例选择、工具契约和 stdio 冒烟测试
   docs/MVP_DESIGN.md
 ```
@@ -130,11 +132,12 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "E:\Captures\some.rdc"
 ```
 
-## qrendertest 内的 AI 面板（M5a/M5b）
+## qrendertest 内的 AI 面板（M5a–M5c）
 
 菜单 `Window → AI Assistant` 打开可停靠面板。第一次发送消息时，面板启动 `codex app-server`，并把 rendertest MCP 绑定到本窗口的 Bridge 实例；不需要改 `~/.codex/config.toml`。
 
-- 前提：已经安装 Codex CLI（`npm install -g @openai/codex`），并执行过 `codex login`；`agent/mcp_server/.venv` 已创建。
+- 前提：已经安装 Codex CLI（`npm install -g @openai/codex`）；`agent/mcp_server/.venv` 已创建。可沿用已有 Codex 登录，或在未登录提示出现后点面板的 `Log in`，在浏览器完成登录后重新发送问题；等待时可点 `Cancel login`。
+- 设置：点 `Settings` 配置原生 codex 可执行文件、MCP Python、模型、推理强度和隔离开关；设置保存到 RenderTest 配置文件，下一条问题重新建立会话。留空沿用自动查找或 Codex 配置。模型列表由 app-server 分页获取；自定义 provider 可以手填模型与推理强度。
 - 只读：thread 使用 `read-only` 沙箱和 `never` 审批，所有审批请求都会被拒绝；shell 和 web search 始终关闭，其它 MCP server 默认隔离。隔离检查失败会阻止对话。
 - 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息会新建 thread。“New Chat”清空对话。
 - 每条消息前会附上 `<rendertest_context>`（实例 id、capture、当前 EID），这是发送时的快照。
@@ -146,12 +149,15 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
   - Texture Viewer 的 Pixel Context 面板 → `Ask AI`（使用资源值和当前类型解释，坐标换算和 Pixel History 一致；MSAA Average val 模式需先选择具体 sample，显示 Shader/overlay 的值不作为资源值）
   - Mesh Viewer VS In / VS Out 表格右键 → `Ask AI about this Vertex`
 - 回答里的 `EID 1459`、`event 1459`、`ResourceId::116618` 会变成链接：点击 EID 跳到该事件；点击资源时纹理在 Texture Viewer 打开，缓冲在 Buffer Viewer 打开，其它资源在 Resource Inspector 打开。
+- 工具卡默认折叠，点击展开参数、错误和结果；参数最多 8 KiB、结果最多 4 KiB（UTF-8）。完整结果里的 PNG artifact 会独立提取为最多 256×256 缩略图，点击用系统查看器打开。图片必须属于工具响应中的实例/session 目录，并通过文件大小、SHA-256、PNG 格式和路径校验；拒绝越界、符号链接/junction、超过 8 MiB、单边超过 8192 或超过 16 MP 的图片。图片不可用时显示原因。
+- 4 个 Skills 随构建部署到 `integrations/rendertest_agent/skills/`，并在 `.agents/skills/` 保留 cwd 自动发现副本；不依赖从仓库目录启动。
 - 日志：`<agent root>/logs/chat-<instanceId>.log`，包含启动参数和 app-server 的 stderr 尾部。
 
 环境变量：
 
-- `RENDERTEST_AGENT_CODEX_COMMAND`：替换 codex 命令（按空格拆分，支持引号），默认查找 npm 安装的 `codex.exe`，再查 PATH。
-- `RENDERTEST_MCP_PYTHON`：MCP Server 使用的 Python，默认是 exe 上层目录中的 `agent/mcp_server/.venv/Scripts/python.exe`。
+- `RENDERTEST_AGENT_CODEX_COMMAND`：替换 codex 命令（按空格拆分，支持引号），优先于设置；未配置时查找 npm 安装的 `codex.exe`，再查 PATH。
+- `RENDERTEST_MCP_PYTHON`：MCP Server 使用的 Python，优先于设置；未配置时查找 exe 上层目录中的 `agent/mcp_server/.venv/Scripts/python.exe`。
+- `RENDERTEST_AGENT_MODEL` / `RENDERTEST_AGENT_REASONING_EFFORT`：覆盖保存的模型和推理强度，分别传给 `thread/start.model` 和 `turn/start.effort`。
 - `RENDERTEST_AGENT_ISOLATE=0`：不关闭用户其它 Codex feature 和 MCP server；shell 与 web search 仍然禁用。
 - `RENDERTEST_AGENT_FIXED_INSTANCE_ID` / `RENDERTEST_AGENT_CAPTURE_SESSION_ID`：面板为其 MCP 子进程设置的强制绑定，必须成对有效；不同实例参数或 capture session 会被拒绝。外部 CLI 不设置这两个变量时仍可按原规则选择实例。
 - `RENDERTEST_AGENT_CHAT_AUTOTEST`：测试钩子（JSON 或 JSON 文件路径），由 `chat_panel_e2e.py` 使用。
@@ -161,6 +167,9 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 ```powershell
 # fake app-server，不调用模型
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py
+# 本机 Codex 协议与部署检查，不调用模型或登录流程
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_schema_check.py
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_skills_check.py
 # 真实 codex：选中 EID 后提问、第二问中途 Stop、退出后检查进程树（会把 capture 数据发给模型）
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --real --capture "E:\Captures\some.rdc" --event 1513
 # 真实 codex：通过 Texture Viewer 的 Ask AI 像素入口问 Q2 (256,256) / Q3 (1,1)，再点击回答里的第一个 EID 链接

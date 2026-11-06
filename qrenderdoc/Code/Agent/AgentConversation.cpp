@@ -1,13 +1,15 @@
 #include "AgentConversation.h"
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QVariant>
 
 namespace
 {
-const int MaxArgumentsChars = 400;
-const int MaxResultChars = 4096;
+const int MaxArgumentsBytes = 8192;
+const int MaxResultBytes = 4096;
+const int MaxArtifacts = 8;
 
-QString Compact(const QJsonValue &value, int maxChars)
+QString Compact(const QJsonValue &value, int maxBytes)
 {
   QString text;
   if(value.isObject())
@@ -18,9 +20,33 @@ QString Compact(const QJsonValue &value, int maxChars)
     text = value.toString();
   else if(!value.isNull() && !value.isUndefined())
     text = value.toVariant().toString();
-  if(text.size() > maxChars)
-    text = text.left(maxChars) + lit("...");
+  QByteArray utf8 = text.toUtf8();
+  if(utf8.size() > maxBytes)
+  {
+    int end = maxBytes - 3;
+    while(end > 0 && (quint8(utf8[end]) & 0xc0) == 0x80)
+      end--;
+    text = QString::fromUtf8(utf8.constData(), end) + lit("...");
+  }
   return text;
+}
+
+QJsonObject ArtifactEnvelope(const QJsonObject &result)
+{
+  QJsonObject envelope = result[lit("structuredContent")].toObject();
+  if(envelope[lit("schema")].toString() == lit("rendertest-mcp-result/v1"))
+    return envelope;
+  // export_texture returns an MCP content list, so its envelope is a JSON text block.
+  for(const QJsonValue &value : result[lit("content")].toArray())
+  {
+    const QJsonObject content = value.toObject();
+    if(content[lit("type")].toString() != lit("text"))
+      continue;
+    envelope = QJsonDocument::fromJson(content[lit("text")].toString().toUtf8()).object();
+    if(envelope[lit("schema")].toString() == lit("rendertest-mcp-result/v1"))
+      return envelope;
+  }
+  return QJsonObject();
 }
 
 QString JoinStrings(const QJsonArray &array)
@@ -166,17 +192,56 @@ void AgentConversation::UpdateFromItem(AgentItem &item, const QJsonObject &json,
     item.server = json[lit("server")].toString();
     item.tool = json[lit("tool")].toString();
     item.status = json[lit("status")].toString();
-    item.arguments = Compact(json[lit("arguments")], MaxArgumentsChars);
-    if(json[lit("durationMs")].isDouble())
-      item.durationMs = qint64(json[lit("durationMs")].toDouble());
+    item.arguments = Compact(json[lit("arguments")], MaxArgumentsBytes);
+    item.durationMs = json[lit("durationMs")].isDouble()
+                          ? qint64(json[lit("durationMs")].toDouble())
+                          : -1;
     QJsonObject error = json[lit("error")].toObject();
-    item.error = error[lit("message")].toString();
+    item.error = Compact(error[lit("message")], MaxResultBytes);
+    item.result.clear();
+    item.artifacts = QJsonArray();
+    item.artifactInstanceId.clear();
+    item.artifactCaptureSessionId.clear();
+    if(completed)
+      item.progress.clear();
     QJsonObject result = json[lit("result")].toObject();
     if(!result.isEmpty())
     {
       QJsonValue structured = result[lit("structuredContent")];
       item.result =
-          Compact(structured.isObject() ? structured : result[lit("content")], MaxResultChars);
+          Compact(structured.isObject() ? structured : result[lit("content")], MaxResultBytes);
+      if(result[lit("isError")].toBool())
+      {
+        item.status = lit("failed");
+        if(item.error.isEmpty())
+          item.error = Compact(result[lit("content")], MaxResultBytes);
+      }
+      if(item.server == lit("rendertest"))
+      {
+        const QJsonObject envelope = ArtifactEnvelope(result);
+        const QString session = envelope[lit("captureSessionId")].toString();
+        const QString metaSession =
+            envelope[lit("meta")].toObject()[lit("captureSessionId")].toString();
+        if(!session.isEmpty() && metaSession == session)
+        {
+          item.artifactInstanceId = envelope[lit("instanceId")].toString();
+          item.artifactCaptureSessionId = session;
+          for(const QJsonValue &artifact : envelope[lit("artifacts")].toArray())
+          {
+            const QJsonObject value = artifact.toObject();
+            if(!value.isEmpty() && item.artifacts.size() < MaxArtifacts &&
+               value[lit("path")].toString().size() <= 4096)
+            {
+              QJsonObject metadata;
+              metadata[lit("path")] = value[lit("path")];
+              metadata[lit("mediaType")] = value[lit("mediaType")].toString().left(64);
+              metadata[lit("bytes")] = value[lit("bytes")];
+              metadata[lit("sha256")] = value[lit("sha256")].toString().left(65);
+              item.artifacts << metadata;
+            }
+          }
+        }
+      }
     }
   }
   else if(type == lit("commandExecution"))
@@ -354,6 +419,12 @@ QJsonObject AgentConversation::ToJson() const
         json[lit("error")] = item.error;
       if(!item.result.isEmpty())
         json[lit("result")] = item.result;
+      if(!item.artifacts.isEmpty())
+      {
+        json[lit("artifactInstanceId")] = item.artifactInstanceId;
+        json[lit("artifactCaptureSessionId")] = item.artifactCaptureSessionId;
+        json[lit("artifacts")] = item.artifacts;
+      }
     }
     else if(!item.status.isEmpty())
     {

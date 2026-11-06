@@ -19,6 +19,7 @@ class QPushButton;
 class QTextBrowser;
 class QTimer;
 class QUrl;
+struct AgentToolImage;
 
 // Dockable "AI Assistant" panel. Runs `codex app-server` bound to this window's agent bridge
 // instance and shows a read-only chat with streamed answers and one-line tool cards.
@@ -63,6 +64,13 @@ private:
   void SendText(const QString &text);
   void Stop();
   void NewChat();
+  void EditSettings();
+  void Login();
+  void CancelLogin();
+  void FinishLogin(const QString &status, const QString &message);
+  void ReadModels(int generation, const QString &cursor = QString(),
+                  const QJsonArray &models = QJsonArray(),
+                  const QStringList &seenCursors = QStringList());
 
   void AddChip(const AgentContextChip &chip);
   void UpdateChips();
@@ -94,7 +102,7 @@ private:
   void SetState(SessionState state, const QString &message = QString());
   void ScheduleRender();
   void Render();
-  QString RenderItem(const AgentItem &item) const;
+  QString RenderItem(const AgentItem &item, QList<AgentToolImage> *images) const;
   void UpdateControls();
 
   void AutotestNext();
@@ -121,6 +129,12 @@ private:
   QString m_ReferenceToken;
   QString m_Account;
   QString m_AccountType;
+  QJsonArray m_Models;
+  QString m_LoginId;
+  QString m_LoginStatus;
+  bool m_LoginStarting = false;
+  int m_LoginRequest = 0;
+  QSet<QString> m_ExpandedTools;
   QString m_McpStatus;
   int m_McpTools = -1;
   QStringList m_OtherServers;
@@ -138,6 +152,8 @@ private:
 
   QLabel *m_Status = NULL;
   QPushButton *m_NewChat = NULL;
+  QPushButton *m_Settings = NULL;
+  QPushButton *m_Login = NULL;
   QTextBrowser *m_View = NULL;
   QWidget *m_ContextBar = NULL;
   FlowLayout *m_ContextLayout = NULL;
@@ -163,6 +179,14 @@ private:
     int turnTimeoutMs = 60000;
     int captureChangeAfterMs = 0;
     bool captureChangeBeforeLinks = false;
+    bool autoLogin = false;
+    bool loginAttempted = false;
+    int cancelLoginAfterMs = 0;
+    QJsonArray authUrls;
+    QJsonObject settings;
+    QString screenshot;
+    QString settingsScreenshot;
+    QJsonObject settingsDialog;
     bool waitForCapture = false;
     int captureTimeoutMs = 180000;
     qint64 selectEvent = -1;

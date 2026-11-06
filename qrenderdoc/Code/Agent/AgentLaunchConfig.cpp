@@ -5,6 +5,7 @@
 #include <QJsonDocument>
 #include <QProcessEnvironment>
 #include <QStandardPaths>
+#include "Code/Interface/QRDInterface.h"
 
 const char *AgentLaunchConfig::ServerName = "rendertest";
 
@@ -84,7 +85,8 @@ QString AgentLaunchConfig::FindUpwards(const QString &relativePath)
   return QString();
 }
 
-QString AgentLaunchConfig::FindCodex(QStringList &prefixArgs, QString &error)
+QString AgentLaunchConfig::FindCodex(const PersistentConfig &settings, QStringList &prefixArgs,
+                                    QString &error)
 {
   QString command = EnvValue("RENDERTEST_AGENT_CODEX_COMMAND");
   if(!command.isEmpty())
@@ -119,6 +121,23 @@ QString AgentLaunchConfig::FindCodex(QStringList &prefixArgs, QString &error)
 
   prefixArgs = QStringList({lit("app-server")});
 
+  QString configured = QString(settings.Agent_CodexPath).trimmed();
+  if(!configured.isEmpty())
+  {
+    const QString suffix = QFileInfo(configured).suffix().toLower();
+    if(suffix == lit("cmd") || suffix == lit("bat") || suffix == lit("ps1"))
+    {
+      error = tr("Choose the native Codex executable (codex.exe), not a command or PowerShell shim.");
+      return QString();
+    }
+    QString found = QFileInfo(configured).isAbsolute() ? configured
+                                                      : QStandardPaths::findExecutable(configured);
+    if(!found.isEmpty() && QFileInfo(found).isFile())
+      return Posix(found);
+    error = tr("The configured Codex executable was not found: %1").arg(configured);
+    return QString();
+  }
+
   QString appData = EnvValue("APPDATA");
   if(!appData.isEmpty())
   {
@@ -139,18 +158,32 @@ QString AgentLaunchConfig::FindCodex(QStringList &prefixArgs, QString &error)
   return QString();
 }
 
-QString AgentLaunchConfig::FindMcpPython(QString &error)
+QString AgentLaunchConfig::FindMcpPython(const PersistentConfig &settings, QString &error)
 {
   QString python = EnvValue("RENDERTEST_MCP_PYTHON");
   if(!python.isEmpty())
   {
-    if(QFileInfo::exists(python))
+    if(QFileInfo(python).isFile())
       return Posix(python);
     error = tr("RENDERTEST_MCP_PYTHON points to a missing file: %1").arg(python);
     return QString();
   }
 
+  python = QString(settings.Agent_McpPython).trimmed();
+  if(!python.isEmpty())
+  {
+    QString found = QFileInfo(python).isAbsolute() ? python : QStandardPaths::findExecutable(python);
+    if(!found.isEmpty() && QFileInfo(found).isFile())
+      return Posix(found);
+    error = tr("The configured MCP Python executable was not found: %1").arg(python);
+    return QString();
+  }
+
+#if defined(Q_OS_WIN32)
   python = FindUpwards(lit("agent/mcp_server/.venv/Scripts/python.exe"));
+#else
+  python = FindUpwards(lit("agent/mcp_server/.venv/bin/python"));
+#endif
   if(!python.isEmpty())
     return python;
 
@@ -215,28 +248,35 @@ QString AgentLaunchConfig::DeveloperInstructions(const QString &instanceId)
 }
 
 AgentLaunchConfig AgentLaunchConfig::Resolve(const QString &instanceId, const QString &captureSessionId,
-                                            const QString &agentRoot)
+                                            const QString &agentRoot, const PersistentConfig &settings)
 {
   AgentLaunchConfig config;
   config.instanceId = instanceId;
   config.captureSessionId = captureSessionId;
   config.captureTools = !instanceId.isEmpty() && !captureSessionId.isEmpty();
   config.agentRoot = Posix(agentRoot);
+  config.model = EnvValue("RENDERTEST_AGENT_MODEL");
+  if(config.model.isEmpty())
+    config.model = QString(settings.Agent_Model).trimmed();
+  config.reasoningEffort = EnvValue("RENDERTEST_AGENT_REASONING_EFFORT");
+  if(config.reasoningEffort.isEmpty())
+    config.reasoningEffort = QString(settings.Agent_ReasoningEffort).trimmed();
 
   QStringList prefixArgs;
-  config.program = FindCodex(prefixArgs, config.error);
+  config.program = FindCodex(settings, prefixArgs, config.error);
   if(!config.error.isEmpty())
     return config;
 
   if(config.captureTools)
   {
-    config.mcpPython = FindMcpPython(config.error);
+    config.mcpPython = FindMcpPython(settings, config.error);
     if(!config.error.isEmpty())
       return config;
   }
 
   QString isolate = EnvValue("RENDERTEST_AGENT_ISOLATE").toLower();
-  config.isolate = !(isolate == lit("0") || isolate == lit("false") || isolate == lit("off"));
+  config.isolate = isolate.isEmpty() ? settings.Agent_IsolateMcpServers
+                                    : !(isolate == lit("0") || isolate == lit("false") || isolate == lit("off"));
 
   QString workingDir = QDir(QCoreApplication::applicationDirPath())
                            .absoluteFilePath(lit("integrations/rendertest_agent"));

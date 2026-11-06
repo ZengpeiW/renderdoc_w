@@ -4,6 +4,8 @@
 #include <QString>
 #include <QStringList>
 
+class PersistentConfig;
+
 // Everything needed to launch `codex app-server` for the AI panel of this qrendertest instance.
 struct AgentLaunchConfig
 {
@@ -16,6 +18,8 @@ public:
   QString mcpPython;
   QString instanceId;
   QString captureSessionId;
+  QString model;
+  QString reasoningEffort;
   bool captureTools = false;
   QString agentRoot;
   QStringList skillRoots;
@@ -24,7 +28,7 @@ public:
   QString error;
 
   static AgentLaunchConfig Resolve(const QString &instanceId, const QString &captureSessionId,
-                                   const QString &agentRoot);
+                                   const QString &agentRoot, const PersistentConfig &settings);
 
   // splits a command line on whitespace, honouring double quotes
   static QStringList SplitCommand(const QString &command);
@@ -35,8 +39,8 @@ public:
   static const char *ServerName;
 
 private:
-  static QString FindCodex(QStringList &prefixArgs, QString &error);
-  static QString FindMcpPython(QString &error);
+  static QString FindCodex(const PersistentConfig &settings, QStringList &prefixArgs, QString &error);
+  static QString FindMcpPython(const PersistentConfig &settings, QString &error);
   static QStringList FindSkillRoots();
   static QString FindUpwards(const QString &relativePath);
 };

@@ -21,18 +21,23 @@ Scenarios:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import struct
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
 SCENARIOS = ("stream", "tool", "approvals", "interrupt", "hang", "crash-once", "logged-out",
              "config-error", "config-malformed", "status-error", "status-foreign",
              "status-page-foreign", "status-pages", "status-loop", "turn-timeout-once",
-             "late-items", "late-before-start", "late-response", "command-status", "explicit-links")
+             "late-items", "late-before-start", "late-response", "command-status", "explicit-links",
+             "login-success", "login-failure", "login-cancel", "model-pages", "model-error",
+             "login-not-found", "auth-recovered", "account-updated", "tool-artifacts", "tool-artifacts-rejected")
 ANSWER = "Hello from the **fake** app-server.\n\n- EID 1513 draws the scene\n- uses `ResourceId::116618`"
 SERVER_REQUESTS = (
     "item/commandExecution/requestApproval",
@@ -56,7 +61,12 @@ class FakeAppServer:
         self.server_replies: dict[int, threading.Event] = {}
         self.next_server_id = 1000
         self.thread_id = ""
+        self.initialized = False
+        self.account_reads = 0
         self.capture_tools_enabled = False
+        login_marker = self.state_dir / "logged-in" if self.state_dir else None
+        self.logged_in = (not scenario.startswith("login-") and scenario != "auth-recovered") or bool(login_marker and login_marker.exists())
+        self.login_id: str | None = None
         self.log({"event": "start", "pid": os.getpid(), "scenario": scenario, "argv": argv})
 
     def log(self, entry: dict[str, Any]) -> None:
@@ -71,6 +81,12 @@ class FakeAppServer:
         data = json.dumps(message, ensure_ascii=False) + "\n"
         with self.lock:
             sys.stdout.write(data)
+            sys.stdout.flush()
+
+    def send_batch(self, messages: list[dict[str, Any]]) -> None:
+        """Keep a response and deliberately racing notification in the same pipe write."""
+        with self.lock:
+            sys.stdout.write("".join(json.dumps(message, ensure_ascii=False) + "\n" for message in messages))
             sys.stdout.flush()
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
@@ -97,15 +113,63 @@ class FakeAppServer:
             return
 
         if method == "initialize":
+            if self.initialized:
+                self.send({"id": request_id, "error": {"code": -32600, "message": "Already initialized"}})
+                return
+            self.initialized = True
             self.respond(request_id, {"userAgent": "fake-app-server/0", "codexHome": "fake",
                                       "platformFamily": "windows", "platformOs": "windows"})
         elif method == "account/read":
-            if self.scenario == "logged-out":
+            self.account_reads += 1
+            if self.scenario == "auth-recovered" and self.account_reads >= 2:
+                self.logged_in = True
+            if self.scenario == "logged-out" or not self.logged_in:
                 self.respond(request_id, {"account": None, "requiresOpenaiAuth": True})
             else:
                 self.respond(request_id, {"account": {"type": "chatgpt", "email": "fake@example.com",
                                                       "planType": "plus"},
                                           "requiresOpenaiAuth": True})
+        elif method == "account/login/start":
+            if params.get("type") != "chatgpt":
+                self.send({"id": request_id, "error": {"code": -32602, "message": "expected ChatGPT login"}})
+                return
+            self.login_id = f"login-{self.prefix}"
+            login_id = self.login_id
+            self.respond(request_id, {"type": "chatgpt", "loginId": login_id,
+                                      "authUrl": f"https://example.invalid/rendertest-login/{login_id}"})
+            if self.scenario not in ("login-cancel", "login-not-found"):
+                threading.Timer(0.25, self.finish_login, args=(login_id,)).start()
+        elif method == "account/login/cancel":
+            login_id = params.get("loginId")
+            matched = login_id == self.login_id
+            if matched:
+                self.login_id = None
+            if self.scenario == "login-not-found":
+                self.logged_in = True  # Another login operation already completed the account transition.
+                self.respond(request_id, {"status": "notFound"})
+                return
+            # Completion can race cancellation. This must not restore a canceled login UI.
+            if matched:
+                self.log({"event": "late-login-completion", "loginId": login_id})
+                self.send_batch([
+                    {"id": request_id, "result": {"status": "canceled"}},
+                    {"method": "account/login/completed", "params": {"loginId": login_id, "success": True,
+                                                                       "error": None, "onboardingEntrypoint": None}},
+                ])
+            else:
+                self.respond(request_id, {"status": "notFound"})
+        elif method == "model/list":
+            if self.scenario == "model-error":
+                self.send({"id": request_id, "error": {"code": -32000, "message": "model catalog unavailable"}})
+                return
+            models = [self.model("fake-model", "Fake model", ["low", "high"], "low", True),
+                      self.model("fake-deep", "Fake deep model", ["medium", "ultra"], "medium", False)]
+            if self.scenario == "model-pages":
+                second = bool(params.get("cursor"))
+                self.respond(request_id, {"data": models[1:] if second else models[:1],
+                                          "nextCursor": None if second else "models-page2"})
+            else:
+                self.respond(request_id, {"data": models, "nextCursor": None})
         elif method == "skills/extraRoots/set":
             self.respond(request_id, {})
         elif method == "config/read":
@@ -121,7 +185,7 @@ class FakeAppServer:
             self.capture_tools_enabled = params.get("config", {}).get("mcp_servers.rendertest.enabled", True)
             self.thread_counter += 1
             self.thread_id = f"thr_{self.prefix}_{self.thread_counter}"
-            self.respond(request_id, {"thread": {"id": self.thread_id}, "model": "fake-model",
+            self.respond(request_id, {"thread": {"id": self.thread_id}, "model": params.get("model") or "fake-model",
                                       "sandbox": {"type": "readOnly", "networkAccess": False},
                                       "approvalPolicy": "never"})
         elif method == "mcpServerStatus/list":
@@ -180,6 +244,68 @@ class FakeAppServer:
         else:
             self.send({"id": request_id, "error": {"code": -32601, "message": f"fake: {method}"}})
 
+    @staticmethod
+    def model(name: str, title: str, efforts: list[str], default: str, is_default: bool) -> dict[str, Any]:
+        # Deliberately use distinct id/model to detect clients sending the display/catalog id.
+        return {"id": f"catalog-{name}", "model": name, "displayName": title,
+                "description": f"Test catalog entry for {name}", "hidden": False,
+                "isDefault": is_default, "defaultReasoningEffort": default,
+                "supportedReasoningEfforts": [{"reasoningEffort": effort, "description": effort.title()}
+                                               for effort in efforts],
+                "inputModalities": ["text"], "upgrade": None, "upgradeInfo": None,
+                "availabilityNux": None, "modelSpecialty": None, "supportsPersonality": False,
+                "multiAgentVersion": None, "additionalSpeedTiers": [], "serviceTiers": [],
+                "defaultServiceTier": None, "availableAccessPrograms": None}
+
+    def finish_login(self, login_id: str) -> None:
+        if self.login_id != login_id:
+            return
+        success = self.scenario != "login-failure"
+        if success:
+            self.logged_in = True
+            if self.state_dir:
+                (self.state_dir / "logged-in").write_text("1", encoding="utf-8")
+        self.login_id = None
+        self.notify("account/login/completed", {"loginId": login_id, "success": success,
+                    "error": None if success else "fake login rejected", "onboardingEntrypoint": None})
+        if success:
+            self.notify("account/updated", {"authMode": "chatgpt", "planType": "plus"})
+
+    def artifact_result(self) -> dict[str, Any]:
+        instance, session = f"fake-{self.prefix}", "0123456789abcdef0123456789abcdef"
+        root = Path(os.environ["RENDERTEST_AGENT_ROOT"]).resolve()
+        directory = root / "artifacts" / instance / session / "textures"
+        directory.mkdir(parents=True, exist_ok=True)
+
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0)) +
+               chunk(b"IDAT", zlib.compress((b"\x00" + b"\x20\x80\xff\xff" * 2) * 2)) + chunk(b"IEND", b""))
+        valid = directory / "valid.png"
+        outside = root.parent / "outside-artifact.png"
+        corrupt = directory / "not-a-png.png"
+        missing = directory / "missing.png"
+        valid.write_bytes(png)
+        outside.write_bytes(png)
+        corrupt.write_bytes(b"this is plain text, not an image")
+
+        def describe(path: Path, data: bytes) -> dict[str, Any]:
+            return {"kind": "image", "path": str(path), "mediaType": "image/png", "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(), "source": {"eventId": 1513}}
+
+        artifacts = [describe(valid, png), describe(outside, png),
+                     describe(corrupt, corrupt.read_bytes()), describe(missing, png)]
+        if self.scenario == "tool-artifacts-rejected":
+            artifacts[0], artifacts[1] = artifacts[1], artifacts[0]
+        envelope = {"schema": "rendertest-mcp-result/v1", "ok": True, "instanceId": instance,
+                    "captureSessionId": session, "meta": {"captureSessionId": session},
+                    "data": {"preview": "RESULT_VISIBLE_MARKER", "padding": "X" * 6000},
+                    "artifacts": artifacts}
+        # export_texture sends a JSON text block; its artifacts occur beyond the 4 KiB display
+        # truncation. The UI must extract metadata from the original result, not the preview.
+        return {"content": [{"type": "text", "text": json.dumps(envelope)}], "isError": False}
+
     def item_id(self, turn_id: str, name: str) -> str:
         return f"{turn_id}_{name}"
 
@@ -236,16 +362,19 @@ class FakeAppServer:
                 sys.stderr.flush()
                 os._exit(3)
 
-        if self.scenario == "tool":
+        if self.scenario == "tool" or self.scenario.startswith("tool-artifacts"):
             tool_id = self.item_id(turn_id, "tool")
-            item = {"type": "mcpToolCall", "id": tool_id, "server": "rendertest", "tool": "get_context",
-                    "status": "inProgress", "arguments": {}}
+            artifact = self.scenario.startswith("tool-artifacts")
+            arguments = {"padding": "A" * 700, "z_marker": "ARGUMENT_END_MARKER"} if artifact else {}
+            item = {"type": "mcpToolCall", "id": tool_id, "server": "rendertest",
+                    "tool": "export_texture" if artifact else "get_context",
+                    "status": "inProgress", "arguments": arguments}
             self.notify("item/started", {"threadId": thread_id, "turnId": turn_id, "item": item})
             self.notify("item/mcpToolCall/progress", {"threadId": thread_id, "turnId": turn_id,
                                                       "itemId": tool_id, "message": "reading context"})
             time.sleep(0.1)
-            done = dict(item, status="completed", durationMs=123,
-                        result={"content": [], "structuredContent": {"ok": True, "eventId": 1513}})
+            result = self.artifact_result() if artifact else {"content": [], "structuredContent": {"ok": True, "eventId": 1513}}
+            done = dict(item, status="completed", durationMs=123, result=result)
             self.notify("item/completed", {"threadId": thread_id, "turnId": turn_id, "item": done})
 
         if self.scenario == "approvals":
@@ -286,6 +415,9 @@ class FakeAppServer:
                                                                  "last": {"totalTokens": 42},
                                                                  "modelContextWindow": 200000}})
         self.complete(thread_id, turn_id, "completed")
+        if self.scenario == "account-updated":
+            self.logged_in = False
+            self.notify("account/updated", {"authMode": None, "planType": None})
 
 
 def main(argv: list[str] | None = None) -> int:

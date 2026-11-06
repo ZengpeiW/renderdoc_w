@@ -1,5 +1,8 @@
 #include "AgentChatPanel.h"
 #include <QCoreApplication>
+#include <QApplication>
+#include <QComboBox>
+#include <QDialog>
 #include <QDesktopServices>
 #include <QDateTime>
 #include <QDir>
@@ -14,6 +17,7 @@
 #include <QRegularExpression>
 #include <QScrollBar>
 #include <QTextBrowser>
+#include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
 #include <QUrl>
@@ -21,6 +25,8 @@
 #include <QUuid>
 #include <QVBoxLayout>
 #include "Code/Agent/AgentMarkdown.h"
+#include "Code/Agent/AgentSettingsDialog.h"
+#include "Code/Agent/AgentToolView.h"
 #include "Code/Agent/CodexAppServerClient.h"
 #include "Code/Agent/RenderTestAgentIntegration.h"
 #include "Code/CaptureContext.h"
@@ -29,6 +35,16 @@
 
 namespace
 {
+// QTextBrowser must never resolve model-supplied local files or network resources. The panel
+// inserts only verified artifact thumbnails into the document's resource cache.
+class AgentTextBrowser : public QTextBrowser
+{
+public:
+  explicit AgentTextBrowser(QWidget *parent) : QTextBrowser(parent) {}
+protected:
+  QVariant loadResource(int, const QUrl &) override { return QVariant(); }
+};
+
 const int InitializeTimeoutMs = 30000;
 const int AccountTimeoutMs = 30000;
 const int ConfigTimeoutMs = 15000;
@@ -56,6 +72,31 @@ QString ErrorMessage(const QJsonObject &error)
 {
   QString message = error[lit("message")].toString();
   return message.isEmpty() ? lit("unknown error") : message;
+}
+
+QJsonObject AgentSettingsSnapshot(const PersistentConfig &config)
+{
+  QJsonObject result;
+  result[lit("codexPath")] = QString(config.Agent_CodexPath);
+  result[lit("mcpPython")] = QString(config.Agent_McpPython);
+  result[lit("model")] = QString(config.Agent_Model);
+  result[lit("reasoningEffort")] = QString(config.Agent_ReasoningEffort);
+  result[lit("isolate")] = config.Agent_IsolateMcpServers;
+  return result;
+}
+
+void ApplyAgentSettings(PersistentConfig &config, const QJsonObject &settings)
+{
+  if(settings.contains(lit("codexPath")))
+    config.Agent_CodexPath = settings[lit("codexPath")].toString();
+  if(settings.contains(lit("mcpPython")))
+    config.Agent_McpPython = settings[lit("mcpPython")].toString();
+  if(settings.contains(lit("model")))
+    config.Agent_Model = settings[lit("model")].toString();
+  if(settings.contains(lit("reasoningEffort")))
+    config.Agent_ReasoningEffort = settings[lit("reasoningEffort")].toString();
+  if(settings.contains(lit("isolate")))
+    config.Agent_IsolateMcpServers = settings[lit("isolate")].toBool(true);
 }
 
 QString Elide(const QString &text, int maxChars)
@@ -98,7 +139,11 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   m_NewChat = new QPushButton(tr("New Chat"), this);
   m_NewChat->setToolTip(tr("Discard this conversation and start a new one"));
 
-  m_View = new QTextBrowser(this);
+  m_Settings = new QPushButton(tr("Settings"), this);
+  m_Login = new QPushButton(tr("Log in"), this);
+  m_Login->setVisible(false);
+
+  m_View = new AgentTextBrowser(this);
   m_View->setOpenLinks(false);
   m_View->setOpenExternalLinks(false);
 
@@ -115,7 +160,9 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
 
   QHBoxLayout *top = new QHBoxLayout();
   top->addWidget(m_Status, 1);
+  top->addWidget(m_Login);
   top->addWidget(m_NewChat);
+  top->addWidget(m_Settings);
 
   QVBoxLayout *buttons = new QVBoxLayout();
   buttons->addWidget(m_Send);
@@ -151,6 +198,8 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   connect(m_Send, &QPushButton::clicked, this, &AgentChatPanel::Send);
   connect(m_StopButton, &QPushButton::clicked, this, &AgentChatPanel::Stop);
   connect(m_NewChat, &QPushButton::clicked, this, &AgentChatPanel::NewChat);
+  connect(m_Settings, &QPushButton::clicked, this, &AgentChatPanel::EditSettings);
+  connect(m_Login, &QPushButton::clicked, this, &AgentChatPanel::Login);
   connect(m_View, &QTextBrowser::anchorClicked, this, &AgentChatPanel::OpenLink);
 
   m_Ctx.AddCaptureViewer(this);
@@ -403,6 +452,45 @@ QString AgentChatPanel::LinkError(const QUrl &url)
 
 bool AgentChatPanel::OpenLink(const QUrl &url)
 {
+  if(url.scheme() == lit("agent-tool") || url.scheme() == lit("agent-artifact"))
+  {
+    const QStringList parts = url.path().split(QLatin1Char('/'), QString::SkipEmptyParts);
+    if(url.host() == lit("item") && !parts.isEmpty())
+    {
+      for(const AgentItem &item : m_Conversation.Items())
+      {
+        if(item.kind != AgentItem::Kind::Tool || AgentToolView::ItemKey(item) != parts[0])
+          continue;
+        if(url.scheme() == lit("agent-tool") && parts.size() == 1)
+        {
+          if(m_ExpandedTools.contains(parts[0]))
+            m_ExpandedTools.remove(parts[0]);
+          else
+            m_ExpandedTools.insert(parts[0]);
+          Render();
+          return true;
+        }
+        bool ok = false;
+        int index = parts.size() == 2 ? parts[1].toInt(&ok) : -1;
+        if(url.scheme() == lit("agent-artifact") && ok)
+        {
+          AgentToolImage image = AgentToolView::ValidatedImage(
+              item, index, RenderTestAgentIntegration::AgentRoot(), true);
+          if(image.IsValid())
+          {
+            // Tests validate the same file without launching an external viewer.
+            if(m_Autotest.active || QDesktopServices::openUrl(QUrl::fromLocalFile(image.canonicalPath)))
+              return true;
+          }
+          m_Conversation.AddNotice(lit("warning"), image.error.isEmpty()
+                                      ? tr("Could not open the artifact image.") : image.error);
+          ScheduleRender();
+          return false;
+        }
+      }
+    }
+    return false;
+  }
   QString error = LinkError(url);
   if(error.isEmpty())
     return true;
@@ -429,7 +517,7 @@ bool AgentChatPanel::eventFilter(QObject *watched, QEvent *event)
 void AgentChatPanel::Send()
 {
   QString text = m_Input->toPlainText().trimmed();
-  if(text.isEmpty() || m_Conversation.TurnRunning())
+  if(text.isEmpty() || m_Conversation.TurnRunning() || m_LoginStarting || !m_LoginId.isEmpty())
     return;
   m_Input->clear();
   SendText(text);
@@ -465,6 +553,12 @@ void AgentChatPanel::SendText(const QString &text)
       BeginThread(m_Generation);
     else
       StartTurn();
+  }
+  else if(m_State == SessionState::NotLoggedIn && m_Client->IsRunning())
+  {
+    // The initialized process stays alive for login. Recheck its account without initializing twice.
+    SetState(SessionState::Starting, tr("Checking account..."));
+    ReadAccount(m_Generation);
   }
   else if(m_State != SessionState::Starting)
   {
@@ -537,8 +631,13 @@ void AgentChatPanel::StartSession()
            "plain chat is available."));
   }
 
+  // Test overrides must never enter the shared persistent configuration, even on early shutdown.
+  PersistentConfig settings;
+  ApplyAgentSettings(settings, AgentSettingsSnapshot(m_Ctx.Config()));
+  if(m_Autotest.active)
+    ApplyAgentSettings(settings, m_Autotest.settings);
   m_Launch = AgentLaunchConfig::Resolve(m_InstanceId, m_CaptureSessionId,
-                                      RenderTestAgentIntegration::AgentRoot());
+                                      RenderTestAgentIntegration::AgentRoot(), settings);
   if(!m_Launch.error.isEmpty())
   {
     SessionFailed(SessionState::Error, m_Launch.error);
@@ -589,6 +688,7 @@ void AgentChatPanel::StartSession()
                         return;
                       }
                       m_Client->Notify(lit("initialized"), QJsonObject());
+                      ReadModels(generation);
                       ReadAccount(generation);
                     });
 }
@@ -612,9 +712,21 @@ void AgentChatPanel::ReadAccount(int generation)
         QJsonObject account = data[lit("account")].toObject();
         if(account.isEmpty() && data[lit("requiresOpenaiAuth")].toBool(true))
         {
-          SessionFailed(SessionState::NotLoggedIn,
-                        tr("Codex is not logged in. Run `codex login` in a terminal, then send "
-                           "the message again."));
+          // Keep the initialized process alive so the panel can complete browser login.
+          m_Account.clear();
+          m_AccountType.clear();
+          m_PendingText.clear();
+          m_Conversation.SetThread(QString(), m_Conversation.Model());
+          const QString message = tr("Codex is not logged in. Click Log in, then send your question.");
+          SetState(SessionState::NotLoggedIn, message);
+          if(m_Conversation.TurnRunning())
+            m_Conversation.EndTurn(lit("failed"), message);
+          else
+            m_Conversation.AddNotice(lit("warning"), message);
+          ScheduleRender();
+          if(m_Autotest.active && !m_QuestionActive)
+            QTimer::singleShot(300, this, &AgentChatPanel::AutotestNext);
+          QuestionFinished();
           return;
         }
         m_AccountType = account[lit("type")].toString();
@@ -623,6 +735,157 @@ void AgentChatPanel::ReadAccount(int generation)
           m_Account = m_AccountType.isEmpty() ? tr("custom provider") : m_AccountType;
         SetSkillRoots(generation);
       });
+}
+
+void AgentChatPanel::ReadModels(int generation, const QString &cursor, const QJsonArray &models,
+                                const QStringList &seenCursors)
+{
+  QJsonObject params;
+  params[lit("limit")] = 100;
+  if(!cursor.isEmpty())
+    params[lit("cursor")] = cursor;
+  m_Client->Request(lit("model/list"), params, ConfigTimeoutMs,
+                    [this, generation, models, seenCursors](const QJsonValue &result,
+                                                           const QJsonObject &error) {
+    if(generation != m_Generation)
+      return;
+    if(!error.isEmpty() || !result.toObject()[lit("data")].isArray())
+      return;    // Custom provider model names remain editable when enumeration is unavailable.
+    QJsonArray all = models;
+    for(const QJsonValue &model : result.toObject()[lit("data")].toArray())
+      if(model.isObject())
+        all << model;
+    const QString next = result.toObject()[lit("nextCursor")].toString();
+    if(!next.isEmpty())
+    {
+      if(seenCursors.contains(next) || seenCursors.size() >= 99)
+        return;
+      QStringList seen = seenCursors;
+      seen << next;
+      ReadModels(generation, next, all, seen);
+      return;
+    }
+    m_Models = all;
+  });
+}
+
+void AgentChatPanel::EditSettings()
+{
+  if(m_Conversation.TurnRunning() || m_State == SessionState::Starting || m_LoginStarting ||
+     !m_LoginId.isEmpty())
+    return;
+  bool accepted = false;
+  if(m_Autotest.active)
+  {
+    PersistentConfig settings;
+    ApplyAgentSettings(settings, AgentSettingsSnapshot(m_Ctx.Config()));
+    ApplyAgentSettings(settings, m_Autotest.settings);
+    accepted = AgentSettingsDialog::Edit(settings, m_Models, this, false);
+  }
+  else
+    accepted = AgentSettingsDialog::Edit(m_Ctx.Config(), m_Models, this);
+  if(!accepted)
+    return;
+  KillSession();
+  m_Models = QJsonArray();
+  m_Conversation.AddNotice(lit("info"), tr("Settings saved. The next question starts a new session."));
+  ScheduleRender();
+  UpdateControls();
+}
+
+void AgentChatPanel::Login()
+{
+  if(!m_LoginId.isEmpty())
+  {
+    CancelLogin();
+    return;
+  }
+  if(m_LoginStarting || !m_Client->IsRunning() || m_State != SessionState::NotLoggedIn)
+    return;
+  const int generation = m_Generation;
+  const int request = ++m_LoginRequest;
+  m_LoginStarting = true;
+  m_LoginStatus = lit("starting");
+  UpdateControls();
+  QJsonObject params;
+  params[lit("type")] = lit("chatgpt");
+  m_Client->Request(lit("account/login/start"), params, AccountTimeoutMs,
+                    [this, generation, request](const QJsonValue &result, const QJsonObject &error) {
+    if(generation != m_Generation || request != m_LoginRequest)
+      return;
+    m_LoginStarting = false;
+    const QJsonObject data = result.toObject();
+    const QUrl url(data[lit("authUrl")].toString());
+    if(!error.isEmpty() || data[lit("type")].toString() != lit("chatgpt") ||
+       data[lit("loginId")].toString().isEmpty() || !url.isValid() || url.host().isEmpty() ||
+       (url.scheme() != lit("https") && url.scheme() != lit("http")))
+    {
+      FinishLogin(lit("failed"), tr("Could not start login: %1").arg(ErrorMessage(error)));
+      return;
+    }
+    m_LoginId = data[lit("loginId")].toString();
+    m_LoginStatus = lit("waiting");
+    SetState(SessionState::NotLoggedIn, tr("Complete login in your browser, or cancel here."));
+    if(m_Autotest.active)
+    {
+      m_Autotest.authUrls << url.toString();
+      if(m_Autotest.cancelLoginAfterMs > 0)
+        QTimer::singleShot(m_Autotest.cancelLoginAfterMs, this, [this, generation, request]() {
+          if(generation == m_Generation && request == m_LoginRequest && !m_LoginId.isEmpty())
+            CancelLogin();
+        });
+    }
+    else if(!QDesktopServices::openUrl(url))
+    {
+      CancelLogin();
+      m_Conversation.AddNotice(lit("error"), tr("Could not open the login page in your browser."));
+      ScheduleRender();
+    }
+  });
+}
+
+void AgentChatPanel::CancelLogin()
+{
+  if(m_LoginId.isEmpty())
+    return;
+  QJsonObject params;
+  params[lit("loginId")] = m_LoginId;
+  const int generation = m_Generation;
+  const int request = ++m_LoginRequest;
+  m_LoginId.clear();    // Ignore any completion racing with the cancellation response.
+  m_LoginStarting = true;
+  UpdateControls();
+  m_Client->Request(lit("account/login/cancel"), params, AccountTimeoutMs,
+                    [this, generation, request](const QJsonValue &result, const QJsonObject &error) {
+    if(generation != m_Generation || request != m_LoginRequest)
+      return;
+    const QString status = result.toObject()[lit("status")].toString();
+    if(error.isEmpty() && status == lit("notFound"))
+    {
+      m_LoginStarting = false;
+      m_LoginStatus = lit("notFound");
+      SetState(SessionState::Starting, tr("Login already ended. Checking account..."));
+      ReadAccount(generation);
+    }
+    else if(error.isEmpty() && status == lit("canceled"))
+      FinishLogin(lit("canceled"), tr("Login canceled."));
+    else
+      FinishLogin(lit("failed"), tr("Could not cancel login: %1")
+                                    .arg(error.isEmpty() ? tr("Unexpected server response")
+                                                         : ErrorMessage(error)));
+  });
+}
+
+void AgentChatPanel::FinishLogin(const QString &status, const QString &message)
+{
+  m_LoginId.clear();
+  m_LoginStarting = false;
+  m_LoginStatus = status;
+  SetState(SessionState::NotLoggedIn, message);
+  m_Conversation.AddNotice(status == lit("failed") ? lit("error") : lit("info"), message);
+  ScheduleRender();
+  if(m_Autotest.active)
+    QTimer::singleShot(0, this, &AgentChatPanel::AutotestNext);
 }
 
 void AgentChatPanel::SetSkillRoots(int generation)
@@ -699,6 +962,8 @@ void AgentChatPanel::StartThread(int generation, const QStringList &disabledServ
   params[lit("ephemeral")] = true;
   params[lit("serviceName")] = lit("qrendertest");
   params[lit("developerInstructions")] = AgentLaunchConfig::DeveloperInstructions(m_InstanceId);
+  if(!m_Launch.model.isEmpty())
+    params[lit("model")] = m_Launch.model;
   if(!config.isEmpty())
     params[lit("config")] = config;
 
@@ -840,6 +1105,8 @@ void AgentChatPanel::PollMcpStatus(int generation, int attempt, const QString &c
         ScheduleRender();
         if(m_Conversation.TurnRunning() && !m_PendingText.isEmpty())
           StartTurn();
+        else if(m_Autotest.active)
+          QTimer::singleShot(0, this, &AgentChatPanel::AutotestNext);
       });
 }
 
@@ -866,6 +1133,8 @@ void AgentChatPanel::StartTurn()
   QJsonObject params;
   params[lit("threadId")] = m_Conversation.ThreadId();
   params[lit("input")] = QJsonArray({input});
+  if(!m_Launch.reasoningEffort.isEmpty())
+    params[lit("effort")] = m_Launch.reasoningEffort;
 
   m_Client->Request(
       lit("turn/start"), params, m_Autotest.active ? m_Autotest.turnTimeoutMs : TurnTimeoutMs,
@@ -902,6 +1171,9 @@ void AgentChatPanel::SessionFailed(SessionState state, const QString &message)
 void AgentChatPanel::KillSession()
 {
   m_Generation++;
+  m_LoginRequest++;
+  m_LoginId.clear();
+  m_LoginStarting = false;
   m_StopTimer->stop();
   m_ExpectExit = true;
   m_Client->Kill();
@@ -953,6 +1225,8 @@ void AgentChatPanel::NewChat()
   if(m_Conversation.TurnRunning())
     return;
   m_Conversation.Clear();
+  m_ExpandedTools.clear();
+  AgentToolView::ClearCache();
   m_HadThread = false;
   m_IncludeEvent = true;
   UpdateChips();
@@ -962,6 +1236,71 @@ void AgentChatPanel::NewChat()
 
 void AgentChatPanel::OnNotification(const QString &method, const QJsonObject &params)
 {
+  if(method == lit("account/login/completed"))
+  {
+    if(m_LoginId.isEmpty() || params[lit("loginId")].toString() != m_LoginId)
+      return;
+    if(!params[lit("success")].toBool(false))
+    {
+      FinishLogin(lit("failed"), tr("Login failed: %1").arg(params[lit("error")].toString()));
+      return;
+    }
+    m_LoginId.clear();
+    m_LoginStarting = false;
+    m_LoginStatus = lit("completed");
+    SetState(SessionState::Starting, tr("Login completed. Connecting..."));
+    ReadAccount(m_Generation);
+    return;
+  }
+  if(method == lit("account/updated"))
+  {
+    if(m_LoginStarting || !m_LoginId.isEmpty())
+      return;
+    if(m_State == SessionState::NotLoggedIn)
+    {
+      SetState(SessionState::Starting, tr("Checking account..."));
+      ReadAccount(m_Generation);
+      return;
+    }
+    if(m_State != SessionState::Ready)
+      return;
+    const int generation = m_Generation;
+    QJsonObject request;
+    request[lit("refreshToken")] = false;
+    m_Client->Request(lit("account/read"), request, AccountTimeoutMs,
+                      [this, generation](const QJsonValue &result, const QJsonObject &error) {
+      if(generation != m_Generation || !error.isEmpty())
+        return;
+      QJsonObject account = result.toObject()[lit("account")].toObject();
+      if(account.isEmpty() && result.toObject()[lit("requiresOpenaiAuth")].toBool(true))
+      {
+        const QString message = tr("Codex is no longer logged in. Log in before sending another question.");
+        m_Account.clear();
+        m_AccountType.clear();
+        m_PendingText.clear();
+        if(m_Conversation.TurnRunning())
+        {
+          // Do not leave an authenticated remote turn alive after losing its local account state.
+          m_Conversation.EndTurn(lit("failed"), message);
+          KillSession();
+          StartSession();
+          QuestionFinished();
+        }
+        else
+        {
+          m_Conversation.SetThread(QString(), m_Conversation.Model());
+          SetState(SessionState::NotLoggedIn, message);
+          m_Conversation.AddNotice(lit("warning"), message);
+        }
+        ScheduleRender();
+        return;
+      }
+      m_AccountType = account[lit("type")].toString();
+      m_Account = account[lit("email")].toString(m_AccountType);
+      UpdateControls();
+    });
+    return;
+  }
   if(m_State != SessionState::Ready || !m_Conversation.TurnRunning())
     return;
   bool changed = m_Conversation.Apply(method, params);
@@ -1011,6 +1350,9 @@ void AgentChatPanel::OnProcessExited(int exitCode, bool killed, const QString &r
   message += lit("\n") + tr("The next message restarts it. Log: %1").arg(LogPath());
 
   m_Generation++;
+  m_LoginRequest++;
+  m_LoginStarting = false;
+  m_LoginId.clear();
   m_StopTimer->stop();
   m_Conversation.SetThread(QString(), m_Conversation.Model());
   m_PendingText.clear();
@@ -1048,9 +1390,14 @@ void AgentChatPanel::QuestionFinished()
 void AgentChatPanel::UpdateControls()
 {
   const bool running = m_Conversation.TurnRunning();
-  m_Send->setEnabled(!running);
+  const bool loginBusy = m_LoginStarting || !m_LoginId.isEmpty();
+  m_Send->setEnabled(!running && !loginBusy);
   m_StopButton->setEnabled(running);
-  m_NewChat->setEnabled(!running);
+  m_NewChat->setEnabled(!running && !loginBusy);
+  m_Settings->setEnabled(!running && m_State != SessionState::Starting && !loginBusy);
+  m_Login->setVisible(m_State == SessionState::NotLoggedIn);
+  m_Login->setEnabled(m_Client->IsRunning() && !m_LoginStarting);
+  m_Login->setText(m_LoginId.isEmpty() ? tr("Log in") : tr("Cancel login"));
 
   QString color = lit("gray");
   QString state;
@@ -1066,7 +1413,7 @@ void AgentChatPanel::UpdateControls()
       color = running ? lit("#c08000") : lit("#2a9d2a");
       break;
     case SessionState::NotLoggedIn:
-      state = tr("Not logged in");
+      state = loginBusy ? tr("Waiting for login") : tr("Not logged in");
       color = lit("#c03030");
       break;
     case SessionState::Error:
@@ -1105,7 +1452,7 @@ void AgentChatPanel::ScheduleRender()
     m_RenderTimer->start();
 }
 
-QString AgentChatPanel::RenderItem(const AgentItem &item) const
+QString AgentChatPanel::RenderItem(const AgentItem &item, QList<AgentToolImage> *images) const
 {
   switch(item.kind)
   {
@@ -1142,38 +1489,8 @@ QString AgentChatPanel::RenderItem(const AgentItem &item) const
     }
     case AgentItem::Kind::Tool:
     {
-      QString mark = Glyph(0x2026);
-      QString color = lit("#c08000");
-      if(item.status == lit("completed"))
-      {
-        mark = Glyph(0x2713);
-        color = lit("#2a9d2a");
-      }
-      else if(item.status == lit("failed") || item.status == lit("interrupted") ||
-              !item.error.isEmpty())
-      {
-        mark = Glyph(0x2717);
-        color = lit("#c03030");
-      }
-      QString args = item.arguments;
-      if(args == lit("{}"))
-        args.clear();
-      if(args.size() > 90)
-        args = args.left(90) + Glyph(0x2026);
-      QString duration = item.durationMs >= 0
-                             ? lit("%1s").arg(double(item.durationMs) / 1000.0, 0, 'f', 1)
-                             : QString();
-      QString detail = !item.error.isEmpty() ? item.error : item.progress;
-      if(detail.size() > 160)
-        detail = detail.left(160) + Glyph(0x2026);
-      QString html = lit("<p style=\"font-family: Consolas, monospace; margin:2px;\">%1 <b>%2</b> "
-                         "<span style=\"color:gray;\">%3</span> %4 "
-                         "<span style=\"color:%5;\">%6</span>")
-                         .arg(Glyph(0x25B8), item.tool.toHtmlEscaped(), args.toHtmlEscaped(),
-                              duration, color, mark);
-      if(!detail.isEmpty())
-        html += lit("<br/><span style=\"color:gray;\">%1</span>").arg(detail.toHtmlEscaped());
-      return html + lit("</p>");
+      return AgentToolView::Render(item, m_ExpandedTools.contains(AgentToolView::ItemKey(item)),
+                                   RenderTestAgentIntegration::AgentRoot(), images);
     }
     case AgentItem::Kind::Notice:
     {
@@ -1196,6 +1513,7 @@ QString AgentChatPanel::RenderItem(const AgentItem &item) const
 void AgentChatPanel::Render()
 {
   QString html;
+  QList<AgentToolImage> images;
   if(m_Conversation.Items().isEmpty())
   {
     html = lit("<p style=\"color:gray;\">%1</p>")
@@ -1205,7 +1523,7 @@ void AgentChatPanel::Render()
   }
 
   for(const AgentItem &item : m_Conversation.Items())
-    html += RenderItem(item);
+    html += RenderItem(item, &images);
 
   if(m_Conversation.TurnRunning())
   {
@@ -1218,6 +1536,11 @@ void AgentChatPanel::Render()
   const bool atBottom = bar->value() >= bar->maximum() - 4;
   const int previous = bar->value();
   m_View->setHtml(html);
+  for(const AgentToolImage &image : images)
+    if(image.IsValid())
+      m_View->document()->addResource(QTextDocument::ImageResource, image.resourceUrl, image.thumbnail);
+  if(!images.isEmpty())
+    m_View->document()->markContentsDirty(0, m_View->document()->characterCount());
   bar->setValue(atBottom ? bar->maximum() : previous);
 }
 
@@ -1225,6 +1548,11 @@ void AgentChatPanel::RunAutotest(const QJsonObject &config)
 {
   m_Autotest = Autotest();
   m_Autotest.active = true;
+  m_Autotest.settings = config[lit("settings")].toObject();
+  m_Autotest.autoLogin = config[lit("autoLogin")].toBool(false);
+  m_Autotest.cancelLoginAfterMs = config[lit("cancelLoginAfterMs")].toInt(0);
+  m_Autotest.screenshot = config[lit("screenshot")].toString();
+  m_Autotest.settingsScreenshot = config[lit("settingsScreenshot")].toString();
   for(const QJsonValue &question : config[lit("questions")].toArray())
     m_Autotest.questions << question.toString();
   m_Autotest.asks = config[lit("asks")].toArray();
@@ -1247,8 +1575,17 @@ void AgentChatPanel::RunAutotest(const QJsonObject &config)
 
 void AgentChatPanel::AutotestNext()
 {
-  if(!m_Autotest.active)
+  if(!m_Autotest.active || m_QuestionActive)
     return;
+
+  if(m_LoginStarting || !m_LoginId.isEmpty() || m_State == SessionState::Starting)
+    return;
+  if(m_Autotest.autoLogin && !m_Autotest.loginAttempted && m_State == SessionState::NotLoggedIn)
+  {
+    m_Autotest.loginAttempted = true;
+    Login();
+    return;
+  }
 
   if(m_Autotest.index == 0 && m_Autotest.waitForCapture &&
      (!m_Ctx.IsCaptureLoaded() || m_Ctx.IsCaptureLoading()))
@@ -1402,6 +1739,19 @@ void AgentChatPanel::AutotestClickLinks()
         }
       }
     }
+    else if(link == lit("first-tool") || link == lit("first-artifact"))
+    {
+      const bool artifact = link == lit("first-artifact");
+      link.clear();
+      for(const AgentItem &item : m_Conversation.Items())
+      {
+        if(item.kind != AgentItem::Kind::Tool || (artifact && item.artifacts.isEmpty()))
+          continue;
+        link = artifact ? lit("agent-artifact://item/%1/0").arg(AgentToolView::ItemKey(item))
+                        : lit("agent-tool://item/%1").arg(AgentToolView::ItemKey(item));
+        break;
+      }
+    }
 
     QJsonObject click;
     click[lit("requested")] = value.toString();
@@ -1411,6 +1761,34 @@ void AgentChatPanel::AutotestClickLinks()
     m_Autotest.linkClicks << click;
   }
 
+  Render();
+  if(!m_Autotest.screenshot.isEmpty())
+  {
+    QDir().mkpath(QFileInfo(m_Autotest.screenshot).absolutePath());
+    grab().save(m_Autotest.screenshot);
+  }
+  if(!m_Autotest.settingsScreenshot.isEmpty())
+  {
+    // Exercise the real dialog without accepting or changing the user's saved configuration.
+    QTimer::singleShot(100, this, [this]() {
+      QDialog *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+      if(!dialog || dialog->objectName() != lit("agentSettings"))
+        return;
+      QComboBox *model = dialog->findChild<QComboBox *>(lit("agentModel"));
+      QComboBox *effort = dialog->findChild<QComboBox *>(lit("agentReasoningEffort"));
+      if(model && effort)
+      {
+        m_Autotest.settingsDialog[lit("model")] = model->currentData().toString();
+        m_Autotest.settingsDialog[lit("effort")] = effort->currentData().toString();
+        m_Autotest.settingsDialog[lit("modelCount")] = model->count();
+        m_Autotest.settingsDialog[lit("effortEditable")] = effort->isEditable();
+      }
+      QDir().mkpath(QFileInfo(m_Autotest.settingsScreenshot).absolutePath());
+      m_Autotest.settingsDialog[lit("screenshotSaved")] = dialog->grab().save(m_Autotest.settingsScreenshot);
+      dialog->reject();
+    });
+    EditSettings();
+  }
   WriteTranscript();
   m_Autotest.active = false;
 }
@@ -1434,6 +1812,13 @@ void AgentChatPanel::WriteTranscript()
   session[lit("captureTools")] = m_Launch.captureTools;
   session[lit("referenceToken")] = m_ReferenceToken;
   session[lit("accountType")] = m_AccountType;
+  session[lit("loginStatus")] = m_LoginStatus;
+  session[lit("loginVisible")] = !m_Login->isHidden();
+  session[lit("loginEnabled")] = m_Login->isEnabled();
+  session[lit("authUrls")] = m_Autotest.authUrls;
+  session[lit("models")] = m_Models;
+  session[lit("selectedModel")] = m_Launch.model;
+  session[lit("selectedEffort")] = m_Launch.reasoningEffort;
   session[lit("mcpStatus")] = m_McpStatus;
   session[lit("mcpTools")] = m_McpTools;
   session[lit("otherServers")] = QJsonArray::fromStringList(m_OtherServers);
@@ -1454,6 +1839,9 @@ void AgentChatPanel::WriteTranscript()
   autotest[lit("asks")] = m_Autotest.askResults;
   autotest[lit("renderedLinks")] = QJsonArray::fromStringList(RenderedLinks(m_Conversation.Items()));
   autotest[lit("linkClicks")] = m_Autotest.linkClicks;
+  autotest[lit("expandedTools")] = QJsonArray::fromStringList(m_ExpandedTools.values());
+  autotest[lit("renderedHtml")] = m_View->toHtml();
+  autotest[lit("settingsDialog")] = m_Autotest.settingsDialog;
   transcript[lit("autotest")] = autotest;
 
   if(m_Autotest.transcript.isEmpty())

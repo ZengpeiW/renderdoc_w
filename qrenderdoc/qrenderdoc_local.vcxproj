@@ -741,6 +741,8 @@
     <ClCompile Include="Code\Agent\AgentLaunchConfig.cpp" />
     <ClCompile Include="Code\Agent\AgentAsk.cpp" />
     <ClCompile Include="Code\Agent\AgentMarkdown.cpp" />
+    <ClCompile Include="Code\Agent\AgentSettingsDialog.cpp" />
+    <ClCompile Include="Code\Agent\AgentToolView.cpp" />
     <ClCompile Include="Code\Agent\CodexAppServerClient.cpp" />
     <ClCompile Include="Styles\RDStyle\RDStyle.cpp" />
     <ClCompile Include="Styles\StyleData.cpp" />
@@ -1014,6 +1016,8 @@
     <ClInclude Include="Code\Agent\AgentLaunchConfig.h" />
     <ClInclude Include="Code\Agent\AgentAsk.h" />
     <ClInclude Include="Code\Agent\AgentMarkdown.h" />
+    <ClInclude Include="Code\Agent\AgentSettingsDialog.h" />
+    <ClInclude Include="Code\Agent\AgentToolView.h" />
     <ClInclude Include="Styles\StyleData.h" />
     <ClInclude Include="Code\qprocessinfo.h" />
     <ClInclude Include="Code\MiniQtHelper.h" />
@@ -2206,18 +2210,42 @@
     <PropertyGroup>
       <RenderTestAgentBridgeSourceDir>$(SolutionDir)agent\bridge\rendertest_agent_bridge</RenderTestAgentBridgeSourceDir>
       <RenderTestAgentBridgeOutputDir>$(OutDir)integrations\rendertest_agent\python\rendertest_agent_bridge\</RenderTestAgentBridgeOutputDir>
+      <RenderTestAgentSkillsSourceDir>$(SolutionDir).agents\skills</RenderTestAgentSkillsSourceDir>
+      <RenderTestAgentSkillsOutputDir>$(OutDir)integrations\rendertest_agent\skills\</RenderTestAgentSkillsOutputDir>
+      <RenderTestAgentSkillsFallbackDir>$(OutDir)integrations\rendertest_agent\.agents\skills\</RenderTestAgentSkillsFallbackDir>
     </PropertyGroup>
     <ItemGroup>
       <RenderTestAgentBridgeSource Include="$(RenderTestAgentBridgeSourceDir)\**\*.py;$(RenderTestAgentBridgeSourceDir)\integration.json"
                                    Exclude="$(RenderTestAgentBridgeSourceDir)\**\__pycache__\**" />
+      <RenderTestAgentSkillName Include="rendertest-core;rendertest-event-analysis;rendertest-shader-debug;rendertest-pixel-investigation" />
+      <RenderTestAgentSkillSource Include="$(RenderTestAgentSkillsSourceDir)\rendertest-core\**\*">
+        <SkillName>rendertest-core</SkillName>
+      </RenderTestAgentSkillSource>
+      <RenderTestAgentSkillSource Include="$(RenderTestAgentSkillsSourceDir)\rendertest-event-analysis\**\*">
+        <SkillName>rendertest-event-analysis</SkillName>
+      </RenderTestAgentSkillSource>
+      <RenderTestAgentSkillSource Include="$(RenderTestAgentSkillsSourceDir)\rendertest-shader-debug\**\*">
+        <SkillName>rendertest-shader-debug</SkillName>
+      </RenderTestAgentSkillSource>
+      <RenderTestAgentSkillSource Include="$(RenderTestAgentSkillsSourceDir)\rendertest-pixel-investigation\**\*">
+        <SkillName>rendertest-pixel-investigation</SkillName>
+      </RenderTestAgentSkillSource>
     </ItemGroup>
     <Error Condition="!Exists('$(RenderTestAgentBridgeSourceDir)\__init__.py')"
            Text="RenderTest agent bridge package is missing: $(RenderTestAgentBridgeSourceDir)" />
+    <Error Condition="!Exists('$(RenderTestAgentSkillsSourceDir)\%(RenderTestAgentSkillName.Identity)\SKILL.md')"
+           Text="RenderTest agent skill is missing: %(RenderTestAgentSkillName.Identity)" />
     <RemoveDir Directories="$(RenderTestAgentBridgeOutputDir)" />
     <MakeDir Directories="@(RenderTestAgentBridgeSource->'$(RenderTestAgentBridgeOutputDir)%(RecursiveDir)')" />
     <Copy SourceFiles="@(RenderTestAgentBridgeSource)"
           DestinationFiles="@(RenderTestAgentBridgeSource->'$(RenderTestAgentBridgeOutputDir)%(RecursiveDir)%(Filename)%(Extension)')" />
     <Message Importance="high" Text="RenderTest agent bridge deployed to $(RenderTestAgentBridgeOutputDir)" />
+    <MakeDir Directories="@(RenderTestAgentSkillSource->'$(RenderTestAgentSkillsOutputDir)%(SkillName)\%(RecursiveDir)');@(RenderTestAgentSkillSource->'$(RenderTestAgentSkillsFallbackDir)%(SkillName)\%(RecursiveDir)')" />
+    <Copy SourceFiles="@(RenderTestAgentSkillSource)"
+          DestinationFiles="@(RenderTestAgentSkillSource->'$(RenderTestAgentSkillsOutputDir)%(SkillName)\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(RenderTestAgentSkillSource)"
+          DestinationFiles="@(RenderTestAgentSkillSource->'$(RenderTestAgentSkillsFallbackDir)%(SkillName)\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Message Importance="high" Text="RenderTest agent skills deployed with cwd fallback" />
   </Target>
   <ItemGroup>
     <ProjectTools Include="python_sheet" />

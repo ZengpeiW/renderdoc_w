@@ -380,6 +380,26 @@ DECLARE_REFLECTION_STRUCT(BugReport);
       "type: List[str]");                                                                          \
   CONFIG_SETTING(public, QVariantList, rdcarray<rdcstr>, TextureViewer_ShaderDirs)                 \
                                                                                                    \
+  DOCUMENT("The native Codex executable for the AI assistant. Empty selects automatic detection." \
+           "\n\n:type: str");                                                                    \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_CodexPath, "")                                \
+                                                                                                   \
+  DOCUMENT("The Python executable with the RenderTest MCP package installed."                     \
+           "\n\n:type: str");                                                                    \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_McpPython, "")                                \
+                                                                                                   \
+  DOCUMENT("The AI assistant model override. Empty follows the Codex configuration."                \
+           "\n\n:type: str");                                                                    \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_Model, "")                                    \
+                                                                                                   \
+  DOCUMENT("The reasoning effort override. Empty follows the Codex configuration."                  \
+           "\n\n:type: str");                                                                    \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_ReasoningEffort, "")                          \
+                                                                                                   \
+  DOCUMENT("Whether the AI assistant disables other MCP servers and optional capabilities."        \
+           "\n\n:type: bool");                                                                   \
+  CONFIG_SETTING_VAL(public, bool, bool, Agent_IsolateMcpServers, true)                             \
+                                                                                                   \
   DOCUMENT(                                                                                        \
       "``True`` if debugging should be enabled at startup for python, including UI extensions "    \
       "and scripts in the python shell.\n"                                                         \

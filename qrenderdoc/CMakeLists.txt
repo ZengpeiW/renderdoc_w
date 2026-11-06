@@ -428,6 +428,25 @@ add_custom_target(rendertest-agent-bridge ALL
     COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_BINARY_DIR}/bin/integrations/rendertest_agent/python/rendertest_agent_bridge
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${RENDERTEST_AGENT_BRIDGE_DIR} ${CMAKE_BINARY_DIR}/bin/integrations/rendertest_agent/python/rendertest_agent_bridge)
 
+# Both extraRoots and the cwd-based discovery fallback receive the same four skills.
+set(RENDERTEST_AGENT_SKILLS rendertest-core rendertest-event-analysis
+    rendertest-shader-debug rendertest-pixel-investigation)
+foreach(SKILL IN LISTS RENDERTEST_AGENT_SKILLS)
+    set(SKILL_SOURCE "${CMAKE_SOURCE_DIR}/.agents/skills/${SKILL}")
+    if(NOT EXISTS "${SKILL_SOURCE}/SKILL.md")
+        message(FATAL_ERROR "RenderTest agent skill is missing: ${SKILL_SOURCE}")
+    endif()
+    add_custom_command(TARGET rendertest-agent-bridge POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${SKILL_SOURCE}"
+            "${CMAKE_BINARY_DIR}/bin/integrations/rendertest_agent/skills/${SKILL}"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${SKILL_SOURCE}"
+            "${CMAKE_BINARY_DIR}/bin/integrations/rendertest_agent/.agents/skills/${SKILL}")
+    install(DIRECTORY "${SKILL_SOURCE}"
+            DESTINATION bin/integrations/rendertest_agent/skills)
+    install(DIRECTORY "${SKILL_SOURCE}"
+            DESTINATION bin/integrations/rendertest_agent/.agents/skills)
+endforeach()
+
 if(APPLE AND CMAKE_GENERATOR STREQUAL "Xcode")
     set_target_properties(build-qrenderdoc PROPERTIES XCODE_SCHEME_DEBUG_DOCUMENT_VERSIONING OFF)
     set_target_properties(build-qrenderdoc PROPERTIES XCODE_SCHEME_EXECUTABLE ${CMAKE_BINARY_DIR}/bin/qrendertest.app)

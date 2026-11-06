@@ -175,6 +175,8 @@ SOURCES += Code/qrenderdoc.cpp \
     Code/Agent/AgentLaunchConfig.cpp \
     Code/Agent/AgentAsk.cpp \
     Code/Agent/AgentMarkdown.cpp \
+    Code/Agent/AgentSettingsDialog.cpp \
+    Code/Agent/AgentToolView.cpp \
     Code/Agent/CodexAppServerClient.cpp \
     Code/ScintillaSyntax.cpp \
     Code/QRDUtils.cpp \
@@ -272,6 +274,8 @@ HEADERS += Code/CaptureContext.h \
     Code/Agent/AgentLaunchConfig.h \
     Code/Agent/AgentAsk.h \
     Code/Agent/AgentMarkdown.h \
+    Code/Agent/AgentSettingsDialog.h \
+    Code/Agent/AgentToolView.h \
     Code/Agent/CodexAppServerClient.h \
     Code/qprocessinfo.h \
     Code/ReplayManager.h \
@@ -455,4 +459,22 @@ HEADERS += $$_PRO_FILE_PWD_/3rdparty/scintilla/lexlib/*.h \
     $$_PRO_FILE_PWD_/3rdparty/scintilla/src/*.h \
     $$_PRO_FILE_PWD_/3rdparty/scintilla/qt/ScintillaEdit/*.h \
     $$_PRO_FILE_PWD_/3rdparty/scintilla/qt/ScintillaEditBase/*.h
+
+# The skills are standalone Markdown files. Deploy both extraRoots and cwd discovery layouts.
+RENDERTEST_AGENT_SKILLS = rendertest-core rendertest-event-analysis \
+    rendertest-shader-debug rendertest-pixel-investigation
+RENDERTEST_AGENT_RUNTIME = $$DESTDIR/integrations/rendertest_agent
+macx: RENDERTEST_AGENT_RUNTIME = $$DESTDIR/$${TARGET}.app/Contents/MacOS/integrations/rendertest_agent
+for(skill, RENDERTEST_AGENT_SKILLS) {
+    skill_source = $$_PRO_FILE_PWD_/../.agents/skills/$$skill/SKILL.md
+    !exists($$skill_source): error("RenderTest agent skill is missing: $$skill_source")
+    PRE_TARGETDEPS += $$skill_source
+    skill_destinations = $$RENDERTEST_AGENT_RUNTIME/skills/$$skill \
+        $$RENDERTEST_AGENT_RUNTIME/.agents/skills/$$skill
+    for(skill_destination, skill_destinations) {
+        skill_mkdir = $$replace(QMAKE_MKDIR_CMD, %1, $$shell_quote($$shell_path($$skill_destination)))
+        QMAKE_POST_LINK += $$escape_expand(\\n\\t) $$skill_mkdir
+        QMAKE_POST_LINK += $$escape_expand(\\n\\t) $$QMAKE_COPY $$shell_quote($$shell_path($$skill_source)) $$shell_quote($$shell_path($$skill_destination/SKILL.md))
+    }
+}
 

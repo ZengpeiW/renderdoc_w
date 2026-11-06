@@ -37,6 +37,11 @@ struct AgentItem
   QString progress;
   QString error;
   QString result;
+  // Parsed from the original MCP result envelope, before the displayed JSON is truncated.
+  // These are untrusted metadata; AgentToolView validates scope, path, size and digest.
+  QString artifactInstanceId;
+  QString artifactCaptureSessionId;
+  QJsonArray artifacts;
   qint64 durationMs = -1;
   // user messages: the context chips attached when it was sent
   QJsonArray context;

@@ -63,7 +63,7 @@ qrendertest.exe
 | `userMessage` | 用户气泡，下面列出发送时的上下文 chip |
 | `agentMessage` | Markdown 转 HTML，流式追加，每 50ms 节流重绘一次 |
 | `reasoning` | 默认折叠为一行“思考中…”，只展示 summary |
-| `mcpToolCall` | 默认折叠为一行工具卡：工具名、关键参数、耗时和 ✓/✗。点击展开参数 JSON 和结果，结果截断到 4KB |
+| `mcpToolCall` | 默认折叠为一行工具卡：工具名、关键参数、耗时和 ✓/✗。点击展开参数 JSON、错误和结果；按 UTF-8 字节截断，参数最多 8 KiB、结果最多 4 KiB |
 | `commandExecution` / `fileChange` | 显示服务端返回的实际状态；不能把所有项都标成“已拒绝”。shell 始终禁用，正常情况下不应出现命令项 |
 | `plan` / `webSearch` / 其它 | 灰色单行摘要，不报错 |
 
@@ -77,9 +77,9 @@ Qt 5.9.4 没有 `QTextDocument::setMarkdown`（5.14 才加），所以要自带�
 |---|---|---|
 | `EID 1459`、`EID: 1459`、`event 1459` | `rt://event/1459?source=<capture token>` | 先验证消息来源仍是当前 capture，再执行 `m_Ctx.SetEventID({}, 1459, 1459)` |
 | `ResourceId::116618` | `rt://resource/116618?source=<capture token>` | 校验来源后，纹理 → TextureViewer；buffer → BufferViewer；其它 → ResourceInspector |
-| 工具结果中 agent root 下的 png 文件 | `<img>` 缩略图（宽 256） | 点击用系统查看器打开 |
+| 工具结果 envelope 中的 PNG artifact | `<img>` 缩略图（最长边 256） | 再次完整校验后用系统查看器打开 |
 
-图片只允许 `RENDERTEST_AGENT_ROOT/artifacts/` 下的路径，其它路径一律不渲染。
+图片只接受 rendertest 工具完整 structuredContent 或文本 JSON envelope 中登记的 artifact（最多 8 个），在结果截断前提取。路径必须位于 `RENDERTEST_AGENT_ROOT/artifacts/<instanceId>/<captureSessionId>/`，身份取自同一 envelope。校验规范路径、实际打开文件、大小和完整 SHA-256，拒绝符号链接、Windows junction、伪 PNG 以及超过 8 MiB、单边超过 8192 或超过 16 MP 的图片。无效图片显示原因。`QTextBrowser` 禁止自动加载本地/网络资源，仅注入通过校验的内部图片资源；点击重新验证。
 
 每个消息记录由面板生成的 capture 生命周期 token；capture 加载/关闭时更换 token，旧消息保留旧 token。渲染时为所有 `rt://` 链接附加消息 token（包括模型原本写出的 Markdown 链接，不能信任其自带 token）。点击必须匹配当前 token 且当前实例/session 绑定仍有效，否则只提示引用已过期，不执行导航。
 
@@ -135,6 +135,8 @@ codex app-server generate-ts --out <dir>
 
 新增 `agent/devtools/appserver_schema_check.py`。它重新生成 TS 绑定，检查第 3.3–3.6 节用到的 method 和字段是否都还在，用于 codex 升级后的回归检查。
 
+M5c 的可复现检查已入库：schema 脚本在 Codex 0.162.1 上验证 31 个方法、123 个字段、11 个 feature 开关；`appserver_skills_check.py` 使用空的临时 CODEX_HOME，验证部署目录、仓库外空目录，以及不使用 extraRoots 的 cwd 回退三种情况。它们不调用模型，也不启动登录。浏览器登录完成流程仍需人工验收，自动化只验证 fake app-server 的成功、失败、取消和状态恢复。
+
 ### 3.2 进程启动
 
 由 `AgentLaunchConfig` 负责启动参数。
@@ -172,6 +174,8 @@ codex.exe app-server
 - `-c` 参数的格式与 `agent/devtools/codex_config.py` 中的 `cli_overrides()` 一致，C++ 侧照搬。
 - `shell_tool=false`、`unified_exec=false` 和 `web_search="disabled"` 始终设置，不受 MCP 隔离开关影响。其它 feature 开关在隔离打开时设置；关闭隔离继承用户其它能力，状态行显示“非隔离”。
 - 模型不硬编码。默认跟随用户 `config.toml` 的 `model`（本机是自定义 provider），面板显示 `thread/start` 返回的实际模型。
+  - `model/list` 完整读取分页，用条目的 `model` 作为请求值，不能使用目录 `id`；推理选项来自 `supportedReasoningEfforts[].reasoningEffort`。
+  - 设置保存到 `PersistentConfig`；环境变量 `RENDERTEST_AGENT_MODEL` / `RENDERTEST_AGENT_REASONING_EFFORT` 优先，分别传到 `thread/start.model` / `turn/start.effort`。自定义 provider 或目录不可用时允许手填字符串，空值表示跟随 Codex 配置。
 - **MCP Python** 的查找顺序：
   1. env `RENDERTEST_MCP_PYTHON`
   2. 设置项 `Agent_McpPython`
@@ -197,6 +201,9 @@ codex.exe app-server
 ```
 
 - **未登录**：仅当 `account` 为 `null` 且 `requiresOpenaiAuth=true` 时进入“未登录”状态；无需 OpenAI 凭据的自定义 provider 不受此条件阻塞。M5c 的“登录”按钮调用 `account/login/start {"type":"chatgpt"}`，用 `QDesktopServices` 打开返回的 `authUrl`，然后等待 `account/login/completed`。
+  - 未登录时保留已初始化进程；再次发送只重读 `account/read`。失败的原问题不自动重发。登录成功须匹配本次 `loginId`，重新读取账户并建立 thread，之后由用户重新发送。
+  - `account/login/cancel {"loginId":...}` 返回 `canceled` 时结束等待，忽略迟到完成；返回 `notFound` 时重新确认账号，不谎报取消成功。失败、进程退出、capture 变化均清理待登录状态。
+  - `account/updated` 后重新读取账号；退出登录时废弃 thread 并显示登录入口，若有运行中回合则先结束进程树。
 - **Skills**：调用 `skills/extraRoots/set {"extraRoots":["<exe>/integrations/rendertest_agent/skills"]}`，确保脱离仓库也能加载 4 个 rendertest Skill。这个方法是 experimental 的，失败时退回到依赖 cwd 下的 `.agents/skills`。
 - **隔离**：开关打开时（默认打开），调用 `config/read {"cwd":...}`，从 `config.mcp_servers` 中取出除 `rendertest` 以外的名字，在 `thread/start.config` 里逐个设为 `enabled:false`。
   - plugins/apps 带来的 `codex_apps`、`cua_repl` 等，由第 3.2 节的 feature 开关关闭。
@@ -300,13 +307,16 @@ codex.exe app-server
 | `qrenderdoc/Code/Agent/AgentLaunchConfig.{h,cpp}` | 查找 codex、MCP Python 和 skills 目录，组装启动参数和 developerInstructions | 250 |
 | `qrenderdoc/Code/Agent/AgentConversation.{h,cpp}` | thread、turn、item 的状态归约 | 400 |
 | `qrenderdoc/Code/Agent/AgentMarkdown.{h,cpp}` | 最小 Markdown 转 HTML，加 EID/ResourceId 链接化 | 350 |
+| `qrenderdoc/Code/Agent/AgentSettingsDialog.{h,cpp}` | 保存路径、模型、推理强度与隔离设置；动态模型目录 | 230 |
+| `qrenderdoc/Code/Agent/AgentToolView.{h,cpp}` | 工具卡展开、artifact 校验、缩略图与缓存 | 450 |
 | `qrenderdoc/Code/Agent/AgentAsk.{h,cpp}` | 各 viewer 调用的 `RequestAgentAsk(ICaptureContext&, AgentAskRequest)` | 80 |
 | `qrenderdoc/Windows/AgentChatPanel.{h,cpp,ui}` | 停靠面板：状态行、对话视图、上下文 chip、输入框、设置对话框，并实现 `ICaptureViewer` | 1000 |
 | `agent/devtools/fake_app_server.py` | 按脚本回放 JSON-RPC 的 fake app-server，并记录收到的消息 | 300 |
 | `agent/devtools/chat_panel_e2e.py` | 启动 qrendertest、注入 fake 或真实 codex，并检查日志和 transcript | 300 |
 | `agent/devtools/appserver_schema_check.py` | 协议回归检查 | 80 |
+| `agent/devtools/appserver_skills_check.py` | 无模型的真实部署 Skill 加载验证 | 180 |
 
-C++ 合计约 2700 行，Python 约 700 行。
+行数为初始估算；构建与验收以实际文件为准。
 
 ### 4.2 修改
 
@@ -319,7 +329,7 @@ C++ 合计约 2700 行，Python 约 700 行。
 | `qrenderdoc/Windows/TextureViewer.{h,cpp}` | 在 `OpenResourceContextMenu` 中加入“问 AI：这个资源”；在 Pixel Context 区用代码加一个“问 AI”按钮，不改 `.ui`。坐标、资源和子资源复用 `GetPickedLocation()`、`GetCurrentResource()`、`GetSelectedSubresource()` 以及 `ShowPixelHistory` 里的 mip/flipY 换算 |
 | `qrenderdoc/Windows/BufferViewer.cpp` | 在 `stageRowMenu` 中加入“问 AI：这个顶点” |
 | `qrenderdoc/Code/Interface/PersistentConfig.h` | 新增 `Agent_CodexPath`、`Agent_McpPython`、`Agent_Model`、`Agent_ReasoningEffort`、`Agent_IsolateMcpServers`（默认 true） |
-| `qrenderdoc/qrenderdoc_local.vcxproj` 和 `.filters` | 新增源文件、moc 和 uic；定义 `RENDERTEST_AGENT_SOURCE_DIR`；`DeployRenderTestAgentBridge` 额外把 `.agents/skills/rendertest-*` 复制到 `integrations/rendertest_agent/skills/` |
+| `qrenderdoc/qrenderdoc_local.vcxproj` 和 `.filters` | 新增源文件、moc 和 uic；定义 `RENDERTEST_AGENT_SOURCE_DIR`；`DeployRenderTestAgentBridge` 额外把 `.agents/skills/rendertest-*` 复制到 `integrations/rendertest_agent/skills/` 和同级 `.agents/skills/` |
 | `qrenderdoc/CMakeLists.txt`、`qrenderdoc/qrenderdoc.pro` | 同步新增源文件和 skills 部署 |
 | `.agents/skills/rendertest-core/SKILL.md` | 补一条规则：存在 `<rendertest_context>` 时直接使用其中的 instanceId 和 selection，不再询问用户 |
 
@@ -344,6 +354,10 @@ C++ 合计约 2700 行，Python 约 700 行。
 | M5d | 非 ephemeral thread、本地对话索引、历史列表、`thread/resume`，capture 不匹配时只读 | 重启 qrendertest 后能继续追问同一 capture |
 
 每个阶段完成后单独提交，沿用 M0–M4 的节奏。
+
+当前 M5a–M5c 已实现，M5d 尚未开始。M5c 已覆盖 fake 登录、模型目录和工具卡回归、真实 app-server 的部署 Skill 加载；真实浏览器授权尚待人工验收，不把 fake 成功等同于实际登录成功。
+
+2026-11-06 验证：MSBuild Release x64 成功；39 个 fake 界面场景通过；Python 测试 141 通过、2 个符号链接测试跳过；协议检查和 3 种部署 Skill 加载检查通过。已检查设置框与展开工具卡截图。CMake/qmake 同步清单，未在本次实际构建。
 
 ## 6. 验收方式
 
@@ -371,6 +385,8 @@ C++ 合计约 2700 行，Python 约 700 行。
 
 跨层回归：首次工具前和工具中切换 capture、同 RDC 重开、旧链接失效、固定实例不能覆盖、bridge 禁用时不连接其它实例。像素覆盖 UInt/SInt 类型解释和独立缓存/游标、非法平均 sample；artifact 覆盖分页/搜索、越界路径、旧 session、内容被修改和文件预算。
 
+M5c 回归覆盖：登录成功后重新发送、失败可恢复、取消后迟到成功通知不重启会话；未登录再次发送只重读账户、不重复 initialize；模型分页与 `.model`/`.id` 区分、自定义 provider 字符串、目录查询失败不阻止手填；工具卡展开、截断后的 artifact 元数据、合法 PNG 和越界/损坏/缺失图片。
+
 另外：
 
 - `InstanceId()` 的 manifest 扫描规则写成 `AgentLaunchConfig` 可测的纯函数：输入目录列表和 pid，输出 id。用 fake 目录覆盖多实例、stopped 和同 pid 残留三种情况。
@@ -379,7 +395,7 @@ C++ 合计约 2700 行，Python 约 700 行。
 ### B. 构建和加载
 
 - MSBuild Release x64 构建成功。CMake 和 `.pro` 的文件清单同步更新（只做清单检查，不实际构建）。
-- 部署后存在 `integrations/rendertest_agent/skills/rendertest-*/SKILL.md`。
+- 部署后存在 `integrations/rendertest_agent/skills/rendertest-*/SKILL.md` 和 `integrations/rendertest_agent/.agents/skills/rendertest-*/SKILL.md`，用 `appserver_skills_check.py` 验证两种发现方式。
 - 以下情况下 qrendertest 都能正常启动，且面板在没有 capture 时可以打开：
   - 没有安装 codex；
   - 设置了 `RENDERTEST_AGENT_BRIDGE=0`；

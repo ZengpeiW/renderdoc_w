@@ -1,4 +1,4 @@
-"""End-to-end checks for the qrendertest AI panel (M5a/M5b).
+"""End-to-end checks for the qrendertest AI panel (M5a-M5c).
 
 Usage:
     python devtools/chat_panel_e2e.py [--scenario all|A1|A2|...] [--exe qrendertest.exe]
@@ -210,7 +210,8 @@ def scenario_a1(run: Run) -> None:
     order = methods(received)
     expected = ["initialize", "initialized", "account/read", "skills/extraRoots/set", "config/read",
                 "thread/start", "mcpServerStatus/list", "turn/start"]
-    run.check(order[:len(expected)] == expected, f"request order {order}")
+    session_order = [method for method in order if method != "model/list"]
+    run.check(session_order[:len(expected)] == expected, f"request order {order}")
     start = next((m["params"] for m in received if m.get("method") == "thread/start"), {})
     instance = run.session().get("instanceId")
     run.check(bool(instance), "panel did not find the bridge instance id")
@@ -250,7 +251,7 @@ def scenario_a2(run: Run) -> None:
         tool = tools[0]
         run.check(tool.get("tool") == "get_context" and tool.get("server") == "rendertest", f"tool {tool}")
         run.check(tool.get("status") == "completed" and tool.get("durationMs") == 123, f"tool {tool}")
-        run.check(tool.get("progress") == "reading context", f"progress {tool.get('progress')}")
+        run.check(not tool.get("progress"), f"completed tool retained progress text: {tool.get('progress')}")
         run.check('"eventId":1513' in tool.get("result", ""), f"result {tool.get('result')}")
     run.check([r.get("status") for r in run.results()] == ["completed"], f"results {run.results()}")
 
@@ -324,7 +325,12 @@ def scenario_a6_logged_out(run: Run) -> None:
     run.check(run.session().get("state") == "notLoggedIn", f"state {run.session().get('state')}")
     run.check([r.get("status") for r in run.results()] == ["failed"], f"results {run.results()}")
     run.check("thread/start" not in methods(run.received()), "thread started while logged out")
-    run.check("codex login" in " ".join(i.get("text", "") for i in run.items("notice")), "no login hint")
+    run.check("Click Log in" in " ".join(i.get("text", "") for i in run.items("notice")),
+              "no hint for the panel's login entry")
+    run.check(run.session().get("loginVisible") is True and run.session().get("loginEnabled") is True,
+              "logged-out panel has no usable login button")
+    run.check(run.session().get("appServerRunning") is True,
+              "logged-out panel discarded the initialized login process")
 
 
 def scenario_a6_bad_codex(run: Run) -> None:
@@ -519,6 +525,155 @@ def scenario_command_status(run: Run) -> None:
               f"command/file status misrepresented: {items}")
 
 
+def scenario_login(run: Run) -> None:
+    scenario = run.name.removeprefix("C-")
+    success = scenario == "login-success"
+    settings: dict[str, Any] = {"questions": ["before login", "after login"] if success else ["before login"],
+                                "autoLogin": True}
+    if scenario == "login-cancel":
+        settings["cancelLoginAfterMs"] = 50
+    run.launch(settings, fake_env(run, scenario))
+    if not run.wait_transcript(60):
+        return
+    received = run.received()
+    login_requests = [m for m in received if m.get("method") == "account/login/start"]
+    run.check(len(login_requests) == 1 and login_requests[0]["params"].get("type") == "chatgpt",
+              f"login requests: {login_requests}")
+    urls = run.session().get("authUrls", [])
+    run.check(len(urls) == 1 and urls[0].startswith("https://example.invalid/rendertest-login/"),
+              f"test browser URL was not captured: {urls}")
+    expected_status = {"login-success": "completed", "login-failure": "failed", "login-cancel": "canceled"}[scenario]
+    run.check(run.session().get("loginStatus") == expected_status, f"login state {run.session()}")
+    expected_turns = ["failed", "completed"] if success else ["failed"]
+    run.check([r.get("status") for r in run.results()] == expected_turns, f"results {run.results()}")
+    if success:
+        run.check(len(turn_texts(run)) == 1 and turn_texts(run)[0].endswith("after login"),
+                  "failed pre-login question was sent or post-login question was lost")
+        run.check(len([m for m in received if m.get("method") == "account/read"]) >= 2,
+                  "account details were not refreshed after login")
+    else:
+        run.check("thread/start" not in methods(received) and "turn/start" not in methods(received),
+                  "chat started without successful login")
+    if scenario == "login-cancel":
+        cancel = [m for m in received if m.get("method") == "account/login/cancel"]
+        run.check(len(cancel) == 1 and bool(cancel[0]["params"].get("loginId")), f"cancel request {cancel}")
+        late = [event for event in read_jsonl(run.fake_log) if event.get("event") == "late-login-completion"]
+        run.check(len(late) == 1 and cancel and late[0].get("loginId") == cancel[0]["params"].get("loginId"),
+                  "fixture did not send the canceled login's racing completion")
+    if scenario == "login-failure":
+        run.check("fake login rejected" in " ".join(i.get("text", "") for i in run.items("notice")),
+                  "login error was not shown")
+
+
+def scenario_auth_retry(run: Run) -> None:
+    recovered = run.name in ("C-auth-recovered", "C-login-not-found")
+    canceled = run.name == "C-login-cancel-retry"
+    scenario = "login-cancel" if canceled else ("login-not-found" if run.name == "C-login-not-found" else
+                                               "auth-recovered" if recovered else "logged-out")
+    autotest: dict[str, Any] = {"questions": ["first attempt", "second attempt"]}
+    if canceled or scenario == "login-not-found":
+        autotest.update(autoLogin=True, cancelLoginAfterMs=50)
+    run.launch(autotest, fake_env(run, scenario))
+    if not run.wait_transcript(60):
+        return
+    received = run.received()
+    run.check(methods(received).count("initialize") == 1, "existing app-server was initialized again")
+    run.check(len(run.fake_pids()) == 1, "auth retry unnecessarily restarted the app-server")
+    run.check(methods(received).count("account/read") >= 2, "auth retry did not refresh account state")
+    expected = ["failed", "completed"] if recovered else ["failed", "failed"]
+    run.check([r.get("status") for r in run.results()] == expected, f"results {run.results()}")
+    run.check(len(turn_texts(run)) == (1 if recovered else 0), "pre-login prompt reached a model turn")
+    if canceled:
+        run.check(run.session().get("loginStatus") == "canceled", "late completion undid login cancellation")
+    if scenario == "login-not-found":
+        run.check(run.session().get("loginStatus") != "canceled", "notFound was reported as a canceled login")
+        run.check(methods(received).count("account/login/cancel") == 1, "missing cancel race")
+
+
+def scenario_account_updated(run: Run) -> None:
+    run.launch({"questions": ["before account expires"]}, fake_env(run, "account-updated"))
+    if not run.wait_transcript(60):
+        return
+    received = run.received()
+    run.check(methods(received).count("initialize") == 1 and len(run.fake_pids()) == 1,
+              "idle account transition unnecessarily restarted or reinitialized app-server")
+    run.check(methods(received).count("account/read") >= 2, "account/updated did not refresh account state")
+    run.check(run.session().get("state") == "notLoggedIn", f"account state {run.session().get('state')}")
+    run.check(run.session().get("loginVisible") is True and run.session().get("loginEnabled") is True,
+              "expired account has no usable login entry")
+    run.check(run.session().get("appServerRunning") is True, "initialized login process was discarded")
+    run.check(run.transcript.get("threadId") == "", "old account's thread remains active")
+    run.check([r.get("status") for r in run.results()] == ["completed"], f"finished turn was changed: {run.results()}")
+
+
+def scenario_model_settings(run: Run) -> None:
+    catalog_error = run.name == "C-model-error"
+    custom = run.name == "C-custom-model" or catalog_error
+    selected_model = "custom-provider-model" if custom else "fake-deep"
+    selected_effort = "custom-effort" if custom else "ultra"
+    settings = {"codexPath": str(run.root / "missing-settings-codex.exe"),
+                "model": selected_model, "reasoningEffort": selected_effort, "isolate": False}
+    env = fake_env(run, "model-error" if catalog_error else "model-pages")
+    # The test setting controls isolation; the explicit fake command still outranks codexPath.
+    env.pop("RENDERTEST_AGENT_ISOLATE")
+    autotest = {"questions": ["hello"], "settings": settings}
+    if run.name == "C-model-settings":
+        autotest["settingsScreenshot"] = str(run.root / "model-settings.png")
+    run.launch(autotest, env)
+    if not run.wait_transcript(60):
+        return
+    received = run.received()
+    start = next((m["params"] for m in received if m.get("method") == "thread/start"), {})
+    turn = next((m["params"] for m in received if m.get("method") == "turn/start"), {})
+    run.check(start.get("model") == selected_model, f"thread model {start.get('model')}")
+    run.check(turn.get("effort") == selected_effort, f"turn effort {turn.get('effort')}")
+    run.check(run.session().get("selectedModel") == selected_model and
+              run.session().get("selectedEffort") == selected_effort, "model/effort settings were not preserved")
+    run.check([r.get("status") for r in run.results()] == ["completed"], f"results {run.results()}")
+    argv = next((e["argv"] for e in read_jsonl(run.fake_log) if e.get("event") == "start"), [])
+    run.check("features.shell_tool=false" in argv and "features.unified_exec=false" in argv,
+              "settings isolation switch re-enabled shell tools")
+    if not catalog_error:
+        queries = [m["params"] for m in received if m.get("method") == "model/list"]
+        run.check(any(q.get("cursor") == "models-page2" for q in queries), f"model pagination {queries}")
+        models = run.session().get("models", [])
+        run.check({m.get("model") for m in models} >= {"fake-model", "fake-deep"}, f"model catalog {models}")
+        run.check(all(m.get("id") != m.get("model") for m in models), "fixture did not distinguish catalog id from model name")
+    if run.name == "C-model-settings":
+        dialog = run.transcript.get("autotest", {}).get("settingsDialog", {})
+        run.check(dialog.get("model") == selected_model and dialog.get("effort") == selected_effort,
+                  f"dialog used catalog id instead of model value: {dialog}")
+        run.check(dialog.get("modelCount", 0) >= 3 and dialog.get("effortEditable") is False,
+                  f"dialog did not use catalog-supported model/effort choices: {dialog}")
+
+
+def scenario_tool_artifacts(run: Run) -> None:
+    rejected = run.name == "C-tool-artifacts-rejected"
+    run.launch({"questions": ["show the texture"], "clickLinks": ["first-tool", "first-artifact"]},
+               fake_env(run, "tool-artifacts-rejected" if rejected else "tool-artifacts"))
+    if not run.wait_transcript(60):
+        return
+    tools = run.items("tool")
+    run.check(len(tools) == 1, f"tool cards {tools}")
+    if tools:
+        run.check("ARGUMENT_END_MARKER" in tools[0].get("arguments", ""), "expanded arguments were truncated to the old one-line limit")
+        run.check(len(tools[0].get("result", "").encode("utf-8")) <= 4096, "tool result exceeded its display budget")
+        run.check("valid.png" not in tools[0].get("result", ""), "fixture failed to put artifacts beyond display truncation")
+        run.check(len(tools[0].get("artifacts", [])) == 4, "image metadata was lost to result truncation")
+    auto = run.transcript.get("autotest", {})
+    html = auto.get("renderedHtml", "")
+    run.check("ARGUMENT_END_MARKER" in html and "RESULT_VISIBLE_MARKER" in html,
+              "tool expansion did not show arguments and result preview")
+    run.check(len(auto.get("expandedTools", [])) == 1, "tool card did not expand")
+    run.check(html.count("<img ") == 1 and "agent-image://" in html, "PNG preview accepted unsafe files or omitted the valid image")
+    run.check(html.count("Image unavailable") == 3, "unsafe or unreadable PNGs were not rejected")
+    clicks = auto.get("linkClicks", [])
+    run.check([click.get("ok") for click in clicks] == [True, not rejected], f"tool/artifact clicks {clicks}")
+    if rejected:
+        run.check(clicks and clicks[-1].get("link", "").startswith("agent-artifact://"),
+                  "unsafe artifact was never clicked")
+
+
 SCENARIOS: dict[str, Callable[[Run], None]] = {
     "A1": scenario_a1,
     "A2": scenario_a2,
@@ -541,6 +696,19 @@ SCENARIOS: dict[str, Callable[[Run], None]] = {
     "guard-disabled-bridge": scenario_disabled_bridge,
     "guard-reference-scope": scenario_reference_scope,
     "guard-command-status": scenario_command_status,
+    "C-login-success": scenario_login,
+    "C-login-failure": scenario_login,
+    "C-login-cancel": scenario_login,
+    "C-auth-retry": scenario_auth_retry,
+    "C-auth-recovered": scenario_auth_retry,
+    "C-login-cancel-retry": scenario_auth_retry,
+    "C-login-not-found": scenario_auth_retry,
+    "C-account-updated": scenario_account_updated,
+    "C-model-settings": scenario_model_settings,
+    "C-custom-model": scenario_model_settings,
+    "C-model-error": scenario_model_settings,
+    "C-tool-artifacts": scenario_tool_artifacts,
+    "C-tool-artifacts-rejected": scenario_tool_artifacts,
     "exit": scenario_exit,
 }
 

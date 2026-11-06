@@ -141,6 +141,12 @@
     <ClCompile Include="Code\Agent\AgentMarkdown.cpp">
       <Filter>Code\Agent</Filter>
     </ClCompile>
+    <ClCompile Include="Code\Agent\AgentSettingsDialog.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\Agent\AgentToolView.cpp">
+      <Filter>Code\Agent</Filter>
+    </ClCompile>
     <ClCompile Include="Code\Agent\CodexAppServerClient.cpp">
       <Filter>Code\Agent</Filter>
     </ClCompile>
@@ -855,6 +861,12 @@
       <Filter>Code\Agent</Filter>
     </ClInclude>
     <ClInclude Include="Code\Agent\AgentMarkdown.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\AgentSettingsDialog.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\Agent\AgentToolView.h">
       <Filter>Code\Agent</Filter>
     </ClInclude>
     <ClInclude Include="Code\qprocessinfo.h">
