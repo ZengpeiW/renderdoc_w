@@ -48,7 +48,7 @@ def test_tool_annotations_follow_effects() -> None:
 
     read_only = {name for name, tool in tools.items() if tool.annotations.readOnlyHint}
     assert read_only == set(TOOL_NAMES) - {"set_event", "export_texture", "debug_pixel",
-                                              "debug_vertex"}
+                                              "debug_vertex", "get_shader_source"}
     for tool in tools.values():
         assert tool.annotations.destructiveHint is False
         assert tool.annotations.openWorldHint is False
@@ -63,12 +63,15 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "get_context": {},
             "list_actions": {"parent_event_id": 1, "limit": 2},
             "find_actions": {"query": "draw", "flags": ["draw"]},
+            "get_action_stats": {"parent_event_id": 1, "limit": 2, "top_n": 1},
             "inspect_event": {"event_id": 30},
             "set_event": {"event_id": 20},
             "get_pipeline_state": {"event_id": 20},
             "get_shader": {"event_id": 30, "stage": "pixel", "include_disassembly": True},
+            "get_shader_source": {"event_id": 30, "stage": "pixel", "file_index": 0},
             "get_cbuffer": {"event_id": 30, "stage": "pixel", "index": 0},
             "list_resources": {"kind": "texture"},
+            "get_resource_stats": {"kind": "all", "top_n": 1},
             "get_resource": {"resource_id": "1001"},
             "get_resource_usage": {"resource_id": "1001"},
             "export_texture": {"resource_id": "1001", "event_id": 30},
@@ -85,6 +88,10 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
         results["read_artifact"] = structured(call_tool(
             server, "read_artifact", {"path": results["debug_pixel"]["artifacts"][0]["path"]}
         ))
+        source = structured(call_tool(server, "read_artifact", {
+            "path": results["get_shader_source"]["data"]["sourceArtifact"],
+            "search": "float4", "limit": 1,
+        }))
 
     assert set(results) == set(TOOL_NAMES)
     assert results["list_instances"]["data"]["instances"][0]["instanceId"] == bridge.instance_id
@@ -101,6 +108,14 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["get_mesh_data"]["data"]["columns"][0]["systemValue"] == "Position"
     assert len(results["get_mesh_data"]["data"]["rows"]) == 4
     assert results["get_mesh_data"]["nextCursor"]
+    assert results["get_action_stats"]["data"]["counts"]["draw"] == 2
+    assert results["get_action_stats"]["data"]["groups"][0]["action"]["eventId"] == 10
+    assert results["get_action_stats"]["data"]["topDraws"]["actions"][0]["indexOrVertexInvocations"] == 36
+    assert results["get_resource_stats"]["data"]["resourceCount"] == 4
+    assert results["get_resource_stats"]["data"]["knownTotalBytes"] == 448
+    assert results["get_resource_stats"]["data"]["hasMoreLargest"]
+    assert results["get_shader_source"]["effect"] == "artifact"
+    assert source["data"]["lines"][0]["text"] == "float4 main() : SV_Target { return 1; }"
     artifact = results["export_texture"]["artifacts"][0]
     assert Path(artifact["path"]).read_bytes().startswith(b"\x89PNG")
 

@@ -9,19 +9,28 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
 - M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
+- 分析工具扩展：Shader 内嵌源码读取、资源大小统计、事件统计；当前共 26 个 MCP 工具，Codex 和 Claude 共用。
 
 ## P0 工具
 
 | 分类 | 工具 |
 | --- | --- |
 | 实例/上下文 | `list_instances`、`get_status`、`get_context`（含当前 EID 的 Pipeline 摘要） |
-| Action | `list_actions`、`find_actions`、`inspect_event`、`set_event`（唯一会改变 UI 的工具） |
-| Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_cbuffer` |
-| 资源 | `list_resources`、`get_resource`、`get_resource_usage` |
+| Action | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`set_event`（唯一会改变 UI 的工具） |
+| Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`get_cbuffer` |
+| 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
 | Buffer | `get_buffer_data`（64 KiB 内 base64，1 KiB 内附 hex，更大写 artifact；`format="float4, uint"` 可解码行） |
 | 消息 | `get_debug_messages` |
 | 文本 artifact | `read_artifact`（MCP 本地只读，不经 replay） |
+
+新增分析接口：
+
+- `get_shader_source(stage, event_id=None, file_index=None, cursor=None, limit=100)`：省略 `file_index` 返回完整内嵌源码目录，可分页；指定索引导出 UTF-8 `sourceArtifact`，用 `read_artifact` 分页或搜索。文件名仅作标识，不从宿主机读取同名文件；重名文件按索引区分。没有嵌入源码时明确返回 `available=false`，不会把反汇编冒充源码。单文件上限 64 MiB，空文件和 BOM 原样保留，非法 UTF-8 或含 NUL 的内容明确不可用。单行超过文本工具 128 KiB JSON 预算时，源码仍完整导出，但 `readArtifactCompatible=false` 和 warning 会说明该行不能分页读取。
+- `get_resource_stats(kind="all", top_n=20)`：汇总 texture/buffer 数量、`knownTotalBytes`，按类型/纹理格式/维度类型分组，返回最大的资源。`all` 只包括纹理和缓冲；大小来自 texture `byteSize` 和 buffer `length`，不表示驻留、峰值或去重后的实际显存分配。未知大小计入 `unknownSizeCount`，不混成 0，也不参与排名。分类最多 256 组、Top N 最多 1000，省略内容显式标记。
+- `get_action_stats(parent_event_id=None, cursor=None, limit=200, top_n=20)`：整帧或指定 action/marker 子树的事件类型计数，按直接子节点分组分页；总数与排名每页都覆盖完整范围。只计操作叶节点，容器与 marker 单独计数，排除父节点操作标志时给 warning；mesh/ray dispatch 单独分类。Draw 排名依据 `numIndices * numInstances`，普通 compute dispatch 按组数排名；这些是记录的工作量估计，不是三角形数、唯一 VS 调用数或 GPU 耗时。
+
+三个接口都保持当前 UI EID。源码导出标记为 `artifact`，另外两个为 `read`。例如可以直接问：“列出当前 Pixel Shader 的源码文件并解释主函数”、“统计这一帧的纹理和 Buffer，列出最大的 10 个资源”、“统计 EID 123 所在 pass 的 draw/dispatch，并找出工作量最大的 draw”。
 
 ## P1 工具（M4）
 
@@ -66,8 +75,8 @@ agent/
 仓库根目录的 `.agents/skills/` 下有 4 个 Skill，在本仓库里运行 Codex 时会被发现。Skill 正文用英文（模型仍按用户语言回答）：Codex 在 Windows PowerShell 下读无 BOM 的中文 UTF-8 文件会乱码。
 
 - `rendertest-core`：目标选择、capture/session 身份、工具效果、实测与推断的区分。
-- `rendertest-event-analysis`：解释 EID/pass 的输入、计算和输出。
-- `rendertest-shader-debug`：Shader 反射、绑定、CBuffer 和反汇编，`debug_pixel` / `debug_vertex` 单步调试。
+- `rendertest-event-analysis`：解释 EID/pass 的输入、计算和输出，统计 frame/pass 事件及纹理/缓冲大小。
+- `rendertest-shader-debug`：Shader 内嵌源码、反射、绑定、CBuffer 和反汇编，`debug_pixel` / `debug_vertex` 单步调试。
 - `rendertest-pixel-investigation`：像素取值、用 `pixel_history` 找最后改变它的事件和失败原因，必要时 `debug_pixel` 看 Shader 计算；不支持时退回资源用途比较。
 
 ## 环境
@@ -102,6 +111,8 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --expect-
 
 # 启动 qrendertest 打开 capture，跑全部 P0 工具后退出
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc"
+# 只验证新增分析工具，明确选择 Draw EID，结束后退出独立进程
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --analysis-only --launch "E:\Captures\some.rdc" --event-id 3820
 # 额外检查指定像素的 pixel_history（可重复）
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc" --pixel-history 116618:1513:1:1
 # 额外对指定像素跑 debug_pixel（自动取 pixel_history 里通过的 primitive，可重复）

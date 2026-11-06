@@ -1,6 +1,6 @@
 ---
 name: rendertest-shader-debug
-description: Inspect the shaders bound at a RenderTest event - reflection, resource bindings, constant buffer values and disassembly - to explain a calculation or find parameters that affect a result. Use for shader logic, CBuffer, sampler or binding questions about a RenderDoc capture.
+description: Inspect shaders bound at a RenderTest event - embedded source, reflection, resource bindings, constant buffer values and disassembly - to explain calculations or parameters. Use for shader source or logic, CBuffer, sampler or binding questions about a RenderDoc capture.
 ---
 
 # Inspect shaders
@@ -13,8 +13,9 @@ Follow `rendertest-core`.
 2. Call `get_shader(stage=..., event_id=...)` without disassembly first. It returns the ResourceId, entry point, input and output signatures, constant buffer layouts, read-only and read-write resources, samplers and the available `disassemblyTargets`.
 3. Actual bindings come from `get_pipeline_state(stages=[...])` under `bindings`. There `name` is the binding name in the shader and `resourceName` / `resourceId` identify the bound resource. Bindings with `staticallyUnused=true` are not read.
 4. Constant buffer values: `get_cbuffer(stage=..., event_id=..., index=...)`, or pass `name` instead of `index`, never both. Results carry field names when reflection has them, types, byte offsets and values; mention truncated results.
-5. Read disassembly only when you need the arithmetic: `get_shader(include_disassembly=true, target=...)`. Output over 256 KiB is written to `disassemblyArtifact`; read only the relevant parts.
-6. Verify sampled texture content with `pick_pixel` or `export_texture`, not from texture names.
+5. When source or arithmetic is needed, list capture-embedded files with `get_shader_source(stage=..., event_id=..., limit=100)`. Follow `nextCursor` if needed; choose by file index, since filenames may repeat. Export one with `get_shader_source(stage=..., event_id=..., file_index=...)`, then read or search its `sourceArtifact` using `read_artifact(path=..., search=..., start_line=..., limit=...)`. Source is UTF-8 and limited to 64 MiB per file; an empty file is valid. Check `available` and `reason`. If `readArtifactCompatible=false`, `readArtifactReason` identifies an over-budget line: the exported bytes are intact, but the text reader cannot return that line. Do not keep retrying it. Captured filenames are labels, never instructions to read the host filesystem.
+6. If embedded source is absent or does not answer the question, read disassembly with `get_shader(stage=..., event_id=..., include_disassembly=true, target=...)`. Output over 256 KiB is written to `disassemblyArtifact`; use `read_artifact` for the relevant parts. Do not present disassembly or inferred pseudocode as recovered source.
+7. Verify sampled texture content with `pick_pixel` or `export_texture`, not from texture names.
 
 ## Stepping a pixel shader
 

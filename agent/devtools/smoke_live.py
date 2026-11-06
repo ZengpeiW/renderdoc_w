@@ -3,10 +3,13 @@
 Usage:
     python devtools/smoke_live.py [--root DIR] [--instance-id ID] [--expect-capture] [--wait 30]
     python devtools/smoke_live.py --all-p0 [--launch FILE.rdc] [--exe qrendertest.exe]
+    python devtools/smoke_live.py --analysis-only [--event-id EID] [--launch FILE.rdc]
 
 Without ``--all-p0`` it checks ping/get_status/get_context. With ``--all-p0`` it calls every P0
 tool against the loaded capture and checks that read tools leave the UI event alone, that paging
 has no duplicates, that ``set_event`` moves the UI and that exported PNGs match the texture size.
+It also cross-checks frame/subtree statistics and verifies one embedded source through ArtifactReader.
+``--analysis-only`` runs only those new analysis checks, without pixel/mesh/debug comparisons.
 ``--launch`` starts qrendertest with the capture first and closes it with WM_CLOSE afterwards.
 """
 
@@ -32,6 +35,7 @@ if str(SOURCE_DIR) not in sys.path:
 
 from rendertest_mcp.errors import RenderTestAgentError  # noqa: E402
 from rendertest_mcp.ipc_client import BridgeClient  # noqa: E402
+from rendertest_mcp.artifacts import ArtifactReader, MAX_PAGE_BYTES  # noqa: E402
 
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 WM_CLOSE = 0x0010
@@ -67,6 +71,8 @@ class P0Smoke:
         self.instance_id = instance_id
         self.failures: list[str] = []
         self.timings: list[tuple[str, float, int]] = []
+        self.last_response = None
+        self.artifact_reader = ArtifactReader(client)
 
     def fail(self, message: str) -> None:
         self.failures.append(message)
@@ -75,6 +81,7 @@ class P0Smoke:
     def call(self, method: str, params: dict[str, Any] | None = None, *, expect_error: str | None = None,
              timeout: float | None = None) -> dict[str, Any] | None:
         start = time.perf_counter()
+        self.last_response = None
         try:
             response = self.client.call(method, params or {}, instance_id=self.instance_id,
                                         timeout=timeout)
@@ -87,6 +94,7 @@ class P0Smoke:
                 self.fail(f"{method}({params}) -> {error.code}: {error}")
             return None
         elapsed = (time.perf_counter() - start) * 1000
+        self.last_response = response
         size = len(json.dumps(response.result, ensure_ascii=False).encode("utf-8"))
         self.timings.append((method, elapsed, size))
         if expect_error:
@@ -139,6 +147,55 @@ class P0Smoke:
         self.fail("no probed draw had a bound colour target")
         return None
 
+    def run_analysis(self, max_draws: int = 12, event_id: int | None = None) -> None:
+        status = self.call("get_status")
+        if not status or not status["data"]["capture"]:
+            self.fail("get_status reports no capture")
+            return
+        print("capture:", json.dumps(status["data"]["capture"], ensure_ascii=False))
+        before = self.ui_events()
+        try:
+            print("[analysis actions]")
+            roots = self.page_all("list_actions", {"limit": 1000}, "actions", "eventId")
+            self.check_action_stats(None, roots)
+            if event_id is None:
+                picked = self.pick_draw(max_draws)
+                if picked is None:
+                    return
+                event_id, inspected = picked
+            else:
+                result = self.call("inspect_event", {"event_id": event_id})
+                if result is None:
+                    return
+                inspected = result["data"]
+                action = inspected.get("action") or {}
+                if (action.get("eventId") != event_id or
+                        not set(action.get("flags", [])).intersection(("Drawcall", "MeshDispatch"))):
+                    self.fail(f"explicit EID {event_id} is not a draw action")
+                    return
+            action = inspected["action"]
+            children = (self.page_all("list_actions", {"parent_event_id": event_id, "limit": 1000},
+                                      "actions", "eventId") if action["childCount"] else [])
+            self.check_action_stats(event_id, children, scope_action=action)
+            print(f"  analysis draw EID {event_id}: {action['name']}")
+
+            print("[analysis resources]")
+            buffers = self.page_all("list_resources", {"kind": "buffer", "limit": 1000},
+                                    "resources", "resourceId")
+            self.check_resource_stats(buffers)
+            print("[analysis shader sources]")
+            stages = list(inspected["pipeline"]["shaders"])
+            if stages:
+                self.check_shader_sources(event_id, stages)
+            else:
+                print("  no shader stages bound at the chosen draw; source check unavailable")
+        finally:
+            after = self.ui_events()
+            if after != before:
+                self.fail(f"analysis tools changed the UI event: {before} -> {after}")
+            else:
+                print(f"  UI event unchanged by analysis tools: selected/current {after}")
+
     def run(self, max_draws: int) -> None:
         status = self.call("get_status")
         if not status or not status["data"]["capture"]:
@@ -152,9 +209,13 @@ class P0Smoke:
         if not roots:
             self.fail("list_actions returned no root actions")
         parent = next((item for item in roots if item["childCount"]), None)
+        children = []
         if parent:
-            self.page_all("list_actions", {"parent_event_id": parent["eventId"], "limit": 7},
-                          "actions", "eventId")
+            children = self.page_all("list_actions", {"parent_event_id": parent["eventId"], "limit": 7},
+                                     "actions", "eventId")
+        self.check_action_stats(None, roots)
+        if parent:
+            self.check_action_stats(parent["eventId"], children)
         self.call("list_actions", {"parent_event_id": 10 ** 9}, expect_error="INVALID_EVENT")
         picked = self.pick_draw(max_draws)
         if picked is None:
@@ -171,6 +232,7 @@ class P0Smoke:
         for stage in stages:
             self.call("get_shader", {"event_id": event_id, "stage": stage,
                                      "include_disassembly": stage == "pixel"}, timeout=120)
+        self.check_shader_sources(event_id, stages)
         cbuffer_stage = next((stage for stage in ("pixel", "vertex", "mesh", "compute") if stage in stages
                               and (state or {}).get("data", {}).get("bindings", {}).get(stage, {})
                               .get("constantBlocks")), None)
@@ -185,6 +247,7 @@ class P0Smoke:
         textures = self.call("list_resources", {"kind": "texture", "limit": 20})
         buffers = self.page_all("list_resources", {"kind": "buffer", "limit": 500}, "resources",
                                 "resourceId")
+        self.check_resource_stats(buffers)
         large_buffer = next((item["resourceId"] for item in buffers
                              if item.get("byteLength", 0) > 128 * 1024), None)
         rt_id = target["resourceId"]
@@ -281,6 +344,159 @@ class P0Smoke:
             self.fail(f"after set_event the UI shows {selected}/{current}, expected {event_id}")
         if before[1] is not None:
             self.call("set_event", {"event_id": before[1]})
+
+    def check_action_stats(self, parent: int | None, expected_groups: list[dict],
+                           scope_action: dict | None = None) -> None:
+        """Check at most two group pages against the already fetched action lists."""
+        params = {"parent_event_id": parent, "limit": 7, "top_n": 3}
+        if parent is None:
+            del params["parent_event_id"]
+        first = self.call("get_action_stats", params)
+        if first is None:
+            return
+        baseline = first["data"]
+        groups = list(baseline["groups"])
+        cursor = first.get("nextCursor")
+        if cursor:
+            following = self.call("get_action_stats", dict(params, cursor=cursor))
+            if following is None:
+                return
+            data = following["data"]
+            for key in ("counts", "groupsTotal", "topDraws", "topDispatches"):
+                if data[key] != baseline[key]:
+                    self.fail(f"get_action_stats changed {key} between pages for {parent}")
+            groups.extend(data["groups"])
+            if following.get("nextCursor") == cursor:
+                self.fail("get_action_stats repeated its cursor")
+            cursor = following.get("nextCursor")
+        ids = [item["action"]["eventId"] for item in groups]
+        expected = [item["eventId"] for item in expected_groups]
+        if (baseline["groupsTotal"] != len(expected) or ids != expected[:len(ids)] or
+                len(ids) != len(set(ids)) or (bool(cursor) != (len(ids) < len(expected)))):
+            self.fail(f"get_action_stats group paging disagrees with list_actions for {parent}")
+        if cursor is None:
+            summed = {key: sum(group["counts"][key] for group in groups)
+                      for key in baseline["counts"]}
+            if parent is None and summed != baseline["counts"]:
+                self.fail("frame get_action_stats counts differ from the sum of root groups")
+            has_children = bool(scope_action["childCount"]) if scope_action else bool(expected_groups)
+            self_operations = baseline["counts"]["operationCount"] - summed["operationCount"]
+            if parent is not None and (baseline["counts"]["actionCount"] != summed["actionCount"] + 1 or
+                                       self_operations not in ((0,) if has_children else (0, 1))):
+                self.fail("subtree get_action_stats did not count its own action exactly once")
+        print(f"  action stats scope {parent}: {baseline['counts']['operationCount']} operations; "
+              f"checked {len(ids)}/{len(expected)} immediate-child groups (two-page budget)")
+
+    def check_resource_stats(self, buffers: list[dict]) -> None:
+        complete = self.call("get_resource_stats", {"kind": "all", "top_n": 5})
+        filtered = self.call("get_resource_stats", {"kind": "buffer", "top_n": 5})
+        if complete is None or filtered is None:
+            return
+        data = filtered["data"]
+        sizes = [item.get("byteLength") for item in buffers]
+        valid = [size for size in sizes if type(size) is int and 0 <= size < ((1 << 64) - 1)]
+        expected = {"resourceCount": len(buffers), "knownSizeCount": len(valid),
+                    "unknownSizeCount": len(buffers) - len(valid), "knownTotalBytes": sum(valid),
+                    "totalBytesComplete": len(valid) == len(buffers)}
+        if any(data.get(key) != value for key, value in expected.items()):
+            self.fail(f"buffer resource stats disagree with paged list_resources: expected {expected}")
+        group = next((item for item in complete["data"]["byKind"]["groups"]
+                      if item["kind"] == "buffer"), None)
+        if ((group is None and buffers) or
+                (group is not None and any(group.get(key) != value for key, value in expected.items()))):
+            self.fail("all-resource buffer group disagrees with filtered buffer statistics")
+        for summary in (complete["data"], data):
+            largest = summary["largestResources"]
+            ordering = [(-item["byteSize"], int(item["resourceId"])) for item in largest]
+            if ordering != sorted(ordering) or len(largest) > 5:
+                self.fail("resource statistics largestResources have invalid order or Top N size")
+            if summary["sizeBasis"] != "resource-description-bytes":
+                self.fail("resource stats did not identify its description-size basis")
+        print(f"  resource stats: {len(buffers)} buffers, {sum(valid)} known descriptor bytes; "
+              f"frame has {complete['data']['resourceCount']} textures/buffers")
+
+    def check_shader_sources(self, event_id: int, stages: list[str]) -> None:
+        """Read directories at this one draw, then verify one usable returned source artifact."""
+        candidates = []
+        for stage in stages:
+            params = {"event_id": event_id, "stage": stage, "limit": 100}
+            directory = self.call("get_shader_source", params)
+            if directory is None:
+                continue
+            data = directory["data"]
+            if not data["available"]:
+                if data["fileCount"] != 0 or data["files"] or not data.get("reason"):
+                    self.fail(f"{stage} unavailable source directory is inconsistent")
+                print(f"  {stage} source unavailable (valid): {data.get('reason')}")
+                continue
+            files = list(data["files"])
+            # One extra directory page is enough to exercise continuation without scanning shaders.
+            if directory.get("nextCursor"):
+                page = self.call("get_shader_source", dict(params, cursor=directory["nextCursor"]))
+                if page is not None:
+                    if page["data"]["fileCount"] != data["fileCount"]:
+                        self.fail(f"{stage} source fileCount changed between pages")
+                    files.extend(page["data"]["files"])
+            indices = [item["index"] for item in files]
+            if indices != list(range(len(indices))) or len(indices) > data["fileCount"]:
+                self.fail(f"{stage} source directory has missing or duplicate indices")
+            print(f"  {stage} source directory: checked {len(files)}/{data['fileCount']} files")
+            candidates.extend((stage, item) for item in files if item["available"] and
+                              item.get("readArtifactCompatible") is not False)
+        candidates.sort(key=lambda entry: entry[1].get("readArtifactCompatible") is not True)
+        for stage, source in candidates[:3]:
+            exported = self.call("get_shader_source", {"event_id": event_id, "stage": stage,
+                                                        "file_index": source["index"]})
+            if exported is None:
+                continue
+            artifacts = exported["artifacts"]
+            if len(artifacts) != 1 or not exported["data"].get("available"):
+                self.fail(f"{stage} source export did not return one available artifact")
+                continue
+            artifact = artifacts[0]
+            if (artifact["bytes"] != source["bytes"] or
+                    artifact["path"] != exported["data"].get("sourceArtifact")):
+                self.fail(f"{stage} source bytes/path disagree with directory or artifact metadata")
+                continue
+            # Registration uses the actual BridgeResponse, so the same scope/hash/path checks
+            # as MCP read_artifact run here. Never open source['filename'] on the host.
+            self.artifact_reader.register(self.last_response)
+            compatible = (source.get("readArtifactCompatible") is True or
+                          exported["data"].get("file", {}).get("readArtifactCompatible") is True)
+            try:
+                page = self.artifact_reader.read(artifact["path"], limit=2, max_bytes=MAX_PAGE_BYTES)
+                details = page["data"]
+                if details["bytes"] != artifact["bytes"] or details["sha256"] != artifact["sha256"]:
+                    self.fail("verified source artifact size/hash differs from its export metadata")
+                lines = details["lines"]
+                if details["nextLine"] is not None:
+                    next_page = self.artifact_reader.read(artifact["path"],
+                                                         start_line=details["nextLine"], limit=1,
+                                                         max_bytes=MAX_PAGE_BYTES)
+                    if not next_page["data"]["lines"] or next_page["data"]["lines"][0]["line"] != details["nextLine"]:
+                        self.fail("source artifact line pagination did not continue at nextLine")
+                nonempty = next((line for line in lines if line["text"]), None)
+                if nonempty:
+                    needle = nonempty["text"][:32]
+                    found = self.artifact_reader.read(artifact["path"], search=needle, limit=1,
+                                                     max_bytes=MAX_PAGE_BYTES)
+                    if not found["data"]["lines"] or needle not in found["data"]["lines"][0]["text"]:
+                        self.fail("source artifact literal search did not find its own first line")
+            except RenderTestAgentError as error:
+                if error.code in ("UNSUPPORTED", "LIMIT_EXCEEDED"):
+                    if compatible:
+                        self.fail(f"source {stage}[{source['index']}] claims read_artifact compatibility "
+                                  f"but reading failed: {error.code}: {error}")
+                        return
+                    print(f"  source {stage}[{source['index']}] is not line-readable: {error}")
+                    continue
+                self.fail(f"source artifact verification failed: {error.code}: {error}")
+                return
+            print(f"  source {stage}[{source['index']}]: verified SHA-256 and {artifact['bytes']} "
+                  "UTF-8 bytes through ArtifactReader, with line paging/search where applicable")
+            return
+        print("  no line-readable embedded source found in the bounded probe "
+              "(two directory pages/stage, three exports); no decompilation was attempted")
 
     def check_pixel_history(self, resource_id: str, event_id: int, x: int, y: int,
                             expected: list[Any] | None = None) -> dict | None:
@@ -528,7 +744,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--instance-id")
     parser.add_argument("--expect-capture", action="store_true")
     parser.add_argument("--wait", type=float, default=30.0)
-    parser.add_argument("--all-p0", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--all-p0", action="store_true")
+    mode.add_argument("--analysis-only", action="store_true",
+                      help="Check action/resource statistics and embedded source only.")
+    parser.add_argument("--event-id", type=int,
+                        help="Explicit draw EID for --analysis-only; otherwise probe for a draw.")
     parser.add_argument("--max-draws", type=int, default=40)
     parser.add_argument("--pixel-history", action="append", default=[],
                         metavar="RESOURCE:EID:X:Y",
@@ -545,6 +766,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--launch", type=Path, help="Start qrendertest with this capture first.")
     parser.add_argument("--exe", type=Path, default=REPO_DIR / "x64" / "Release" / "qrendertest.exe")
     args = parser.parse_args(argv)
+    if args.event_id is not None and (not args.analysis_only or args.event_id < 0):
+        parser.error("--event-id requires --analysis-only and a nonnegative draw EID")
 
     process = None
     if args.launch:
@@ -566,6 +789,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         instance_id = instance["instanceId"]
         print("instance:", json.dumps(instance, ensure_ascii=False))
+        if args.analysis_only:
+            smoke = P0Smoke(client, instance_id)
+            smoke.run_analysis(args.max_draws, args.event_id)
+            smoke.report()
+            print("PASS" if not smoke.failures else f"{len(smoke.failures)} check(s) failed")
+            return 0 if not smoke.failures else 1
         if args.all_p0:
             smoke = P0Smoke(client, instance_id)
             smoke.run(args.max_draws)

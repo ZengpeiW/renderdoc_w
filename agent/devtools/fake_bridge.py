@@ -366,6 +366,49 @@ class FakeRenderTestBridge:
             self._read_meta(params.get("event_id")),
         )
 
+    def _method_get_action_stats(self, params: dict[str, Any]) -> dict[str, Any]:
+        parent = params.get("parent_event_id")
+        root = 1 if parent is None else self._event_id({"event_id": parent})
+        nodes = [self._actions[root]]
+        for node in nodes:
+            nodes.extend(self._actions[event] for event in node["children"])
+        def count(items):
+            value = {kind: sum(kind in node["flags"] and not node["children"] for node in items)
+                     for kind in ("draw", "dispatch", "copy", "clear", "resolve", "present",
+                                  "meshDispatch", "rayDispatch", "genMips", "buildAccStruct")}
+            value.update(actionCount=len(items), operationCount=sum(value.values()),
+                         markerCount=sum("marker" in node["flags"] for node in items),
+                         containerCount=0, unclassifiedLeafCount=0, ambiguousOperationCount=0,
+                         excludedParentOperationCount=0)
+            return value
+
+        group_ids = [1] if parent is None else self._actions[root]["children"]
+        groups, cursor = self._page([
+            {"action": self._action_summary(event),
+             "counts": count(nodes if event == root else [self._actions[event]])}
+            for event in group_ids], params)
+        top_n = params.get("top_n", 20)
+        draws = sorted([dict(self._action_summary(node["eventId"]), numIndices=node["numIndices"],
+                             numInstances=node["numInstances"], indexed=False,
+                             indexOrVertexInvocations=node["numIndices"] * node["numInstances"])
+                        for node in nodes if "draw" in node["flags"]],
+                       key=lambda row: (-row["indexOrVertexInvocations"], row["eventId"]))
+        dispatches = [dict(self._action_summary(node["eventId"]), dispatchDimension=node["dispatchDimensions"],
+                           groupCount=node["dispatchDimensions"][0] * node["dispatchDimensions"][1] * node["dispatchDimensions"][2])
+                      for node in nodes if "dispatch" in node["flags"]]
+
+        def ranking(rows, metric, formula):
+            return {"metric": metric, "formula": formula, "candidateCount": len(rows),
+                    "rankableCount": len(rows), "unrankableCount": 0,
+                    "returnedCount": min(top_n, len(rows)), "truncated": len(rows) > top_n,
+                    "actions": rows[:top_n]}
+
+        return _payload({"parentEventId": parent, "counts": count(nodes), "groups": groups,
+                         "groupsTotal": len(group_ids), "topN": top_n,
+                         "topDraws": ranking(draws, "indexOrVertexInvocations", "numIndices * numInstances"),
+                         "topDispatches": ranking(dispatches, "groupCount", "x * y * z")},
+                        next_cursor=cursor)
+
     def _method_set_event(self, params: dict[str, Any]) -> BridgeResult:
         event_id = self._event_id(params, required=True)
         before = self.current_event_id
@@ -434,6 +477,29 @@ class FakeRenderTestBridge:
             self._read_meta(params.get("event_id")),
         )
 
+    def _method_get_shader_source(self, params: dict[str, Any]) -> BridgeResult:
+        event, shader = self._shader_id(params)
+        text = "// Embedded test source\nfloat4 main() : SV_Target { return 1; }\n"
+        source = {"index": 0, "filename": "capture-only/shader.hlsl",
+                  "bytes": len(text.encode("utf-8")), "available": True}
+        data = {"eventId": event, "stage": params["stage"], "shader": {"resourceId": shader},
+                "available": True, "fileCount": 1}
+        artifacts = []
+        if params.get("file_index") is None:
+            data["files"] = [source]
+        else:
+            if params["file_index"] != 0:
+                raise AgentBridgeError("INVALID_REQUEST", "Unknown embedded file index.")
+            directory = artifact_directory(str(self.root), self.instance_id, self.capture_session_id, "replay")
+            path = Path(directory) / f"shader-source-{uuid.uuid4().hex}.txt"
+            path.write_text(text, encoding="utf-8", newline="")
+            artifacts.append(describe_artifact(str(path), "shader-source", "text/plain; charset=utf-8",
+                                               source={"event": event, "stage": params["stage"],
+                                                       "shaderResourceId": shader, "fileIndex": 0,
+                                                       "filename": source["filename"]}))
+            data.update(file=source, sourceArtifact=str(path))
+        return BridgeResult(_payload(data, artifacts=artifacts), self._read_meta(event))
+
     def _method_list_resources(self, params: dict[str, Any]) -> dict[str, Any]:
         kind = params.get("kind")
         query = str(params.get("query") or "").casefold()
@@ -447,6 +513,18 @@ class FakeRenderTestBridge:
 
     def _method_get_resource(self, params: dict[str, Any]) -> dict[str, Any]:
         return _payload(self._resource(params))
+
+    def _method_get_resource_stats(self, params: dict[str, Any]) -> dict[str, Any]:
+        kind = params.get("kind", "all")
+        resources = [dict(item, byteSize=item.get("byteSize", 64)) for item in self._resources.values()
+                     if item["kind"] in ("texture", "buffer") and kind in ("all", item["kind"])]
+        resources.sort(key=lambda item: (-item["byteSize"], int(item["resourceId"])))
+        top = resources[:params.get("top_n", 20)]
+        return _payload({"kind": kind, "resourceCount": len(resources),
+                         "sizeBasis": "resource-description-bytes",
+                         "knownTotalBytes": sum(item["byteSize"] for item in resources),
+                         "totalBytesComplete": True, "largestResources": top,
+                         "hasMoreLargest": len(top) < len(resources)})
 
     def _method_get_resource_usage(self, params: dict[str, Any]) -> dict[str, Any]:
         resource = self._resource(params)

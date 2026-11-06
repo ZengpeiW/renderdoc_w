@@ -1,6 +1,6 @@
 ---
 name: rendertest-event-analysis
-description: Explain what a RenderDoc event, draw, dispatch or pass does in a RenderTest capture - its inputs, shaders, render targets and effect on the frame. Use when asked what an EID or pass is doing, where a pass is, or why an event produces its output.
+description: Explain a RenderDoc event, draw, dispatch or pass in RenderTest, or summarize frame/pass operations and texture/buffer footprint. Use for EID/pass purpose, inputs and outputs, event counts, workload rankings or resource-size questions.
 ---
 
 # Explain an event
@@ -13,6 +13,13 @@ Follow `rendertest-core`.
 - Find events by name or type with `find_actions(query=..., flags=[...])`, for example flags `["draw"]`, `["dispatch"]` or `["clear"]`. An empty query filters by type only.
 - For the surrounding pass, read the `path` returned by `find_actions` or `inspect_event`, or expand markers with `list_actions(parent_event_id=...)`.
 - The EID may be a marker or a non-action API event. `inspect_event` reports `isAction` and the owning `action`.
+
+## Frame and pass summaries
+
+- For a frame overview, call `get_action_stats(top_n=20)` without `parent_event_id`; for a pass, pass its exact marker EID. The scope includes that action and its descendants. `groups` are immediate child subtrees, keyed by EID; identical names are not merged. Page with `cursor` when all groups matter. Scope totals and rankings cover the entire scope on every page.
+- `counts` separates operational leaves, markers and containers. Parent/container operation flags are excluded to avoid double counting; mention `excludedParentOperationCount` and warnings if present. Mesh and ray dispatches are separate categories. A single draw can be the scope even when it has no groups.
+- `topDraws` ranks recorded `numIndices * numInstances` as index/vertex invocations; this is not a triangle count or unique vertex shader executions. `topDispatches` ranks ordinary compute dispatch group counts. Neither ranking measures GPU cost, and invalid metadata is reported as unrankable. Follow a candidate with `inspect_event` before explaining it.
+- For texture/buffer size totals or largest resources, use `get_resource_stats(kind="all", top_n=20)` (`kind="texture"` or `kind="buffer"` narrows it). `all` covers textures and buffers only. Check `byKind`, `byTextureFormat`, `byTextureType` and `largestResources`; use exact ResourceIds to inspect candidates. Report known description bytes and unknown sizes, never call this resident/peak VRAM or a sum of unique allocations.
 
 ## Evidence
 

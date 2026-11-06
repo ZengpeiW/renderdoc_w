@@ -20,6 +20,7 @@ from .protocol import (EFFECT_ARTIFACT, EFFECT_READ, EFFECT_UI, LONG_TIMEOUT_SEC
 Stage = Literal["vertex", "hull", "domain", "geometry", "pixel", "compute", "amplification", "mesh"]
 ActionFlag = Literal["draw", "dispatch", "marker", "clear", "copy", "resolve", "present"]
 ResourceKind = Literal["texture", "buffer", "shader", "pipeline", "sampler", "other"]
+ResourceStatsKind = Literal["all", "texture", "buffer"]
 TextureFormat = Literal["png", "exr", "dds"]
 TextureChannels = Literal["rgba", "rgb", "r", "g", "b", "a", "depth", "stencil"]
 TextureTypeCast = Literal["Typeless", "Float", "UNorm", "SNorm", "UInt", "SInt", "UScaled",
@@ -47,6 +48,22 @@ Cursor = Annotated[str | None, Field(max_length=1024, description="Opaque pagina
 Limit = Annotated[int, Field(ge=1, le=1000, description="Maximum number of items to return.")]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 BufferSize = Annotated[int, Field(ge=1, le=16 * 1024 * 1024)]
+
+# Keep existing tools' coercion behavior unchanged; new selectors and budgets must not
+# silently turn JSON booleans, floats or strings into an event, file index or limit.
+StrictOptionalEventId = Annotated[
+    int | None,
+    Field(strict=True, ge=0, description="RenderDoc EID. Omit to use the current replay event."),
+]
+StrictOptionalParentId = Annotated[
+    int | None,
+    Field(strict=True, ge=0,
+          description="Action or marker EID selecting a subtree. Omit to summarize the whole frame."),
+]
+StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+StrictLimit = Annotated[
+    int, Field(strict=True, ge=1, le=1000, description="Maximum number of items to return.")
+]
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data", "pixel_history",
                                    "debug_pixel", "debug_vertex", "get_mesh_data"})
@@ -244,6 +261,28 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         )
 
     @tool()
+    async def get_action_stats(
+        parent_event_id: StrictOptionalParentId = None,
+        cursor: Cursor = None,
+        limit: StrictLimit = 200,
+        top_n: StrictLimit = 20,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Count operational leaf actions in the frame or one action subtree.
+
+        Returns counts, paged immediate-child groups, and bounded Draw/Dispatch rankings.
+        Containers and markers are counted separately to avoid counting multi-draw parents
+        twice. Draw rankings use numIndices * numInstances; compute rankings use group counts.
+        These are not triangle counts, measured shader invocations, or GPU timings. nextCursor
+        pages groups only; global counts and Top N rankings always cover the whole scope.
+        """
+        return await invoke(
+            "get_action_stats",
+            _clean_params(parent_event_id=parent_event_id, cursor=cursor, limit=limit, top_n=top_n),
+            instance_id=instance_id,
+        )
+
+    @tool()
     async def set_event(event_id: EventId, instance_id: InstanceId = None) -> dict[str, Any]:
         """Change the selected EID in the RenderTest UI."""
         return await invoke("set_event", {"event_id": event_id}, instance_id=instance_id)
@@ -302,6 +341,30 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         )
 
     @tool()
+    async def get_shader_source(
+        stage: Stage,
+        event_id: StrictOptionalEventId = None,
+        file_index: StrictNonNegativeInt | None = None,
+        cursor: Cursor = None,
+        limit: StrictLimit = 100,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """List embedded shader source files, or export one file as a UTF-8 text artifact.
+
+        Omit file_index to page the complete source directory; select its numeric index to
+        export one file (up to 64 MiB), then use read_artifact for line paging or search.
+        readArtifactCompatible/readArtifactReason flag lines exceeding the reader's budget.
+        Files come only from the capture's shader reflection, never from filesystem paths.
+        Reports unavailable when no source was embedded; this does not decompile bytecode.
+        """
+        return await invoke(
+            "get_shader_source",
+            _clean_params(stage=stage, event_id=event_id, file_index=file_index,
+                          cursor=cursor, limit=limit),
+            instance_id=instance_id,
+        )
+
+    @tool()
     async def list_resources(
         kind: ResourceKind | None = None,
         query: Annotated[str | None, Field(max_length=256)] = None,
@@ -320,6 +383,22 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
     async def get_resource(resource_id: ResourceId, instance_id: InstanceId = None) -> dict[str, Any]:
         """Read detailed metadata for one resource."""
         return await invoke("get_resource", {"resource_id": resource_id}, instance_id=instance_id)
+
+    @tool()
+    async def get_resource_stats(
+        kind: ResourceStatsKind = "all",
+        top_n: StrictLimit = 20,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Summarize texture/buffer counts, descriptor bytes, distributions and largest resources.
+
+        all includes textures and buffers only. Sizes are texture.byteSize / buffer.length,
+        not measured resident, peak, or unique-allocation GPU memory. Unknown sizes remain
+        explicit and are excluded from byte sums and size rankings. This is distinct from
+        get_texture_stats, which reads one texture view's pixel min/max values.
+        """
+        return await invoke("get_resource_stats", {"kind": kind, "top_n": top_n},
+                            instance_id=instance_id)
 
     @tool()
     async def get_resource_usage(

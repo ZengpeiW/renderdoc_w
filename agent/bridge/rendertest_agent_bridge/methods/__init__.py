@@ -1,7 +1,7 @@
-from . import (actions, buffers, debug, history, mesh, messages, pipeline, resources, status,
-               textures)
+from . import (action_stats, actions, buffers, debug, history, mesh, messages, pipeline,
+               resource_stats, resources, shader_source, status, textures)
 
 HANDLERS = {}
-for _module in (status, actions, pipeline, resources, textures, buffers, messages, history, debug,
-                mesh):
+for _module in (status, actions, action_stats, pipeline, shader_source, resources, resource_stats,
+                textures, buffers, messages, history, debug, mesh):
     HANDLERS.update(_module.HANDLERS)
