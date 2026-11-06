@@ -13,7 +13,10 @@
 #include <QProcessEnvironment>
 #include <QPushButton>
 #include <QStandardPaths>
+#include <QTimer>
 #include <QVBoxLayout>
+#include "AgentLaunchConfig.h"
+#include "CodexAppServerClient.h"
 #include "Code/Interface/PersistentConfig.h"
 #include "Code/QRDUtils.h"
 
@@ -39,12 +42,138 @@ bool ExecutableExists(const QString &path)
   QString found = QFileInfo(path).isAbsolute() ? path : QStandardPaths::findExecutable(path);
   return !found.isEmpty() && QFileInfo(found).isFile();
 }
+
+// Model discovery is independent of a capture or chat. In particular, opening Settings must not
+// require sending a question, starting a thread, or finding the MCP Python environment first.
+class ModelCatalog : public QObject
+{
+public:
+  typedef std::function<void(const QString &, const QJsonArray &, const QString &)> Update;
+  ModelCatalog(QObject *parent, Update update) : QObject(parent), m_Update(update)
+  {
+    m_Client = new CodexAppServerClient(this);
+    connect(m_Client, &CodexAppServerClient::processExited, this,
+            [this](int, bool, const QString &reason) {
+      if(m_Loading)
+        Fail(Translate("Codex stopped while loading models: %1").arg(reason));
+    });
+  }
+  ~ModelCatalog() { Cancel(); }
+
+  void Cancel()
+  {
+    ++m_Generation;
+    m_Loading = false;
+    m_Client->Kill();
+  }
+
+  void Start(const QString &codexPath)
+  {
+    Cancel();
+    const int generation = m_Generation;
+    PersistentConfig draft;
+    draft.Agent_CodexPath = codexPath.trimmed();
+    draft.Agent_IsolateMcpServers = true;
+    AgentLaunchConfig launch = AgentLaunchConfig::Resolve(QString(), QString(), QString(), draft);
+    if(!launch.error.isEmpty())
+    {
+      Fail(launch.error);
+      return;
+    }
+    launch.arguments << lit("-c") << lit("mcp_servers={}");
+    m_Loading = true;
+    m_Update(lit("starting"), QJsonArray(), Translate("Loading models from Codex..."));
+    QString error;
+    if(!m_Client->Start(launch.program, launch.arguments, launch.workingDir, error))
+    {
+      if(generation == m_Generation)
+        Fail(error);
+      return;
+    }
+    QJsonObject params;
+    params[lit("clientInfo")] = QJsonObject({{lit("name"), lit("qrendertest_settings")},
+                                             {lit("version"), QCoreApplication::applicationVersion()}});
+    params[lit("capabilities")] = QJsonObject({{lit("experimentalApi"), true}});
+    m_Client->Request(lit("initialize"), params, 15000,
+                      [this, generation](const QJsonValue &, const QJsonObject &error) {
+      if(generation != m_Generation)
+        return;
+      if(!error.isEmpty())
+      {
+        Fail(error[lit("message")].toString());
+        return;
+      }
+      m_Client->Notify(lit("initialized"), QJsonObject());
+      Read(generation, QString(), QJsonArray(), QStringList());
+    });
+  }
+
+private:
+  void Fail(const QString &error)
+  {
+    Cancel();
+    m_Update(lit("error"), QJsonArray(),
+             Translate("Could not load models: %1. You can still enter a model name manually.")
+                 .arg(error.isEmpty() ? Translate("Unknown error") : error));
+  }
+
+  void Read(int generation, const QString &cursor, const QJsonArray &models,
+             const QStringList &seen)
+  {
+    m_Update(lit("loading"), QJsonArray(), Translate("Loading models from Codex..."));
+    QJsonObject params;
+    params[lit("limit")] = 100;
+    if(!cursor.isEmpty())
+      params[lit("cursor")] = cursor;
+    m_Client->Request(lit("model/list"), params, 15000,
+                      [this, generation, models, seen](const QJsonValue &result,
+                                                       const QJsonObject &error) {
+      if(generation != m_Generation)
+        return;
+      const QJsonObject data = result.toObject();
+      if(!error.isEmpty() || !data[lit("data")].isArray() ||
+         (!data[lit("nextCursor")].isNull() && !data[lit("nextCursor")].isString()))
+      {
+        Fail(error.isEmpty() ? Translate("Invalid model catalog response")
+                            : error[lit("message")].toString());
+        return;
+      }
+      QJsonArray all = models;
+      for(const QJsonValue &model : data[lit("data")].toArray())
+        if(model.isObject() && !model.toObject()[lit("model")].toString().isEmpty())
+          all << model;
+      const QString next = data[lit("nextCursor")].toString();
+      if(all.size() > 10000 || (!next.isEmpty() && (seen.contains(next) || seen.size() >= 99)))
+      {
+        Fail(Translate("Model catalog pagination did not complete"));
+        return;
+      }
+      if(!next.isEmpty())
+      {
+        QStringList visited = seen;
+        visited << next;
+        Read(generation, next, all, visited);
+        return;
+      }
+      Cancel();
+      m_Update(lit("ready"), all, all.isEmpty()
+                   ? Translate("No models were returned. Enter a model name or follow Codex configuration.")
+                   : Translate("Models loaded. You can also enter a custom model name."));
+    });
+  }
+
+  CodexAppServerClient *m_Client = NULL;
+  Update m_Update;
+  int m_Generation = 0;
+  bool m_Loading = false;
+};
 }
 
 bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &models, QWidget *parent,
                                bool persist)
 {
   QDialog dialog(parent);
+  QJsonArray catalog = models;
   dialog.setObjectName(lit("agentSettings"));
   dialog.setWindowTitle(Translate("AI Assistant Settings"));
   dialog.setWindowFlags(dialog.windowFlags() & ~Qt::WindowContextHelpButtonHint);
@@ -105,15 +234,29 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
     model->setEditText(currentModel);
   form->addRow(Translate("Model"), model);
 
+  QWidget *catalogRow = new QWidget(&dialog);
+  QHBoxLayout *catalogLayout = new QHBoxLayout(catalogRow);
+  catalogLayout->setContentsMargins(0, 0, 0, 0);
+  QLabel *catalogStatus = new QLabel(Translate("Loading models from Codex..."), catalogRow);
+  catalogStatus->setObjectName(lit("agentModelsStatus"));
+  catalogStatus->setProperty("catalogState", lit("starting"));
+  catalogStatus->setWordWrap(true);
+  catalogStatus->setTextFormat(Qt::PlainText);
+  QPushButton *refresh = new QPushButton(Translate("Refresh"), catalogRow);
+  refresh->setObjectName(lit("agentModelsRefresh"));
+  catalogLayout->addWidget(catalogStatus, 1);
+  catalogLayout->addWidget(refresh);
+  form->addRow(QString(), catalogRow);
+
   QComboBox *effort = new QComboBox(&dialog);
   effort->setObjectName(lit("agentReasoningEffort"));
   effort->setEditable(true);
   effort->setInsertPolicy(QComboBox::NoInsert);
   effort->setEditText(QString(settings.Agent_ReasoningEffort).trimmed());
-  auto updateEfforts = [model, effort, models]() {
+  auto updateEfforts = [model, effort, &catalog](bool preserveCurrent) {
     QString selected = ComboValue(effort);
     QJsonArray supported;
-    for(const QJsonValue &value : models)
+    for(const QJsonValue &value : catalog)
     {
       QJsonObject descriptor = value.toObject();
       if(descriptor[lit("model")].toString() == ComboValue(model))
@@ -144,14 +287,23 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
         effort->addItem(name, name);
     }
     int index = effort->findData(selected);
+    // A catalog arriving in the background must not erase an in-progress or saved choice.
+    // Save validates unlisted efforts for known models and lets the user choose a supported value.
+    if(preserveCurrent && !custom && index < 0 && !selected.isEmpty())
+    {
+      effort->addItem(selected, selected);
+      index = effort->count() - 1;
+      effort->setItemData(index, Translate("This effort is not listed for the selected model."),
+                          Qt::ToolTipRole);
+    }
     effort->setCurrentIndex(index >= 0 ? index : 0);
     if(index < 0 && custom)
       effort->setEditText(selected);
     effort->blockSignals(false);
   };
-  updateEfforts();
+  updateEfforts(true);
   QObject::connect(model, &QComboBox::currentTextChanged, &dialog,
-                   [updateEfforts](const QString &) { updateEfforts(); });
+                   [updateEfforts](const QString &) { updateEfforts(false); });
   form->addRow(Translate("Reasoning effort"), effort);
 
   QCheckBox *isolate = new QCheckBox(Translate("Isolate other MCP servers and optional capabilities"),
@@ -203,6 +355,23 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
       message = Translate("The Codex executable was not found: %1").arg(codexPath);
     else if(!ExecutableExists(pythonPath))
       message = Translate("The MCP Python executable was not found: %1").arg(pythonPath);
+    if(message.isEmpty() && !ComboValue(effort).isEmpty())
+    {
+      for(const QJsonValue &value : catalog)
+      {
+        const QJsonObject descriptor = value.toObject();
+        if(descriptor[lit("model")].toString() != ComboValue(model))
+          continue;
+        const QJsonArray supported = descriptor[lit("supportedReasoningEfforts")].toArray();
+        bool listed = supported.isEmpty();
+        for(const QJsonValue &option : supported)
+          listed |= option.toObject()[lit("reasoningEffort")].toString() == ComboValue(effort);
+        if(!listed)
+          message = Translate("This model does not list reasoning effort '%1'. Choose Default or a supported value.")
+                        .arg(ComboValue(effort));
+        break;
+      }
+    }
     if(!message.isEmpty())
     {
       error->setText(message);
@@ -231,5 +400,57 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
     }
     dialog.accept();
   });
-  return RDDialog::show(&dialog) == QDialog::Accepted;
+  auto replaceCatalog = [model, &catalog, updateEfforts](const QJsonArray &models) {
+    const QString selected = ComboValue(model);
+    catalog = models;
+    model->blockSignals(true);
+    model->clear();
+    model->addItem(Translate("Follow Codex configuration"), QString());
+    for(const QJsonValue &value : catalog)
+    {
+      const QJsonObject descriptor = value.toObject();
+      const QString name = descriptor[lit("model")].toString();
+      if(name.isEmpty() || model->findData(name) >= 0)
+        continue;
+      model->addItem(name, name);
+      model->setItemData(model->count() - 1, descriptor[lit("description")].toString(), Qt::ToolTipRole);
+    }
+    const int index = model->findData(selected);
+    if(index >= 0)
+      model->setCurrentIndex(index);
+    else
+      model->setEditText(selected);
+    model->blockSignals(false);
+    updateEfforts(true);
+  };
+  ModelCatalog discovery(&dialog, [catalogStatus, replaceCatalog](const QString &state,
+                                                                 const QJsonArray &models,
+                                                                 const QString &message) {
+    if(state == lit("ready"))
+      replaceCatalog(models);
+    catalogStatus->setProperty("catalogState", state);
+    catalogStatus->setText(message);
+  });
+  QTimer refreshTimer(&dialog);
+  refreshTimer.setSingleShot(true);
+  refreshTimer.setInterval(300);
+  QObject::connect(&refreshTimer, &QTimer::timeout, &dialog,
+                   [&]() { discovery.Start(codex->text()); });
+  QObject::connect(refresh, &QPushButton::clicked, &dialog, [&]() {
+    refreshTimer.stop();
+    discovery.Start(codex->text());
+  });
+  QObject::connect(codex, &QLineEdit::textChanged, &dialog, [&]() {
+    discovery.Cancel();
+    replaceCatalog(QJsonArray());
+    catalogStatus->setProperty("catalogState", lit("starting"));
+    catalogStatus->setText(Translate("Loading models from Codex..."));
+    refreshTimer.start(300);
+  });
+  // Let the dialog paint before starting the discovery process.
+  refreshTimer.start(0);
+  const bool accepted = RDDialog::show(&dialog) == QDialog::Accepted;
+  refreshTimer.stop();
+  discovery.Cancel();    // Kill/fail callbacks while all captured dialog state is still alive.
+  return accepted;
 }

@@ -37,7 +37,8 @@ SCENARIOS = ("stream", "tool", "approvals", "interrupt", "hang", "crash-once", "
              "config-error", "config-malformed", "status-error", "status-foreign",
              "status-page-foreign", "status-pages", "status-loop", "turn-timeout-once",
              "late-items", "late-before-start", "late-response", "command-status", "explicit-links",
-             "login-success", "login-failure", "login-cancel", "model-pages", "model-error",
+             "login-success", "login-failure", "login-cancel", "model-pages", "model-error", "model-delayed",
+             "model-empty", "model-loop",
              "login-not-found", "auth-recovered", "account-updated", "tool-artifacts", "tool-artifacts-rejected",
              "persistent", "resume-failure", "resume-config-error", "resume-foreign", "resume-unsafe", "resume-replay")
 ANSWER = "Hello from the **fake** app-server.\n\n- EID 1513 draws the scene\n- uses `ResourceId::116618`"
@@ -195,15 +196,37 @@ class FakeAppServer:
             else:
                 self.respond(request_id, {"status": "notFound"})
         elif method == "model/list":
-            if self.scenario == "model-error":
-                self.send({"id": request_id, "error": {"code": -32000, "message": "model catalog unavailable"}})
+            if self.scenario in ("model-error", "model-empty"):
+                message = {"id": request_id}
+                if self.scenario == "model-error":
+                    message["error"] = {"code": -32000, "message": "model catalog unavailable"}
+                else:
+                    message["result"] = {"data": [], "nextCursor": None}
+                # Leave enough time for the UI hook to type before completion, independent of
+                # whether Python starts more quickly than the dialog's first 50 ms probe.
+                timer = threading.Timer(0.2, self.send, args=(message,))
+                timer.daemon = True
+                timer.start()
                 return
             models = [self.model("fake-model", "Fake model", ["low", "high"], "low", True),
                       self.model("fake-deep", "Fake deep model", ["medium", "ultra"], "medium", False)]
+            if self.scenario == "model-delayed":
+                self.log({"event": "model-list-delayed"})
+
+                def finish_models() -> None:
+                    self.log({"event": "model-list-response"})
+                    self.respond(request_id, {"data": models, "nextCursor": None})
+
+                timer = threading.Timer(2.0, finish_models)
+                timer.daemon = True
+                timer.start()
+                return
             if self.scenario == "model-pages":
                 second = bool(params.get("cursor"))
                 self.respond(request_id, {"data": models[1:] if second else models[:1],
                                           "nextCursor": None if second else "models-page2"})
+            elif self.scenario == "model-loop":
+                self.respond(request_id, {"data": models[:1], "nextCursor": "models-loop"})
             else:
                 self.respond(request_id, {"data": models, "nextCursor": None})
         elif method == "skills/extraRoots/set":

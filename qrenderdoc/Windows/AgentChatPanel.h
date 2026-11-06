@@ -218,6 +218,11 @@ private:
     QJsonObject settings;
     QString screenshot;
     QString settingsScreenshot;
+    QString settingsTypeModel;
+    QString settingsTypeEffort;
+    QString settingsSelectModel;
+    bool settingsAccept = false;
+    int settingsCloseAfterMs = 0;
     QString historyScreenshot;
     QJsonObject historyDialog;
     QJsonObject settingsDialog;

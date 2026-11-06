@@ -402,6 +402,8 @@ codex.exe app-server
 
 M5c 回归覆盖：登录成功后重新发送、失败可恢复、取消后迟到成功通知不重启会话；未登录再次发送只重读账户、不重复 initialize；模型分页与 `.model`/`.id` 区分、自定义 provider 字符串、目录查询失败不阻止手填；工具卡展开、截断后的 artifact 元数据、合法 PNG 和越界/损坏/缺失图片。
 
+设置窗口的模型目录独立于聊天会话：打开时使用当前 Codex 路径启动短生命周期 app-server，仅执行初始化和分页 `model/list`，不依赖 capture、MCP Python 或第一条问题。窗口提供加载状态、错误、空目录提示和刷新按钮，关闭时终止查询进程。异步结果保留用户正在编辑的模型与推理强度；已知模型未列出的强度在保存时提示选择有效值。`chat_panel_e2e.py --scenario model-settings` 覆盖首次打开分页、加载中手填、已知模型的强度校验、失败、空目录、取消和循环 cursor。
+
 M5d 回归：`chat_panel_e2e.py --scenario M5d` 覆盖新建分开保存、跨进程续聊、恢复去重、无 app-server 查看、损坏记录跳过、capture 不匹配、远端不存在、配置读取失败、其它 MCP 启用和 sandbox 错误。拒绝恢复必须不改写原历史文件。`--history-capture --capture FILE.rdc` 使用真实 capture + fake app-server，验证同文件重开后保持对话/thread、更新实例/session、拒绝旧链接并检查历史列表截图；不发送 capture 给模型。
 
 另外：

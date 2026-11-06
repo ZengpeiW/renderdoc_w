@@ -1,7 +1,7 @@
 """End-to-end checks for the qrendertest AI panel (M5a-M5d).
 
 Usage:
-    python devtools/chat_panel_e2e.py [--scenario all|M5d|A1|A2|...] [--exe qrendertest.exe]
+    python devtools/chat_panel_e2e.py [--scenario all|M5d|model-settings|A1|A2|...] [--exe qrendertest.exe]
     python devtools/chat_panel_e2e.py --history-capture --capture FILE.rdc [--event EID]
     python devtools/chat_panel_e2e.py --real --capture FILE.rdc [--question TEXT] [--ask-pixel]
 
@@ -710,6 +710,103 @@ def scenario_tool_artifacts(run: Run) -> None:
                   "unsafe artifact was never clicked")
 
 
+def scenario_first_settings(run: Run) -> None:
+    case = run.name.removeprefix("C-first-settings")
+    scenario = {"": "model-pages", "-manual": "model-delayed", "-known-manual": "model-delayed", "-error": "model-error",
+                "-cancel": "model-delayed", "-empty": "model-empty", "-loop": "model-loop"}[case]
+    screenshot = run.root / "first-settings.png"
+    autotest: dict[str, Any] = {"questions": [], "settingsScreenshot": str(screenshot),
+                                "settings": {"model": "", "reasoningEffort": "",
+                                             "codexPath": sys.executable,
+                                             "mcpPython": str(run.root / "missing-mcp-python.exe")}}
+    if not case:
+        autotest["settingsSelectModel"] = "fake-deep"
+    elif case in ("-manual", "-known-manual"):
+        autotest.update(settingsTypeModel="fake-deep" if case == "-known-manual" else "manual-before-catalog",
+                        settingsTypeEffort="manual-effort",
+                        settingsAccept=True)
+    elif case == "-cancel":
+        autotest["settingsCloseAfterMs"] = 200
+    elif case in ("-error", "-empty"):
+        autotest.update(settingsTypeModel="manual-without-catalog", settingsTypeEffort="manual-effort",
+                        settingsAccept=True)
+    if autotest.get("settingsAccept"):
+        # Saving still validates executable fields; discovery alone must not need MCP Python.
+        autotest["settings"]["mcpPython"] = sys.executable
+    run.launch(autotest, fake_env(run, scenario))
+    if not run.wait_transcript(60):
+        return
+    received = run.received()
+    order = methods(received)
+    run.check(set(order) <= {"initialize", "initialized", "model/list"},
+              f"opening Settings started unrelated account/thread/turn APIs: {order}")
+    run.check(order.count("initialize") == 1 and order.count("initialized") == 1,
+              f"Settings discovery initialization sequence {order}")
+    run.check(not run.results() and not run.items("user") and not run.transcript.get("threadId"),
+              "first-open Settings created a chat conversation")
+    run.check(run.session().get("appServerRunning") is False,
+              "Settings discovery was bound to the live chat app-server")
+    pids = run.fake_pids()
+    run.check(len(pids) == 1, f"Settings discovery process count {pids}")
+    run.check_no_survivors(pids)
+    starts = [entry for entry in read_jsonl(run.fake_log) if entry.get("event") == "start"]
+    joined = " ".join(starts[0].get("argv", [])) if starts else ""
+    run.check("RENDERTEST_AGENT_FIXED_INSTANCE_ID" not in joined and
+              "RENDERTEST_AGENT_CAPTURE_SESSION_ID" not in joined,
+              "Settings discovery inherited a capture scope")
+    dialog = run.transcript.get("autotest", {}).get("settingsDialog", {})
+    run.check(not dialog.get("timedOut"), f"Settings discovery did not finish: {dialog}")
+    if case != "-cancel":
+        run.check(order.count("model/list") >= 1, "Settings did not request the model catalog")
+        run.check(dialog.get("screenshotSaved") is True and screenshot.is_file(),
+                  "Settings screenshot was not saved")
+    if not case:
+        queries = [message["params"].get("cursor") for message in received if message.get("method") == "model/list"]
+        run.check(queries == [None, "models-page2"], f"first-open model pagination {queries}")
+        run.check(dialog.get("catalogState") == "ready" and dialog.get("modelCount") == 3,
+                  f"first-open Settings did not populate both models plus the default: {dialog}")
+        run.check(dialog.get("model") == "fake-deep", "Settings selected catalog id instead of the model value")
+        run.check(dialog.get("effortOptions") == ["", "medium", "ultra"] and
+                  dialog.get("effortEditable") is False and dialog.get("effort") == "",
+                  f"newly discovered model did not control its supported reasoning efforts: {dialog}")
+    elif case in ("-manual", "-known-manual"):
+        run.check(dialog.get("catalogState") == "ready" and dialog.get("typedWhileLoading") is True,
+                  f"manual-model fixture did not edit during discovery: {dialog}")
+        events = [entry.get("event") for entry in read_jsonl(run.fake_log)]
+        run.check("model-list-delayed" in events and "model-list-response" in events,
+                  "delayed model response was not exercised")
+        expected_model = "fake-deep" if case == "-known-manual" else "manual-before-catalog"
+        run.check(dialog.get("model") == expected_model and dialog.get("effort") == "manual-effort",
+                  "async discovery replaced the user-entered model/effort")
+        if case == "-known-manual":
+            run.check(dialog.get("accepted") is False and dialog.get("appliedModel") == "" and
+                      dialog.get("appliedEffort") == "" and "manual-effort" in dialog.get("validationError", ""),
+                      "unsupported effort was silently changed or saved instead of showing its validation error")
+        else:
+            run.check(dialog.get("appliedModel") == expected_model and
+                      dialog.get("appliedEffort") == "manual-effort" and dialog.get("accepted") is True,
+                      "custom model/effort were not saved")
+    elif case == "-cancel":
+        run.check(dialog.get("accepted") is False and dialog.get("catalogState") == "loading",
+                  f"Settings was not canceled while discovery was pending: {dialog}")
+        run.check(not any(entry.get("event") == "model-list-response" for entry in read_jsonl(run.fake_log)),
+                  "delayed discovery survived cancel and returned a result")
+    else:
+        run.check(dialog.get("catalogState") in (("empty", "ready") if case == "-empty" else ("error",)) and
+                  bool(dialog.get("catalogMessage")), f"empty/failed catalog has no visible status: {dialog}")
+        if case == "-error":
+            run.check("model catalog unavailable" in dialog.get("catalogMessage", ""),
+                      "model discovery error was not displayed")
+        if case == "-loop":
+            run.check(2 <= order.count("model/list") <= 32,
+                      "model pagination loop was not stopped within its request bound")
+        else:
+            run.check(dialog.get("model") == dialog.get("appliedModel") == "manual-without-catalog" and
+                      dialog.get("effort") == dialog.get("appliedEffort") == "manual-effort" and
+                      dialog.get("effortEditable") is True and dialog.get("accepted") is True,
+                      "manual model/effort could not be saved without a catalog")
+
+
 def seed_history(run: Run) -> dict[str, Any] | None:
     """Finish and close one real UI process; retain only this test's local fake/history files."""
     run.launch({"questions": ["saved first question"]}, fake_env(run, "persistent"))
@@ -909,6 +1006,13 @@ SCENARIOS: dict[str, Callable[[Run], None]] = {
     "C-model-error": scenario_model_settings,
     "C-tool-artifacts": scenario_tool_artifacts,
     "C-tool-artifacts-rejected": scenario_tool_artifacts,
+    "C-first-settings": scenario_first_settings,
+    "C-first-settings-manual": scenario_first_settings,
+    "C-first-settings-known-manual": scenario_first_settings,
+    "C-first-settings-error": scenario_first_settings,
+    "C-first-settings-cancel": scenario_first_settings,
+    "C-first-settings-empty": scenario_first_settings,
+    "C-first-settings-loop": scenario_first_settings,
     "D-new-chat": scenario_history_new_chat,
     "D-restart-restore": scenario_history_restore,
     "D-resume-replay": scenario_history_restore,
@@ -1144,7 +1248,7 @@ def split_turns(run: Run) -> list[tuple[list[str], str]]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scenario", default="all", help="all, M5d, or one of: " + ", ".join(SCENARIOS))
+    parser.add_argument("--scenario", default="all", help="all, M5d, model-settings, or one of: " + ", ".join(SCENARIOS))
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--real", action="store_true")
     parser.add_argument("--history-capture", action="store_true",
@@ -1171,6 +1275,8 @@ def main(argv: list[str] | None = None) -> int:
         names = list(SCENARIOS)
     elif args.scenario == "M5d":
         names = [name for name in SCENARIOS if name.startswith("D-")]
+    elif args.scenario == "model-settings":
+        names = [name for name in SCENARIOS if name.startswith("C-first-settings")]
     elif args.scenario in SCENARIOS:
         names = [args.scenario]
     else:

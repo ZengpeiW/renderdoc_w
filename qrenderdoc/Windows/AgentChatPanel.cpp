@@ -3,6 +3,7 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDesktopServices>
 #include <QDateTime>
 #include <QDir>
@@ -1096,6 +1097,9 @@ void AgentChatPanel::EditSettings()
     ApplyAgentSettings(settings, AgentSettingsSnapshot(m_Ctx.Config()));
     ApplyAgentSettings(settings, m_Autotest.settings);
     accepted = AgentSettingsDialog::Edit(settings, m_Models, this, false);
+    m_Autotest.settingsDialog[lit("accepted")] = accepted;
+    m_Autotest.settingsDialog[lit("appliedModel")] = QString(settings.Agent_Model);
+    m_Autotest.settingsDialog[lit("appliedEffort")] = QString(settings.Agent_ReasoningEffort);
   }
   else
     accepted = AgentSettingsDialog::Edit(m_Ctx.Config(), m_Models, this);
@@ -1938,6 +1942,11 @@ void AgentChatPanel::RunAutotest(const QJsonObject &config)
   m_Autotest.cancelLoginAfterMs = config[lit("cancelLoginAfterMs")].toInt(0);
   m_Autotest.screenshot = config[lit("screenshot")].toString();
   m_Autotest.settingsScreenshot = config[lit("settingsScreenshot")].toString();
+  m_Autotest.settingsTypeModel = config[lit("settingsTypeModel")].toString();
+  m_Autotest.settingsTypeEffort = config[lit("settingsTypeEffort")].toString();
+  m_Autotest.settingsSelectModel = config[lit("settingsSelectModel")].toString();
+  m_Autotest.settingsAccept = config[lit("settingsAccept")].toBool(false);
+  m_Autotest.settingsCloseAfterMs = config[lit("settingsCloseAfterMs")].toInt(0);
   m_Autotest.historyScreenshot = config[lit("historyScreenshot")].toString();
   for(const QJsonValue &question : config[lit("questions")].toArray())
     m_Autotest.questions << question.toString();
@@ -2202,25 +2211,74 @@ void AgentChatPanel::AutotestClickLinks()
   }
   if(!m_Autotest.settingsScreenshot.isEmpty())
   {
-    // Exercise the real dialog without accepting or changing the user's saved configuration.
-    QTimer::singleShot(100, this, [this]() {
+    // Exercise asynchronous discovery in the real dialog using an independent config copy.
+    QTimer probe(this);
+    const qint64 started = QDateTime::currentMSecsSinceEpoch();
+    connect(&probe, &QTimer::timeout, this, [this, &probe, started]() {
       QDialog *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
       if(!dialog || dialog->objectName() != lit("agentSettings"))
         return;
       QComboBox *model = dialog->findChild<QComboBox *>(lit("agentModel"));
       QComboBox *effort = dialog->findChild<QComboBox *>(lit("agentReasoningEffort"));
+      QLabel *status = dialog->findChild<QLabel *>(lit("agentModelsStatus"));
+      const QString state = status ? status->property("catalogState").toString() : QString();
+      const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - started;
+      const bool pending = state == lit("starting") || state == lit("loading");
+      const bool cancel = state == lit("loading") && m_Autotest.settingsCloseAfterMs > 0 &&
+                          elapsed >= m_Autotest.settingsCloseAfterMs;
+      if(model && effort && pending &&
+         !m_Autotest.settingsDialog[lit("inputApplied")].toBool() &&
+         !m_Autotest.settingsTypeModel.isEmpty())
+      {
+        model->setEditText(m_Autotest.settingsTypeModel);
+        if(!m_Autotest.settingsTypeEffort.isEmpty())
+          effort->setEditText(m_Autotest.settingsTypeEffort);
+        m_Autotest.settingsDialog[lit("inputApplied")] = true;
+        m_Autotest.settingsDialog[lit("typedWhileLoading")] = true;
+      }
+      if(pending && !cancel && elapsed < 20000)
+        return;
+      probe.stop();
+      if(elapsed >= 20000)
+        m_Autotest.settingsDialog[lit("timedOut")] = true;
+      m_Autotest.settingsDialog[lit("catalogState")] = state;
+      m_Autotest.settingsDialog[lit("catalogMessage")] = status ? status->text() : QString();
       if(model && effort)
       {
-        m_Autotest.settingsDialog[lit("model")] = model->currentData().toString();
-        m_Autotest.settingsDialog[lit("effort")] = effort->currentData().toString();
+        if(state == lit("ready") && !m_Autotest.settingsSelectModel.isEmpty())
+          model->setCurrentIndex(model->findData(m_Autotest.settingsSelectModel));
+        auto value = [](QComboBox *combo) {
+          return combo->currentIndex() >= 0 && combo->currentText() == combo->itemText(combo->currentIndex())
+                     ? combo->currentData().toString() : combo->currentText().trimmed();
+        };
+        m_Autotest.settingsDialog[lit("model")] = value(model);
+        m_Autotest.settingsDialog[lit("effort")] = value(effort);
         m_Autotest.settingsDialog[lit("modelCount")] = model->count();
         m_Autotest.settingsDialog[lit("effortEditable")] = effort->isEditable();
+        QJsonArray options;
+        for(int i = 0; i < effort->count(); i++)
+          options << effort->itemData(i).toString();
+        m_Autotest.settingsDialog[lit("effortOptions")] = options;
       }
       QDir().mkpath(QFileInfo(m_Autotest.settingsScreenshot).absolutePath());
       m_Autotest.settingsDialog[lit("screenshotSaved")] = dialog->grab().save(m_Autotest.settingsScreenshot);
-      dialog->reject();
+      QDialogButtonBox *buttons = dialog->findChild<QDialogButtonBox *>();
+      if(m_Autotest.settingsAccept && !cancel && elapsed < 20000 && buttons)
+      {
+        buttons->button(QDialogButtonBox::Save)->click();
+        if(dialog->isVisible())
+        {
+          QLabel *error = dialog->findChild<QLabel *>(lit("agentSettingsError"));
+          m_Autotest.settingsDialog[lit("validationError")] = error ? error->text() : QString();
+          dialog->reject();
+        }
+      }
+      else
+        dialog->reject();
     });
+    probe.start(50);
     EditSettings();
+    probe.stop();
   }
   if(!m_Autotest.historyScreenshot.isEmpty())
   {

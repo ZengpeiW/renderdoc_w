@@ -139,7 +139,7 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 菜单 `Window → AI Assistant` 打开可停靠面板。第一次发送消息时，面板启动 `codex app-server`，并把 rendertest MCP 绑定到本窗口的 Bridge 实例；不需要改 `~/.codex/config.toml`。
 
 - 前提：已经安装 Codex CLI（`npm install -g @openai/codex`）；`agent/mcp_server/.venv` 已创建。可沿用已有 Codex 登录，或在未登录提示出现后点面板的 `Log in`，在浏览器完成登录后重新发送问题；等待时可点 `Cancel login`。
-- 设置：点 `Settings` 配置原生 codex 可执行文件、MCP Python、模型、推理强度和隔离开关；设置保存到 RenderTest 配置文件，下一条问题重新建立会话。留空沿用自动查找或 Codex 配置。模型列表由 app-server 分页获取；自定义 provider 可以手填模型与推理强度。
+- 设置：点 `Settings` 配置原生 codex 可执行文件、MCP Python、模型、推理强度和隔离开关；设置保存到 RenderTest 配置文件，下一条问题重新建立会话。留空沿用自动查找或 Codex 配置。首次打开设置就会独立加载模型列表，无需先发送问题或配置 MCP Python；窗口显示加载、失败和空列表状态，可点 `Refresh` 重试。加载完成会保留已输入的模型和推理强度；自定义 provider 可以手填，已列出的模型会在保存时校验其支持的推理强度。
 - 只读：thread 使用 `read-only` 沙箱和 `never` 审批，所有审批请求都会被拒绝；shell 和 web search 始终关闭，其它 MCP server 默认隔离。隔离检查失败会阻止对话。
 - 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息重新连接并恢复 thread。“New Chat”保存当前对话后清空面板，下一问创建独立 thread。
 - 历史：点 `History` 搜索并打开已保存对话；消息在本地显示，发送新问题时才启动 Codex 并恢复上下文。历史位于 `<agent root>/conversations/<UUID>.json`，流式更新每 2 秒保存，回合结束和关闭时立即保存；使用原子写入和会话锁。另一窗口正在使用的记录可只读查看。
