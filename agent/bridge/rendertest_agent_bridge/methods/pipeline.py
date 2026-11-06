@@ -1,6 +1,7 @@
 from ..artifacts import write_bytes
 from ..ipc import AgentBridgeError
 from ..values import enum_name, format_name, number, numbers, resource_id
+from . import cbuffer_members
 from .common import (STAGE_NAMES, action_index, get_bool, get_choice, get_choices, get_int,
                      get_str, invalid, renderdoc_module, resolve_event, resource_index, result,
                      session_of, stage_enum)
@@ -585,6 +586,7 @@ def _find_block(blocks, index, name):
 
 def get_cbuffer(runtime, context):
     params = context.params
+    member_request = cbuffer_members.validate_request(params)
     stage_name = get_choice(params, "stage", STAGE_NAMES, required=True)
     index = get_int(params, "index")
     name = get_str(params, "name")
@@ -605,17 +607,6 @@ def get_cbuffer(runtime, context):
         variables = controller.GetCBufferVariableContents(
             _pipeline_object(pipe, stage_name), shader, stage, pipe.GetShaderEntryPoint(stage),
             position, descriptor.resource, descriptor.byteOffset, descriptor.byteSize)
-        constants = dict((constant.name, constant) for constant in block.variables)
-        budget = [CBUFFER_VARIABLE_LIMIT]
-        converted = []
-        for variable in variables:
-            constant = constants.get(variable.name)
-            item = convert_variable(variable, budget,
-                                    constant.type if constant is not None else None,
-                                    int(constant.byteOffset) if constant is not None else None)
-            if item is None:
-                break
-            converted.append(item)
         buffer_key = resource_id(descriptor.resource)
         data = {
             "eventId": event_id,
@@ -630,15 +621,35 @@ def get_cbuffer(runtime, context):
             "binding": {"resourceId": buffer_key, "name": resources.name(buffer_key),
                         "byteOffset": int(descriptor.byteOffset),
                         "byteSize": int(descriptor.byteSize)},
-            "variables": converted,
         }
-        return data, budget[0] <= 0
+        if member_request is not None:
+            scope = (session_of(context), event_id, stage_name, key, position, buffer_key,
+                     int(descriptor.byteOffset), int(descriptor.byteSize))
+            page, next_cursor, truncated, warnings = cbuffer_members.project_members(
+                variables, block, member_request, scope, convert_variable,
+                check_cancelled=context.check_cancelled)
+            data.update(page)
+            return data, next_cursor, truncated, warnings
 
-    (data, truncated), meta = runtime.replay.at_event(context, event_id, read)
-    warnings = []
-    if truncated:
-        warnings.append("Only the first %d variables were returned." % CBUFFER_VARIABLE_LIMIT)
-    return result(data, meta=meta, truncated=truncated, warnings=warnings)
+        constants = dict((constant.name, constant) for constant in block.variables)
+        budget = [CBUFFER_VARIABLE_LIMIT]
+        converted = []
+        for variable in variables:
+            constant = constants.get(variable.name)
+            item = convert_variable(variable, budget,
+                                    constant.type if constant is not None else None,
+                                    int(constant.byteOffset) if constant is not None else None)
+            if item is None:
+                break
+            converted.append(item)
+        data["variables"] = converted
+        truncated = budget[0] <= 0
+        warnings = (["Only the first %d variables were returned." % CBUFFER_VARIABLE_LIMIT]
+                    if truncated else [])
+        return data, None, truncated, warnings
+
+    (data, next_cursor, truncated, warnings), meta = runtime.replay.at_event(context, event_id, read)
+    return result(data, meta=meta, next_cursor=next_cursor, truncated=truncated, warnings=warnings)
 
 
 HANDLERS = {

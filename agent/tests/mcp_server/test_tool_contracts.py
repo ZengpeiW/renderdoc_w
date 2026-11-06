@@ -48,7 +48,7 @@ def test_tool_annotations_follow_effects() -> None:
 
     read_only = {name for name, tool in tools.items() if tool.annotations.readOnlyHint}
     assert read_only == set(TOOL_NAMES) - {"set_event", "export_texture", "debug_pixel",
-                                              "debug_vertex", "get_shader_source"}
+                                              "debug_vertex", "get_shader_source", "export_overlay"}
     for tool in tools.values():
         assert tool.annotations.destructiveHint is False
         assert tool.annotations.openWorldHint is False
@@ -75,6 +75,7 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "get_resource": {"resource_id": "1001"},
             "get_resource_usage": {"resource_id": "1001"},
             "export_texture": {"resource_id": "1001", "event_id": 30},
+            "export_overlay": {"resource_id": "1001", "event_id": 30, "overlay": "Depth"},
             "pick_pixel": {"resource_id": "1001", "x": 1, "y": 2},
             "get_texture_stats": {"resource_id": "1001"},
             "pixel_history": {"resource_id": "1001", "x": 1, "y": 2, "event_id": 30},
@@ -115,6 +116,9 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["get_resource_stats"]["data"]["knownTotalBytes"] == 448
     assert results["get_resource_stats"]["data"]["hasMoreLargest"]
     assert results["get_shader_source"]["effect"] == "artifact"
+    assert results["export_overlay"]["effect"] == "artifact"
+    assert results["export_overlay"]["data"]["overlay"] == "Depth"
+    assert Path(results["export_overlay"]["artifacts"][0]["path"]).read_bytes().startswith(b"\x89PNG")
     assert source["data"]["lines"][0]["text"] == "float4 main() : SV_Target { return 1; }"
     artifact = results["export_texture"]["artifacts"][0]
     assert Path(artifact["path"]).read_bytes().startswith(b"\x89PNG")
@@ -139,3 +143,19 @@ def test_cbuffer_requires_exactly_one_selector() -> None:
         call_tool(server, "get_cbuffer", {"stage": "pixel"})
 
     assert "INVALID_REQUEST" in str(error.value)
+
+
+def test_cbuffer_member_projection_paging_and_leaf_through_mailbox(tmp_path: Path) -> None:
+    with FakeRenderTestBridge(tmp_path):
+        server = create_server(BridgeClient(root=tmp_path, environ={}, poll_interval=0.005))
+        params = {"stage": "pixel", "event_id": 30, "index": 0, "member_path": "", "limit": 1}
+        first = structured(call_tool(server, "get_cbuffer", params))
+        assert first["data"]["childCount"] == 2
+        assert first["data"]["variables"][0]["name"] == "Tint"
+        assert first["nextCursor"]
+        second = structured(call_tool(server, "get_cbuffer", dict(params, cursor=first["nextCursor"])))
+        child = second["data"]["variables"][0]
+        assert child["name"] == "Exposure" and not second["nextCursor"]
+        leaf = structured(call_tool(server, "get_cbuffer", dict(params, member_path=child["canonicalPath"])))
+        assert leaf["data"]["selected"]["value"] == [1.0]
+        assert leaf["data"]["variables"] == []

@@ -35,7 +35,9 @@ Use `pixel_history(resource_id=..., x=..., y=..., event_id=...)`. It replays the
 - Use `rendertest-shader-debug` for its pixel shader, input textures and constant buffers, and `pick_pixel` the inputs around the matching coordinates.
 - To see why the shader produced the value, `debug_pixel` the writing draw at this pixel, passing `primitive` from a passing fragment. Its `outputs` should match that fragment's `shaderOut`; `nanOrInfSteps` locate where NaN or Inf came from.
 - NaN and Inf come back as the strings "NaN" and "Inf". They are measured values; trace earlier writers to where they first appear.
-- Use `export_texture(include_image=true)` when the surrounding image matters.
+- Use `export_texture(include_image=true)` when the surrounding image matters. For diagnostic context use `export_overlay(resource_id=..., event_id=..., overlay="Depth", include_image=true)` on the writing raster draw and its bound target. `Stencil`, `BackfaceCull`, `Wireframe` and `ViewportScissor` can explain other rejection/coverage questions. Colors follow the returned legend; overlapping fragments or samples may hide failures, so verify the specific pixel with `pixel_history`.
+- `export_overlay(resource_id=..., event_id=..., overlay="NaN", include_image=true)` can highlight invalid/negative values on an ordinary 2D texture. `overlay="Clipping"` highlights values outside `range_min` / `range_max`; it is a display-range diagnostic, not geometric clipping. Confirm suspicious pixels with `pick_pixel` using the same `type_cast`.
+- Overlay images may be downscaled and are 8-bit RGB composites, not raw resource content. Use `displayTransform` and original mip dimensions for coordinate mapping. Quad overdraw is a 2x2-quad heatmap, not an exact count of writes at the chosen pixel. Unsupported/budget errors are explicit; do not interpret them as an empty or passing overlay.
 
 ## Report
 

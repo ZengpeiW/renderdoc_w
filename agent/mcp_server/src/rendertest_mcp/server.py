@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 import anyio
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -25,6 +26,10 @@ TextureFormat = Literal["png", "exr", "dds"]
 TextureChannels = Literal["rgba", "rgb", "r", "g", "b", "a", "depth", "stencil"]
 TextureTypeCast = Literal["Typeless", "Float", "UNorm", "SNorm", "UInt", "SInt", "UScaled",
                           "SScaled", "Depth", "UNormSRGB"]
+DiagnosticOverlay = Literal["Drawcall", "Wireframe", "Depth", "Stencil", "BackfaceCull",
+                            "ViewportScissor", "QuadOverdrawDraw", "TriangleSizeDraw", "NaN",
+                            "Clipping"]
+FiniteNumber = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 HistoryOrder = Literal["newest", "oldest"]
 MeshStage = Literal["vs_out", "gs_out"]
 MaxSteps = Annotated[int, Field(ge=1, le=200000, description="Shader steps to execute at most.")]
@@ -65,7 +70,7 @@ StrictLimit = Annotated[
     int, Field(strict=True, ge=1, le=1000, description="Maximum number of items to return.")
 ]
 
-_LONG_RUNNING_METHODS = frozenset({"export_texture", "get_buffer_data", "pixel_history",
+_LONG_RUNNING_METHODS = frozenset({"export_texture", "export_overlay", "get_buffer_data", "pixel_history",
                                    "debug_pixel", "debug_vertex", "get_mesh_data"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
@@ -84,6 +89,18 @@ def tool_effect(name: str) -> str:
 
 def _clean_params(**params: Any) -> dict[str, Any]:
     return {key: value for key, value in params.items() if value is not None}
+
+
+class _CBufferMetadata(FuncMetadata):
+    def pre_parse_json(self, data: dict[str, Any]) -> dict[str, Any]:
+        # FastMCP 1.x JSON-decodes nullable strings before Pydantic validation. Member
+        # paths such as [1], ["name"] and null must remain literal strings; actual
+        # JSON arrays/objects still go through the unchanged string field validator.
+        other = {key: value for key, value in data.items() if key != "member_path"}
+        parsed = super().pre_parse_json(other)
+        if "member_path" in data:
+            parsed["member_path"] = data["member_path"]
+        return parsed
 
 
 def _tool_error(error: RenderTestAgentError) -> ToolError:
@@ -118,6 +135,18 @@ def _envelope(response: BridgeResponse, effect: str) -> dict[str, Any]:
     }
 
 
+def _with_image(result: dict[str, Any], include_image: bool) -> list[Any]:
+    content: list[Any] = [result]
+    if include_image:
+        for artifact in result["artifacts"]:
+            path = Path(artifact["path"])
+            image_format = _IMAGE_FORMATS.get(path.suffix.lower())
+            if image_format and artifact.get("bytes", 0) <= 8 * 1024 * 1024:
+                content.append(Image(path=path, format=image_format))
+                break
+    return content
+
+
 def create_server(client: BridgeClient | None = None) -> FastMCP:
     bridge = client or BridgeClient()
     artifacts = ArtifactReader(bridge)
@@ -134,7 +163,16 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
     def tool(**options: Any):
         def register(function: Any) -> Any:
             annotations = _ANNOTATIONS[tool_effect(function.__name__)]
-            return server.tool(annotations=annotations, **options)(function)
+            registered = server.tool(annotations=annotations, **options)(function)
+            if function.__name__ == "get_cbuffer":
+                # FastMCP exposes no per-argument pre-parser option. Keep this adapter
+                # local to the one tool, retaining its generated input/output schemas.
+                entry = server._tool_manager.get_tool(function.__name__)
+                metadata = entry.fn_metadata
+                entry.fn_metadata = _CBufferMetadata(**{
+                    key: getattr(metadata, key) for key in type(metadata).model_fields
+                })
+            return registered
 
         return register
 
@@ -328,15 +366,29 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         index: Annotated[int | None, Field(ge=0)] = None,
         name: Annotated[str | None, Field(min_length=1, max_length=256)] = None,
         instance_id: InstanceId = None,
+        member_path: Annotated[str | None, Field(strict=True, max_length=4096)] = None,
+        cursor: Cursor = None,
+        limit: StrictLimit | None = None,
+        max_depth: Annotated[int | None, Field(strict=True, ge=0, le=4)] = None,
     ) -> dict[str, Any]:
-        """Read one constant buffer by reflected index or name."""
+        """Read one constant buffer by reflected index or name.
+
+        Omit the member/page options for the legacy full-buffer result. Use member_path=""
+        for the root or a member path to drill into a large buffer, with bounded child pages.
+        Page options require member_path (use "" for the root); max_depth defaults to 0.
+        Follow nextCursor and check truncated/warnings; this never edits buffer contents.
+        """
         if (index is None) == (name is None):
             raise _tool_error(
                 RenderTestAgentError("INVALID_REQUEST", "Specify exactly one of index or name.")
             )
+        if member_path is None and any(option is not None for option in (cursor, limit, max_depth)):
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "Paging options require member_path; use an empty string for the root."))
         return await invoke(
             "get_cbuffer",
-            _clean_params(stage=stage, event_id=event_id, index=index, name=name),
+            _clean_params(stage=stage, event_id=event_id, index=index, name=name,
+                          member_path=member_path, cursor=cursor, limit=limit, max_depth=max_depth),
             instance_id=instance_id,
         )
 
@@ -440,15 +492,40 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             ),
             instance_id=instance_id,
         )
-        content: list[Any] = [result]
-        if include_image:
-            for artifact in result["artifacts"]:
-                path = Path(artifact["path"])
-                image_format = _IMAGE_FORMATS.get(path.suffix.lower())
-                if image_format and artifact.get("bytes", 0) <= 8 * 1024 * 1024:
-                    content.append(Image(path=path, format=image_format))
-                    break
-        return content
+        return _with_image(result, include_image)
+
+    @tool(structured_output=False)
+    async def export_overlay(
+        resource_id: ResourceId,
+        overlay: DiagnosticOverlay,
+        event_id: StrictOptionalEventId = None,
+        mip: StrictNonNegativeInt = 0,
+        slice: StrictNonNegativeInt = 0,
+        sample: StrictNonNegativeInt = 0,
+        type_cast: TextureTypeCast = "Typeless",
+        range_min: FiniteNumber = 0.0,
+        range_max: FiniteNumber = 1.0,
+        max_dimension: Annotated[int, Field(strict=True, ge=1, le=4096)] = 1024,
+        include_image: Annotated[bool, Field(strict=True)] = False,
+        instance_id: InstanceId = None,
+    ) -> list[Any]:
+        """Export a diagnostic overlay for one event and texture view as a PNG artifact.
+
+        Optionally attach the image for visual inspection. Diagnostic colours are not raw
+        texture values or GPU timings. Unsupported API/overlay combinations return an error;
+        the GUI event and texture display are preserved. range_min must be below range_max.
+        """
+        if range_min >= range_max:
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "range_min must be less than range_max."))
+        result = await invoke(
+            "export_overlay",
+            _clean_params(resource_id=resource_id, overlay=overlay, event_id=event_id,
+                          mip=mip, slice=slice, sample=sample, type_cast=type_cast,
+                          range_min=range_min, range_max=range_max, max_dimension=max_dimension),
+            instance_id=instance_id,
+        )
+        return _with_image(result, include_image)
 
     @tool()
     async def pick_pixel(

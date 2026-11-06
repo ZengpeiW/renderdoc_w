@@ -4,12 +4,14 @@ Usage:
     python devtools/smoke_live.py [--root DIR] [--instance-id ID] [--expect-capture] [--wait 30]
     python devtools/smoke_live.py --all-p0 [--launch FILE.rdc] [--exe qrendertest.exe]
     python devtools/smoke_live.py --analysis-only [--event-id EID] [--launch FILE.rdc]
+    python devtools/smoke_live.py --second-batch [--event-id EID] [--launch FILE.rdc]
 
 Without ``--all-p0`` it checks ping/get_status/get_context. With ``--all-p0`` it calls every P0
 tool against the loaded capture and checks that read tools leave the UI event alone, that paging
 has no duplicates, that ``set_event`` moves the UI and that exported PNGs match the texture size.
 It also cross-checks frame/subtree statistics and verifies one embedded source through ArtifactReader.
 ``--analysis-only`` runs only those new analysis checks, without pixel/mesh/debug comparisons.
+``--second-batch`` checks CBuffer member paging and bounded diagnostic overlay PNGs.
 ``--launch`` starts qrendertest with the capture first and closes it with WM_CLOSE afterwards.
 """
 
@@ -17,12 +19,14 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import struct
 import subprocess
 import sys
 import time
+import zlib
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -65,6 +69,56 @@ def png_size(path: Path) -> tuple[int, int] | None:
     return struct.unpack(">II", header[16:24])
 
 
+def decode_overlay_png(encoded: bytes, maximum: int) -> tuple[int, int, bytes]:
+    """Decode the overlay tool's RGB8 PNG, checking chunk integrity and bounded scanlines."""
+    if encoded[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("missing PNG signature")
+    position, header, compressed, ended = 8, None, bytearray(), False
+    while position < len(encoded):
+        if len(encoded) - position < 12:
+            raise ValueError("truncated PNG chunk")
+        size = struct.unpack_from(">I", encoded, position)[0]
+        end = position + 12 + size
+        if end > len(encoded):
+            raise ValueError("PNG chunk extends beyond the artifact")
+        kind, body = encoded[position + 4:position + 8], encoded[position + 8:end - 4]
+        if struct.unpack_from(">I", encoded, end - 4)[0] != zlib.crc32(kind + body) & 0xffffffff:
+            raise ValueError("PNG chunk CRC mismatch")
+        if header is None and kind != b"IHDR":
+            raise ValueError("PNG does not start with IHDR")
+        if kind == b"IHDR":
+            if header is not None or len(body) != 13:
+                raise ValueError("invalid or duplicate IHDR")
+            header = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            compressed.extend(body)
+        elif kind == b"IEND":
+            if body or end != len(encoded):
+                raise ValueError("invalid IEND or trailing PNG data")
+            ended = True
+        position = end
+    if header is None or not ended:
+        raise ValueError("incomplete PNG")
+    width, height, bits, kind, compression, filtering, interlace = header
+    if not (0 < width <= maximum and 0 < height <= maximum):
+        raise ValueError("PNG dimensions exceed the requested bound")
+    if (bits, kind, compression, filtering, interlace) != (8, 2, 0, 0, 0):
+        raise ValueError("overlay PNG must be noninterlaced 8-bit RGB")
+    stride = width * 3
+    expected = (stride + 1) * height
+    decompressor = zlib.decompressobj()
+    scanlines = decompressor.decompress(bytes(compressed), expected + 1)
+    if len(scanlines) != expected or not decompressor.eof or decompressor.unused_data:
+        raise ValueError("PNG scanline size or compression stream is invalid")
+    # The bridge writes unfiltered rows. Validate this explicit producer contract instead of
+    # adding a general image decoder dependency to this standalone smoke runner.
+    if any(scanlines[row * (stride + 1)] != 0 for row in range(height)):
+        raise ValueError("overlay PNG unexpectedly uses filtered scanlines")
+    pixels = b"".join(scanlines[row * (stride + 1) + 1:(row + 1) * (stride + 1)]
+                      for row in range(height))
+    return width, height, pixels
+
+
 class P0Smoke:
     def __init__(self, client: BridgeClient, instance_id: str):
         self.client = client
@@ -72,7 +126,10 @@ class P0Smoke:
         self.failures: list[str] = []
         self.timings: list[tuple[str, float, int]] = []
         self.last_response = None
+        self.last_error = None
         self.artifact_reader = ArtifactReader(client)
+        self.second_batch_artifacts: list[str] = []
+        self.second_batch_summary: dict[str, Any] = {}
 
     def fail(self, message: str) -> None:
         self.failures.append(message)
@@ -82,10 +139,12 @@ class P0Smoke:
              timeout: float | None = None) -> dict[str, Any] | None:
         start = time.perf_counter()
         self.last_response = None
+        self.last_error = None
         try:
             response = self.client.call(method, params or {}, instance_id=self.instance_id,
                                         timeout=timeout)
         except RenderTestAgentError as error:
+            self.last_error = error
             elapsed = (time.perf_counter() - start) * 1000
             self.timings.append((method, elapsed, 0))
             if expect_error == error.code or error.code == "UNSUPPORTED":
@@ -195,6 +254,245 @@ class P0Smoke:
                 self.fail(f"analysis tools changed the UI event: {before} -> {after}")
             else:
                 print(f"  UI event unchanged by analysis tools: selected/current {after}")
+
+    def _second_call(self, method: str, params: dict[str, Any], before: tuple[Any, Any],
+                     timeout: float | None = None) -> tuple[dict | None, Any, Any]:
+        try:
+            payload = self.call(method, params, timeout=timeout)
+            response, error = self.last_response, self.last_error
+            return payload, response, error
+        finally:
+            after = self.ui_events()
+            if after != before:
+                self.fail(f"{method} changed the UI event: {before} -> {after}")
+
+    def _second_cbuffer(self, event_id: int, inspected: dict, before: tuple[Any, Any]) -> None:
+        bindings = inspected["pipeline"].get("bindings", {})
+        candidates = [(stage, block) for stage in ("pixel", "vertex", "mesh", "hull", "domain", "geometry")
+                      for block in bindings.get(stage, {}).get("constantBlocks", [])
+                      if block.get("variableCount", 0) > 0]
+        if not candidates:
+            print("  no nonempty reflected CBuffer at this draw; member check unavailable")
+            self.second_batch_summary["cbuffer"] = {"available": False}
+            return
+        stage, block = next((item for item in candidates if item[1]["variableCount"] > 1), candidates[0])
+        params = {"event_id": event_id, "stage": stage, "index": block["index"]}
+        legacy, _, _ = self._second_call("get_cbuffer", params, before)
+        first, _, _ = self._second_call("get_cbuffer", dict(params, member_path="", limit=1), before)
+        if legacy is None or first is None:
+            self.fail("CBuffer legacy/root member requests did not both succeed")
+            return
+        old_vars = legacy["data"]["variables"]
+        root = first["data"]
+        fields = ("name", "type", "rows", "columns", "value", "byteOffset", "typeName")
+
+        def compare(actual, expected, description):
+            for key in fields:
+                if (key in actual) != (key in expected) or actual.get(key) != expected.get(key):
+                    self.fail(f"{description}: {key} differs from legacy get_cbuffer")
+
+        if (root.get("selected") is not None or root.get("canonicalPath") != "" or
+                root.get("byteOffsetBasis") != "block" or root["childCount"] < len(old_vars)):
+            self.fail("CBuffer root member metadata is inconsistent")
+        if not legacy.get("truncated") and root["childCount"] != len(old_vars):
+            self.fail("CBuffer root childCount differs from complete legacy variable count")
+        pages, root_items, cursor = 1, list(root["variables"]), first.get("nextCursor")
+        if len(root_items) != min(1, root["childCount"]) or bool(cursor) != (root["childCount"] > 1):
+            self.fail("CBuffer root first page has an inconsistent size or continuation cursor")
+        if cursor:
+            second, _, _ = self._second_call("get_cbuffer", dict(params, member_path="", limit=1,
+                                                                cursor=cursor), before)
+            if second:
+                pages += 1
+                if (second["data"]["childCount"] != root["childCount"] or
+                        len(second["data"]["variables"]) != 1 or second.get("nextCursor") == cursor):
+                    self.fail("CBuffer root pagination changed count or failed to advance")
+                root_items.extend(second["data"]["variables"])
+        elif root["childCount"] > len(root_items):
+            self.fail("CBuffer root pagination omitted children without a cursor")
+        for index, item in enumerate(root_items):
+            if item.get("canonicalPath") != f"[{index}]":
+                self.fail("CBuffer root page returned an unexpected canonical child path")
+            if index < len(old_vars):
+                compare(item, old_vars[index], f"root child {index}")
+
+        def leaves(items, prefix="", depth=0):
+            if depth >= 64:
+                return
+            for index, item in enumerate(items):
+                path = f"{prefix}[{index}]"
+                if item.get("value"):
+                    yield path, item
+                yield from leaves(item.get("members", []), path, depth + 1)
+
+        leaf = next(leaves(old_vars), None)
+        if leaf is None:
+            self.fail("Chosen CBuffer has no legacy leaf value to compare")
+            return
+        leaf_path, old_leaf = leaf
+        selected, _, _ = self._second_call("get_cbuffer", dict(params, member_path=leaf_path), before)
+        if selected:
+            data = selected["data"]
+            if data.get("canonicalPath") != leaf_path or data.get("childCount") != 0 or data["variables"]:
+                self.fail("Canonical CBuffer leaf read returned container metadata")
+            compare(data.get("selected") or {}, old_leaf, f"canonical leaf {leaf_path}")
+        else:
+            self.fail("Canonical CBuffer leaf request did not succeed")
+        # A block containing just one large struct/array still exercises two child pages.
+        container = next((item for item in root_items if item.get("childCount", 0) > 1), None)
+        if pages == 1 and container is not None:
+            nested, _, _ = self._second_call("get_cbuffer", dict(params, member_path=container["canonicalPath"],
+                                                                limit=1), before)
+            if nested and nested.get("nextCursor"):
+                continued, _, _ = self._second_call("get_cbuffer", dict(params,
+                    member_path=container["canonicalPath"], limit=1, cursor=nested["nextCursor"]), before)
+                if continued and continued["data"]["variables"]:
+                    paths = [nested["data"]["variables"][0]["canonicalPath"],
+                             continued["data"]["variables"][0]["canonicalPath"]]
+                    if paths != [container["canonicalPath"] + "[0]", container["canonicalPath"] + "[1]"]:
+                        self.fail("CBuffer nested pagination skipped or repeated a child")
+                    pages = 2
+                else:
+                    self.fail("CBuffer nested second page did not return a child")
+            else:
+                self.fail("CBuffer container with multiple children did not offer a second page")
+        large = next((item for item in root_items if item.get("childCount", 0) > 4096), None)
+        if large:
+            tail_path = large["canonicalPath"] + f"[{large['childCount'] - 1}]"
+            tail, _, _ = self._second_call("get_cbuffer", dict(params, member_path=tail_path, limit=1), before)
+            if not tail or tail["data"].get("canonicalPath") != tail_path or not tail["data"].get("selected"):
+                self.fail("CBuffer tail beyond the legacy 4096-node budget is not addressable")
+        self.second_batch_summary["cbuffer"] = {
+            "available": True, "stage": stage, "index": block["index"], "name": block["name"],
+            "rootChildren": root["childCount"], "pagesChecked": pages, "leafPath": leaf_path,
+            "leafValue": old_leaf["value"], "leafByteOffset": old_leaf.get("byteOffset"),
+            "largeArrayTailChecked": large is not None,
+        }
+        print("  CBuffer:", json.dumps(self.second_batch_summary["cbuffer"], ensure_ascii=False))
+
+    def _second_overlay_artifact(self, response, params: dict, source_size: tuple[int, int]) -> dict:
+        if response is None or response.instance_id != self.instance_id:
+            raise ValueError("missing or mismatched actual BridgeResponse")
+        payload, data = response.result, response.result["data"]
+        artifacts = payload.get("artifacts", [])
+        if len(artifacts) != 1:
+            raise ValueError("expected exactly one overlay artifact")
+        artifact = artifacts[0]
+        session = response.meta.get("captureSessionId")
+        if not session:
+            raise ValueError("artifact response has no capture session")
+        self.client.validate_artifact_scope(self.instance_id, session)
+        path = Path(artifact["path"]).resolve(strict=True)
+        path.relative_to((self.client.root / "artifacts" / self.instance_id / session).resolve())
+        if (path.suffix.lower() != ".png" or artifact.get("mediaType") != "image/png" or
+                artifact.get("kind") != "overlay"):
+            raise ValueError(f"overlay artifact metadata is not PNG: suffix={path.suffix!r}, "
+                             f"mediaType={artifact.get('mediaType')!r}, kind={artifact.get('kind')!r}")
+        with path.open("rb") as stream:
+            encoded = stream.read(MAX_RESPONSE_BYTES + 1)
+        if len(encoded) > MAX_RESPONSE_BYTES or len(encoded) != artifact["bytes"]:
+            raise ValueError("overlay artifact size mismatch or limit exceeded")
+        if hashlib.sha256(encoded).hexdigest() != artifact["sha256"]:
+            raise ValueError("overlay artifact SHA-256 mismatch")
+        width, height, pixels = decode_overlay_png(encoded, params["max_dimension"])
+        scale = min(1.0, params["max_dimension"] / max(source_size))
+        expected = tuple(max(1, int(value * scale)) for value in source_size)
+        if ((width, height) != expected or (data["width"], data["height"]) != expected or
+                (artifact.get("width"), artifact.get("height")) != expected or
+                (data["sourceWidth"], data["sourceHeight"]) != source_size):
+            raise ValueError("PNG, artifact and source-view dimensions disagree")
+        source = artifact.get("source", {})
+        for key in ("resource_id", "event_id", "overlay", "mip", "slice", "sample"):
+            if source.get(key) != params[key]:
+                raise ValueError(f"overlay artifact source {key} does not match the request")
+        if data.get("path") != artifact["path"] or data.get("overlay") != params["overlay"]:
+            raise ValueError("overlay data and artifact disagree")
+        colors = set()
+        for offset in range(0, len(pixels), 3):
+            colors.add(tuple(pixels[offset:offset + 3]))
+            if len(colors) > 256:
+                break
+        info = {"overlay": params["overlay"], "path": str(path), "width": width, "height": height,
+                "bytes": len(encoded), "sha256": artifact["sha256"], "nonUniform": len(colors) > 1,
+                "distinctColorsAtLeast": len(colors), "sampleColors": sorted(colors)[:8]}
+        if not info["nonUniform"]:
+            print(f"  {params['overlay']}: decoded image is uniform; review coverage/test outcome visually")
+        self.second_batch_artifacts.append(str(path))
+        return info
+
+    def run_second_batch(self, max_draws: int = 12, event_id: int | None = None) -> None:
+        self.second_batch_artifacts = []
+        self.second_batch_summary = {"overlays": [], "unsupportedOverlays": [], "supportedOverlays": 0}
+        status = self.call("get_status")
+        if not status or not status["data"]["capture"]:
+            self.fail("get_status reports no capture")
+            return
+        before = self.ui_events()
+        try:
+            if event_id is None:
+                picked = self.pick_draw(max_draws)
+                if picked is None:
+                    return
+                event_id, inspected = picked
+            else:
+                result, _, _ = self._second_call("inspect_event", {"event_id": event_id}, before)
+                if result is None:
+                    return
+                inspected = result["data"]
+            action = inspected.get("action") or {}
+            if (action.get("eventId") != event_id or action.get("childCount") or
+                    "Drawcall" not in action.get("flags", []) or "MultiAction" in action.get("flags", [])):
+                self.fail(f"EID {event_id} is not a leaf raster draw")
+                return
+            self.second_batch_summary.update(eventId=event_id, actionName=action.get("name"), uiBefore=before)
+            print(f"[second batch EID {event_id}: {action.get('name')}]")
+            self._second_cbuffer(event_id, inspected, before)
+            targets = inspected["pipeline"].get("outputTargets") or []
+            if not targets:
+                self.fail("Chosen draw has no color target for overlay smoke")
+                return
+            target = targets[0]
+            resource, _, _ = self._second_call("get_resource", {"resource_id": target["resourceId"]}, before)
+            if resource is None:
+                return
+            texture = resource["data"]
+            mip, slice_index = int(target.get("firstMip", 0)), int(target.get("firstSlice", 0))
+            source_size = (max(1, int(texture["width"]) >> mip), max(1, int(texture["height"]) >> mip))
+            overlays = [("Drawcall", 256), ("Wireframe", 512)]
+            depth = inspected["pipeline"].get("depthTarget") or {}
+            if depth.get("resourceId"):
+                overlays.append(("Depth", 256))
+            if int(texture["samples"]) <= 1:
+                overlays.append(("QuadOverdrawDraw", 256))
+            else:
+                print("  QuadOverdrawDraw: not probed for an MSAA target")
+            for overlay, maximum in overlays:
+                params = {"resource_id": target["resourceId"], "event_id": event_id, "overlay": overlay,
+                          "mip": mip, "slice": slice_index, "sample": 0, "max_dimension": maximum}
+                result, response, error = self._second_call("export_overlay", params, before, timeout=120)
+                if result is None:
+                    if error is not None and error.code == "UNSUPPORTED":
+                        self.second_batch_summary["unsupportedOverlays"].append({"overlay": overlay,
+                                                                                "reason": str(error)})
+                    continue
+                try:
+                    info = self._second_overlay_artifact(response, params, source_size)
+                except (OSError, ValueError, KeyError, TypeError, zlib.error, RenderTestAgentError) as error:
+                    self.fail(f"{overlay} artifact verification failed: {error}")
+                    continue
+                self.second_batch_summary["overlays"].append(info)
+                self.second_batch_summary["supportedOverlays"] += 1
+                print("  verified overlay:", json.dumps(info, ensure_ascii=False))
+            if self.second_batch_summary["supportedOverlays"] < 1:
+                self.fail("No diagnostic overlay produced a verified PNG; UNSUPPORTED is not a passed export")
+        finally:
+            after = self.ui_events()
+            self.second_batch_summary["uiAfter"] = after
+            self.second_batch_summary["artifactPaths"] = list(self.second_batch_artifacts)
+            if before != after:
+                self.fail(f"second-batch tools changed the UI event: {before} -> {after}")
+            else:
+                print(f"  UI event unchanged by second-batch tools: selected/current {after}")
 
     def run(self, max_draws: int) -> None:
         status = self.call("get_status")
@@ -308,6 +606,15 @@ class P0Smoke:
         if depth and depth.get("resourceId"):
             self.call("export_texture", {"resource_id": depth["resourceId"], "event_id": event_id,
                                          "channels": "depth"}, timeout=120)
+        diagnostic = self.call("export_overlay", {
+            "resource_id": rt_id, "event_id": event_id, "overlay": "Drawcall",
+            "mip": int(target.get("firstMip", 0)), "slice": int(target.get("firstSlice", 0)),
+            "sample": 0, "max_dimension": 256}, timeout=120)
+        if diagnostic:
+            artifact = diagnostic["artifacts"][0]
+            if png_size(Path(artifact["path"])) != (diagnostic["data"]["width"],
+                                                    diagnostic["data"]["height"]):
+                self.fail("Drawcall overlay PNG dimensions differ from the tool response")
 
         print("[buffers]")
         buffer = self.first_buffer(state)
@@ -748,8 +1055,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--all-p0", action="store_true")
     mode.add_argument("--analysis-only", action="store_true",
                       help="Check action/resource statistics and embedded source only.")
+    mode.add_argument("--second-batch", action="store_true",
+                      help="Check CBuffer member paging and diagnostic overlays only.")
     parser.add_argument("--event-id", type=int,
-                        help="Explicit draw EID for --analysis-only; otherwise probe for a draw.")
+                        help="Explicit draw EID for --analysis-only/--second-batch; otherwise probe for a draw.")
     parser.add_argument("--max-draws", type=int, default=40)
     parser.add_argument("--pixel-history", action="append", default=[],
                         metavar="RESOURCE:EID:X:Y",
@@ -766,8 +1075,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--launch", type=Path, help="Start qrendertest with this capture first.")
     parser.add_argument("--exe", type=Path, default=REPO_DIR / "x64" / "Release" / "qrendertest.exe")
     args = parser.parse_args(argv)
-    if args.event_id is not None and (not args.analysis_only or args.event_id < 0):
-        parser.error("--event-id requires --analysis-only and a nonnegative draw EID")
+    if args.event_id is not None and (not (args.analysis_only or args.second_batch) or args.event_id < 0):
+        parser.error("--event-id requires --analysis-only or --second-batch and a nonnegative draw EID")
 
     process = None
     if args.launch:
@@ -789,6 +1098,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         instance_id = instance["instanceId"]
         print("instance:", json.dumps(instance, ensure_ascii=False))
+        if args.second_batch:
+            smoke = P0Smoke(client, instance_id)
+            smoke.run_second_batch(args.max_draws, args.event_id)
+            smoke.report()
+            print("PASS" if not smoke.failures else f"{len(smoke.failures)} check(s) failed")
+            return 0 if not smoke.failures else 1
         if args.analysis_only:
             smoke = P0Smoke(client, instance_id)
             smoke.run_analysis(args.max_draws, args.event_id)

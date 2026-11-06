@@ -10,6 +10,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 AGENT_DIR = Path(__file__).resolve().parents[1]
@@ -456,11 +457,31 @@ class FakeRenderTestBridge:
         return BridgeResult(_payload(data), self._read_meta(params.get("event_id")))
 
     def _method_get_cbuffer(self, params: dict[str, Any]) -> BridgeResult:
-        event_id, _ = self._shader_id(params)
+        event_id, shader_id = self._shader_id(params)
         index = params.get("index")
         name = params.get("name")
         if index not in (None, 0) or name not in (None, "MaterialConstants"):
             raise AgentBridgeError("INVALID_REQUEST", "The constant buffer does not exist.")
+        from rendertest_agent_bridge.methods.cbuffer_members import validate_request, project_members
+        request = validate_request(params)
+        if request is not None:
+            from rendertest_agent_bridge.methods.pipeline import convert_variable
+            definitions = [("Tint", 0, [1.0, 0.5, 0.25, 1.0]), ("Exposure", 16, [1.0])]
+            variables = [SimpleNamespace(name=label, type="Float", rows=1, columns=len(values),
+                                          members=[], value=SimpleNamespace(f32v=values))
+                         for label, _, values in definitions]
+            block = SimpleNamespace(variables=[
+                SimpleNamespace(name=label, byteOffset=offset,
+                                type=SimpleNamespace(name="float" if len(values) == 1 else "float4",
+                                                     elements=1, members=[], arrayByteStride=0))
+                for label, offset, values in definitions])
+            data, cursor, truncated, warnings = project_members(
+                variables, block, request,
+                (self.capture_session_id, event_id, params["stage"], shader_id, 0, "2001", 0, 32),
+                convert_variable)
+            data.update(eventId=event_id, stage=params["stage"], index=0, name="MaterialConstants")
+            return BridgeResult(_payload(data, next_cursor=cursor, truncated=truncated, warnings=warnings),
+                                self._read_meta(params.get("event_id")))
         return BridgeResult(
             _payload(
                 {
@@ -567,6 +588,25 @@ class FakeRenderTestBridge:
         return BridgeResult(
             _payload({"resource": resource}, artifacts=[artifact]), self._read_meta(event_id)
         )
+
+    def _method_export_overlay(self, params: dict[str, Any]) -> BridgeResult:
+        from rendertest_agent_bridge.methods.overlay import OVERLAYS
+        if params.get("overlay") not in OVERLAYS:
+            raise AgentBridgeError("INVALID_REQUEST", "Unknown diagnostic overlay.")
+        resource, event = self._texture_view(params)
+        event = self.current_event_id if event is None else event
+        directory = artifact_directory(str(self.root), self.instance_id, self.capture_session_id, "replay")
+        path = Path(directory) / f"overlay-{uuid.uuid4().hex}.png"
+        path.write_bytes(_png_bytes(4, 4, [(255, 0, 0, 255), (0, 255, 0, 255)] * 8))
+        artifact = describe_artifact(str(path), "overlay", "image/png", source={
+            "event_id": event, "resource_id": resource["resourceId"], "overlay": params["overlay"],
+            "mip": 0, "slice": 0, "sample": 0,
+        }, extra={"width": 4, "height": 4})
+        return BridgeResult(_payload({"eventId": event, "overlay": params["overlay"],
+                                       "texture": resource, "path": str(path),
+                                       "representation": "composited-diagnostic",
+                                       "legend": "Synthetic test image, not native GPU diagnostic data."},
+                                      artifacts=[artifact]), self._read_meta(event))
 
     def _method_pick_pixel(self, params: dict[str, Any]) -> BridgeResult:
         resource, event_id = self._texture_view(params)

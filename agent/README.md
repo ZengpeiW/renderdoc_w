@@ -9,7 +9,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
 - M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
-- 分析工具扩展：Shader 内嵌源码读取、资源大小统计、事件统计；当前共 26 个 MCP 工具，Codex 和 Claude 共用。
+- 分析工具扩展：Shader 内嵌源码读取、资源大小统计、事件统计、CBuffer 成员查询和单 EID Overlay；当前共 27 个 MCP 工具，Codex 和 Claude 共用。
 
 ## P0 工具
 
@@ -17,9 +17,10 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 | --- | --- |
 | 实例/上下文 | `list_instances`、`get_status`、`get_context`（含当前 EID 的 Pipeline 摘要） |
 | Action | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`set_event`（唯一会改变 UI 的工具） |
-| Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`get_cbuffer` |
+| Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`get_cbuffer`（支持成员路径和子成员分页） |
 | 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
+| 诊断图 | `export_overlay`（单 EID 的离屏 Overlay PNG，不改变 UI） |
 | Buffer | `get_buffer_data`（64 KiB 内 base64，1 KiB 内附 hex，更大写 artifact；`format="float4, uint"` 可解码行） |
 | 消息 | `get_debug_messages` |
 | 文本 artifact | `read_artifact`（MCP 本地只读，不经 replay） |
@@ -31,6 +32,14 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - `get_action_stats(parent_event_id=None, cursor=None, limit=200, top_n=20)`：整帧或指定 action/marker 子树的事件类型计数，按直接子节点分组分页；总数与排名每页都覆盖完整范围。只计操作叶节点，容器与 marker 单独计数，排除父节点操作标志时给 warning；mesh/ray dispatch 单独分类。Draw 排名依据 `numIndices * numInstances`，普通 compute dispatch 按组数排名；这些是记录的工作量估计，不是三角形数、唯一 VS 调用数或 GPU 耗时。
 
 三个接口都保持当前 UI EID。源码导出标记为 `artifact`，另外两个为 `read`。例如可以直接问：“列出当前 Pixel Shader 的源码文件并解释主函数”、“统计这一帧的纹理和 Buffer，列出最大的 10 个资源”、“统计 EID 123 所在 pass 的 draw/dispatch，并找出工作量最大的 draw”。
+
+第二批分析接口：
+
+- `get_cbuffer` 新增可选 `member_path`、`cursor`、`limit` 和 `max_depth`。不传这些参数时保留旧摘要。`member_path=""` 分页浏览根成员；`member_path="Lights[123].Color"` 精确选择成员。返回的 `canonicalPath` 如 `[0][123][1]` 按直接子节点序号定位，支持重复名称和特殊名称，也可用 JSON 引号路径如 `["Light.Data"][123]["Color"]`。`selected` 是选中节点（标量值在 `selected.value`），`variables` 是其直接子成员的当前页，`childCount` 为子成员总数。`limit` 默认 200、上限 1000；`max_depth` 默认 0，仅返回浅层摘要，1–4 额外展开后代，仍受 4096 节点和 256 KiB 响应预算约束。按 `nextCursor` 翻同级，或复制子成员路径继续查询。游标绑定 capture、EID、Shader、CBuffer 绑定、成员和展开深度。`byteOffset` 相对常量块，实际 buffer 偏移还需加 `binding.byteOffset`；没有反射偏移时不猜值。此功能限制响应规模，原生 API 仍解码完整 block。
+- `export_overlay(resource_id, overlay, event_id=None, mip=0, slice=0, sample=0, type_cast="Typeless", range_min=0, range_max=1, max_dimension=1024, include_image=false)`：创建临时 headless ReplayOutput，导出与纹理显示路径一致的诊断合成 PNG。支持 `Drawcall`、`Wireframe`、`Depth`、`Stencil`、`BackfaceCull`、`ViewportScissor`、`QuadOverdrawDraw`、`TriangleSizeDraw`、`NaN`、`Clipping`。Draw 类模式要求实际 raster draw 和当时绑定的目标子资源；NaN/Clipping 可检查普通 2D 纹理。暂不支持 Mesh Shader draw、MSAA Overdraw、pass 级或 ClearBefore 模式。
+- Overlay 是 `artifact` 操作，不移动 UI 选中事件，也不修改 Texture Viewer 设置；输出始终在 `finally` 释放，并强制恢复共享诊断资源。图像是 8-bit RGB 可视化，默认最长边 1024，`max_dimension` 上限 4096，并受 2M 输出像素预算约束。源纹理及关联深度纹理限制为 16M 存储 texel（包括 mip/slice/sample），超限或 API 不支持时明确报错。结果提供 `legend`、原始/输出尺寸及 `displayTransform`；不要把缩放后的坐标、诊断色或 Overdraw 热图当作原始像素值、精确写入次数或 GPU 耗时。需要实际看图时指定 `include_image=true`。
+
+例如：“读取当前 Pixel Shader 的 Lights 数组第 123 项 Color”、“分页查看这个常量缓冲后面的成员”、“导出当前 Draw 的深度测试和背面剔除 Overlay，解释哪些区域被挡住”。Shader 反编译工具接入另行安排，优先评估可用的 release 二进制。
 
 ## P1 工具（M4）
 
@@ -113,6 +122,8 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --expect-
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc"
 # 只验证新增分析工具，明确选择 Draw EID，结束后退出独立进程
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --analysis-only --launch "E:\Captures\some.rdc" --event-id 3820
+# 验证 CBuffer 成员读取、分页和诊断 Overlay PNG，结束后退出独立进程
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --second-batch --launch "E:\Captures\some.rdc" --event-id 3820
 # 额外检查指定像素的 pixel_history（可重复）
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc" --pixel-history 116618:1513:1:1
 # 额外对指定像素跑 debug_pixel（自动取 pixel_history 里通过的 primitive，可重复）
