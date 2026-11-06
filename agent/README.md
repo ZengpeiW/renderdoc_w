@@ -2,7 +2,7 @@
 
 RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打开的 capture。设计见 [docs/MVP_DESIGN.md](docs/MVP_DESIGN.md)。
 
-当前进度：**M4 和 M5a–M5d 已实现**，支持本地历史保存与跨进程恢复。登录状态流通过 fake app-server 验证，真实浏览器授权仍需人工验收。详见 [M5 设计](docs/M5_DESIGN.md)。
+当前进度：**M4 和 M5a–M5d 已实现**，支持 Codex/Claude 双 harness、本地历史保存与跨进程恢复。Claude 在线调用与续聊已验证；Codex 浏览器 OAuth 完整流程仍需人工验收。当前交接快照、验证记录和后续候选见 [CURRENT_STATUS.md](docs/CURRENT_STATUS.md)，设计过程见 [M5 设计](docs/M5_DESIGN.md)。
 
 - M0：MCP Server、文件 mailbox IPC、fake Bridge 和协议测试。
 - M1：qrendertest 启动时从 `integrations/rendertest_agent/python` 固定加载 Bridge，写实例清单和心跳，跟踪 capture 加载、关闭和选中事件，支持 `ping` / `get_status` / `get_context`。
