@@ -1,6 +1,8 @@
 #include "AgentMarkdown.h"
 #include <QRegularExpression>
 #include <QStringList>
+#include <QUrl>
+#include <QUrlQuery>
 
 namespace
 {
@@ -31,10 +33,43 @@ QString BoldAndLinks(const QString &escaped)
 {
   static const QRegularExpression bold(lit("\\*\\*(.+?)\\*\\*"));
   static const QRegularExpression link(lit("\\[([^\\]]+)\\]\\(([^)\\s]+)\\)"));
-  QString text = Linkify(escaped);
+  QString text;
+  int pos = 0;
+  QRegularExpressionMatchIterator it = link.globalMatch(escaped);
+  while(it.hasNext())
+  {
+    QRegularExpressionMatch match = it.next();
+    text += Linkify(escaped.mid(pos, match.capturedStart() - pos));
+    text += lit("<a href=\"%1\">%2</a>").arg(match.captured(2), match.captured(1));
+    pos = match.capturedEnd();
+  }
+  text += Linkify(escaped.mid(pos));
   text.replace(bold, lit("<b>\\1</b>"));
-  text.replace(link, lit("<a href=\"\\2\">\\1</a>"));
   return text;
+}
+
+QString ScopeReferences(const QString &html, const QString &referenceToken)
+{
+  static const QRegularExpression href(lit("href=\"([^\"]+)\""));
+  QString result;
+  int pos = 0;
+  QRegularExpressionMatchIterator it = href.globalMatch(html);
+  while(it.hasNext())
+  {
+    QRegularExpressionMatch match = it.next();
+    QUrl url(match.captured(1).replace(lit("&amp;"), lit("&")));
+    if(url.scheme() != lit("rt"))
+      continue;
+    // Explicit Markdown URLs must get the message's scope too. Never trust a model-supplied token.
+    QUrlQuery query;
+    query.addQueryItem(lit("source"), referenceToken);
+    url.setQuery(query);
+    url.setFragment(QString());
+    result += html.mid(pos, match.capturedStart() - pos);
+    result += lit("href=\"%1\"").arg(QString::fromUtf8(url.toEncoded()).toHtmlEscaped());
+    pos = match.capturedEnd();
+  }
+  return result + html.mid(pos);
 }
 
 bool IsTableRow(const QString &line)
@@ -90,7 +125,7 @@ QString AgentMarkdown::InlineToHtml(const QString &text)
   return html;
 }
 
-QString AgentMarkdown::ToHtml(const QString &markdown)
+QString AgentMarkdown::ToHtml(const QString &markdown, const QString &referenceToken)
 {
   static const QRegularExpression heading(lit("^(#{1,6})\\s+(.*)$"));
   static const QRegularExpression bullet(lit("^\\s*[-*+]\\s+(.*)$"));
@@ -214,5 +249,5 @@ QString AgentMarkdown::ToHtml(const QString &markdown)
 
   flushParagraph();
   closeList();
-  return html;
+  return ScopeReferences(html, referenceToken);
 }

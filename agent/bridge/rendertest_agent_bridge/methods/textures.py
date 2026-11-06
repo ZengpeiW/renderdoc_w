@@ -14,6 +14,16 @@ EXPORT_FORMATS = {
 }
 CHANNELS = {"rgba": -1, "rgb": -1, "r": 0, "g": 1, "b": 2, "a": 3, "depth": 0, "stencil": 1}
 INTEGER_COMP_TYPES = {"UInt": "uint", "SInt": "int"}
+TYPE_CASTS = ("Typeless", "Float", "UNorm", "SNorm", "UInt", "SInt", "UScaled", "SScaled",
+              "Depth", "UNormSRGB")
+
+
+def _type_cast(context):
+    return get_choice(context.params, "type_cast", TYPE_CASTS, "Typeless")
+
+
+def _component_type(texture, type_cast="Typeless"):
+    return enum_name(texture.format.compType) if type_cast == "Typeless" else type_cast
 
 
 def _texture_view(context, resources, key):
@@ -56,17 +66,17 @@ def _prepare(runtime, context):
     return key, resources, event_id, view
 
 
-def _interpret(texture, value):
+def _interpret(texture, value, type_cast="Typeless"):
     fmt = texture.format
     count = max(1, min(4, int(fmt.compCount)))
-    comp_type = enum_name(fmt.compType)
+    comp_type = _component_type(texture, type_cast)
     kind = INTEGER_COMP_TYPES.get(comp_type, "float")
     source = {"float": value.floatValue, "uint": value.uintValue, "int": value.intValue}[kind]
     return kind, numbers(source, count)
 
 
-def _pixel(texture, value):
-    kind, values = _interpret(texture, value)
+def _pixel(texture, value, type_cast="Typeless"):
+    kind, values = _interpret(texture, value, type_cast)
     return {
         "interpretedAs": kind,
         "value": values,
@@ -86,6 +96,7 @@ def _texture_info(resources, key, view):
 
 def pick_pixel(runtime, context):
     key, resources, event_id, view = _prepare(runtime, context)
+    type_cast = _type_cast(context)
     x = get_int(context.params, "x", required=True)
     y = get_int(context.params, "y", required=True)
     if x >= view["width"] or y >= view["height"]:
@@ -95,11 +106,13 @@ def pick_pixel(runtime, context):
 
     def read(controller):
         rd = renderdoc_module()
-        value = controller.PickPixel(handle, x, y, _subresource(rd, view), rd.CompType.Typeless)
-        return _pixel(texture, value)
+        value = controller.PickPixel(handle, x, y, _subresource(rd, view),
+                                     getattr(rd.CompType, type_cast))
+        return _pixel(texture, value, type_cast)
 
     pixel, meta = runtime.replay.at_event(context, event_id, read)
-    data = {"eventId": event_id, "texture": _texture_info(resources, key, view), "x": x, "y": y}
+    data = {"eventId": event_id, "texture": _texture_info(resources, key, view), "x": x, "y": y,
+            "typeCast": type_cast}
     data.update(pixel)
     return result(data, meta=meta)
 

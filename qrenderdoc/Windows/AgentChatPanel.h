@@ -68,13 +68,17 @@ private:
   void UpdateChips();
   QList<AgentContextChip> ContextSnapshot() const;
   QString LinkError(const QUrl &url);
+  bool ReadCaptureBinding(QString &instanceId, QString &sessionId) const;
+  void CaptureChanged(const QString &message);
 
   void StartSession();
   void ReadAccount(int generation);
   void SetSkillRoots(int generation);
   void BeginThread(int generation);
   void StartThread(int generation, const QStringList &disabledServers);
-  void PollMcpStatus(int generation, int attempt);
+  void PollMcpStatus(int generation, int attempt, const QString &cursor = QString(),
+                     const QJsonArray &entries = QJsonArray(),
+                     const QStringList &seenCursors = QStringList());
   void StartTurn();
   void SessionFailed(SessionState state, const QString &message);
   void KillSession();
@@ -107,11 +111,14 @@ private:
   SessionState m_State = SessionState::Idle;
   QString m_StateMessage;
   int m_Generation = 0;
+  int m_TurnRequest = 0;
   bool m_ExpectExit = false;
   bool m_QuestionActive = false;
   bool m_HadThread = false;
   QString m_PendingText;
   QString m_InstanceId;
+  QString m_CaptureSessionId;
+  QString m_ReferenceToken;
   QString m_Account;
   QString m_AccountType;
   QString m_McpStatus;
@@ -153,6 +160,9 @@ private:
     QString stopOnTool;
     int stopAfterMs = 0;
     int stopQuestion = 0;
+    int turnTimeoutMs = 60000;
+    int captureChangeAfterMs = 0;
+    bool captureChangeBeforeLinks = false;
     bool waitForCapture = false;
     int captureTimeoutMs = 180000;
     qint64 selectEvent = -1;

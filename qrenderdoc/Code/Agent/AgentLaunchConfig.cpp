@@ -20,8 +20,6 @@ const char *IsolatedFeatures[] = {
     "multi_agent",
     "goals",
     "hooks",
-    "shell_tool",
-    "unified_exec",
 };
 
 QString EnvValue(const char *name)
@@ -197,21 +195,32 @@ QString AgentLaunchConfig::DeveloperInstructions(const QString &instanceId)
              "argument names (event_id, resource_id, x, y with a top-left origin, mip, slice, "
              "sample, vertex, instance, view), so use them directly instead of asking the user. "
              "For a pixel, start with `pick_pixel` and `pixel_history` on that resource; for a "
-             "vertex, use `debug_vertex` or `get_mesh_data`.\n"
+              "vertex, use `debug_vertex` or `get_mesh_data`. Preserve the pixel `type_cast` "
+              "when calling pick_pixel and pixel_history.\n"
+              "- If captureToolsAvailable is false, this is plain chat: no capture tools are "
+              "available and you must not inspect another instance.\n"
+              "- Read large shader disassembly and debug JSONL with `read_artifact(path, "
+              "start_line=1, limit=100, search=null, max_bytes=65536)`. Use the returned "
+              "nextLine for pagination and search for literal substrings. Only paths from "
+              "successful tools in this MCP session can be read; rerun the producing tool "
+              "after a restart. Do not use shell commands to read these files.\n"
              "- The rendertest server provides get_status, get_context, list_actions, "
              "find_actions, inspect_event, get_pipeline_state, get_shader, get_cbuffer, "
              "list_resources, get_resource, get_resource_usage, export_texture, pick_pixel, "
              "get_texture_stats, pixel_history, debug_pixel, debug_vertex, get_mesh_data, "
-             "get_buffer_data and get_debug_messages. If one of them is not loaded yet, search "
+              "get_buffer_data, get_debug_messages and read_artifact. If one is not loaded yet, search "
              "for it instead of saying it is unavailable.\n"
              "- You cannot run shell commands or write files; rely on the rendertest tools.")
       .arg(instance);
 }
 
-AgentLaunchConfig AgentLaunchConfig::Resolve(const QString &instanceId, const QString &agentRoot)
+AgentLaunchConfig AgentLaunchConfig::Resolve(const QString &instanceId, const QString &captureSessionId,
+                                            const QString &agentRoot)
 {
   AgentLaunchConfig config;
   config.instanceId = instanceId;
+  config.captureSessionId = captureSessionId;
+  config.captureTools = !instanceId.isEmpty() && !captureSessionId.isEmpty();
   config.agentRoot = Posix(agentRoot);
 
   QStringList prefixArgs;
@@ -219,9 +228,12 @@ AgentLaunchConfig AgentLaunchConfig::Resolve(const QString &instanceId, const QS
   if(!config.error.isEmpty())
     return config;
 
-  config.mcpPython = FindMcpPython(config.error);
-  if(!config.error.isEmpty())
-    return config;
+  if(config.captureTools)
+  {
+    config.mcpPython = FindMcpPython(config.error);
+    if(!config.error.isEmpty())
+      return config;
+  }
 
   QString isolate = EnvValue("RENDERTEST_AGENT_ISOLATE").toLower();
   config.isolate = !(isolate == lit("0") || isolate == lit("false") || isolate == lit("off"));
@@ -235,17 +247,26 @@ AgentLaunchConfig AgentLaunchConfig::Resolve(const QString &instanceId, const QS
 
   const QString server = QString::fromLatin1(ServerName);
   QStringList overrides;
-  overrides << lit("mcp_servers.%1.command=%2").arg(server, TomlString(config.mcpPython));
+  // A disabled entry still needs a valid transport config when no user entry exists.
+  overrides << lit("mcp_servers.%1.command=%2")
+                   .arg(server, TomlString(config.captureTools ? config.mcpPython : lit("rendertest-disabled")));
   overrides << lit("mcp_servers.%1.args=[\"-m\",\"rendertest_mcp\"]").arg(server);
-  if(!instanceId.isEmpty())
+  if(config.captureTools)
+  {
     overrides << lit("mcp_servers.%1.env.RENDERTEST_AGENT_INSTANCE_ID=%2")
                      .arg(server, TomlString(instanceId));
-  overrides << lit("mcp_servers.%1.env.RENDERTEST_AGENT_ROOT=%2")
-                   .arg(server, TomlString(config.agentRoot));
-  overrides << lit("mcp_servers.%1.tool_timeout_sec=180").arg(server);
-  overrides << lit("mcp_servers.%1.startup_timeout_sec=30").arg(server);
-  overrides << lit("mcp_servers.%1.enabled=true").arg(server);
+    overrides << lit("mcp_servers.%1.env.RENDERTEST_AGENT_FIXED_INSTANCE_ID=%2")
+                     .arg(server, TomlString(instanceId));
+    overrides << lit("mcp_servers.%1.env.RENDERTEST_AGENT_CAPTURE_SESSION_ID=%2")
+                     .arg(server, TomlString(captureSessionId));
+    overrides << lit("mcp_servers.%1.env.RENDERTEST_AGENT_ROOT=%2")
+                     .arg(server, TomlString(config.agentRoot));
+    overrides << lit("mcp_servers.%1.tool_timeout_sec=180").arg(server);
+    overrides << lit("mcp_servers.%1.startup_timeout_sec=30").arg(server);
+  }
+  overrides << lit("mcp_servers.%1.enabled=%2").arg(server, config.captureTools ? lit("true") : lit("false"));
   overrides << lit("web_search=\"disabled\"");
+  overrides << lit("features.shell_tool=false") << lit("features.unified_exec=false");
   if(config.isolate)
   {
     for(const char *feature : IsolatedFeatures)

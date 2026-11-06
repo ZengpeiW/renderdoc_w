@@ -29,7 +29,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-SCENARIOS = ("stream", "tool", "approvals", "interrupt", "hang", "crash-once", "logged-out")
+SCENARIOS = ("stream", "tool", "approvals", "interrupt", "hang", "crash-once", "logged-out",
+             "config-error", "config-malformed", "status-error", "status-foreign",
+             "status-page-foreign", "status-pages", "status-loop", "turn-timeout-once",
+             "late-items", "late-before-start", "late-response", "command-status", "explicit-links")
 ANSWER = "Hello from the **fake** app-server.\n\n- EID 1513 draws the scene\n- uses `ResourceId::116618`"
 SERVER_REQUESTS = (
     "item/commandExecution/requestApproval",
@@ -53,6 +56,7 @@ class FakeAppServer:
         self.server_replies: dict[int, threading.Event] = {}
         self.next_server_id = 1000
         self.thread_id = ""
+        self.capture_tools_enabled = False
         self.log({"event": "start", "pid": os.getpid(), "scenario": scenario, "argv": argv})
 
     def log(self, entry: dict[str, Any]) -> None:
@@ -105,24 +109,65 @@ class FakeAppServer:
         elif method == "skills/extraRoots/set":
             self.respond(request_id, {})
         elif method == "config/read":
+            if self.scenario == "config-error":
+                self.send({"id": request_id, "error": {"code": -32000, "message": "config unavailable"}})
+                return
+            if self.scenario == "config-malformed":
+                self.respond(request_id, {})
+                return
             self.respond(request_id, {"config": {"mcp_servers": {
                 "rendertest": {"command": "python"}, "blender": {"command": "blender-mcp"}}}})
         elif method == "thread/start":
+            self.capture_tools_enabled = params.get("config", {}).get("mcp_servers.rendertest.enabled", True)
             self.thread_counter += 1
             self.thread_id = f"thr_{self.prefix}_{self.thread_counter}"
             self.respond(request_id, {"thread": {"id": self.thread_id}, "model": "fake-model",
                                       "sandbox": {"type": "readOnly", "networkAccess": False},
                                       "approvalPolicy": "never"})
         elif method == "mcpServerStatus/list":
-            self.respond(request_id, {"data": [
-                {"name": "rendertest", "runtimeStatus": "connected",
-                 "tools": {f"tool{i}": {} for i in range(22)}, "toolsError": None},
-                {"name": "blender", "runtimeStatus": "disabled", "tools": {}, "toolsError": None},
-            ], "nextCursor": None})
+            if self.scenario == "status-error":
+                self.send({"id": request_id, "error": {"code": -32000, "message": "status unavailable"}})
+                return
+            primary = {"name": "rendertest",
+                       "runtimeStatus": "connected" if self.capture_tools_enabled else "disabled",
+                       "tools": {f"tool{i}": {} for i in range(22)} if self.capture_tools_enabled else {},
+                       "toolsError": None}
+            other = {"name": "blender", "runtimeStatus": "disabled", "tools": {}, "toolsError": None}
+            if self.scenario in ("status-foreign", "status-page-foreign"):
+                other["runtimeStatus"] = "connected"
+            if self.scenario in ("status-page-foreign", "status-pages", "status-loop"):
+                page = [other] if params.get("cursor") else [primary]
+                cursor = "page2" if not params.get("cursor") or self.scenario == "status-loop" else None
+                self.respond(request_id, {"data": page, "nextCursor": cursor})
+            else:
+                self.respond(request_id, {"data": [primary, other], "nextCursor": None})
         elif method == "turn/start":
             self.turn_counter += 1
             turn_id = f"turn_{self.prefix}_{self.turn_counter}"
             self.interrupted.clear()
+            marker = self.state_dir / "timed-out-once" if self.state_dir else None
+            if self.scenario == "turn-timeout-once" and marker and not marker.exists():
+                marker.write_text("1", encoding="utf-8")
+                self.notify("turn/started", {"threadId": params["threadId"],
+                                             "turn": {"id": turn_id, "status": "inProgress"}})
+                # The client must terminate this accepted remote turn, not merely time out locally.
+                threading.Timer(2, lambda: self.respond(request_id, {
+                    "turn": {"id": turn_id, "status": "inProgress"}})).start()
+                return
+            if self.scenario == "late-before-start" and self.turn_counter == 2:
+                previous = f"turn_{self.prefix}_1"
+                self.notify("turn/started", {"threadId": params["threadId"],
+                                             "turn": {"id": previous, "status": "inProgress"}})
+                self.notify("item/completed", {"threadId": params["threadId"], "turnId": previous,
+                    "item": {"type": "agentMessage", "id": "stale-before-start", "text": "STALE ANSWER"}})
+                self.complete(params["threadId"], previous, "completed")
+                self.notify("item/completed", {"threadId": params["threadId"], "turnId": turn_id,
+                    "item": {"type": "agentMessage", "id": "early-current", "text": "EARLY ITEM"}})
+            if self.scenario == "late-response" and self.turn_counter == 1:
+                threading.Timer(0.7, lambda: self.send({"id": request_id, "error": {
+                    "code": -32000, "message": "late response from finished first turn"}})).start()
+                threading.Thread(target=self.run_turn, args=(params["threadId"], turn_id), daemon=True).start()
+                return
             self.respond(request_id, {"turn": {"id": turn_id, "status": "inProgress"}})
             threading.Thread(target=self.run_turn, args=(params.get("threadId"), turn_id),
                              daemon=True).start()
@@ -156,7 +201,20 @@ class FakeAppServer:
                                        "item": {"type": "agentMessage", "id": item_id, "text": text}})
 
     def run_turn(self, thread_id: str, turn_id: str) -> None:
+        if self.scenario == "late-response" and self.turn_counter == 2:
+            time.sleep(0.6)
         self.notify("turn/started", {"threadId": thread_id, "turn": {"id": turn_id, "status": "inProgress"}})
+        if self.scenario == "late-items":
+            for stale_thread, stale_turn in (("old-thread", turn_id),
+                                             (thread_id, f"turn_{self.prefix}_{self.turn_counter - 1}")):
+                self.notify("item/completed", {"threadId": stale_thread, "turnId": stale_turn,
+                    "item": {"type": "agentMessage", "id": "stale", "text": "STALE ANSWER"}})
+        if self.scenario == "command-status":
+            for kind in ("commandExecution", "fileChange"):
+                for status in ("completed", "failed", "declined"):
+                    self.notify("item/completed", {"threadId": thread_id, "turnId": turn_id,
+                        "item": {"type": kind, "id": f"{kind}-{status}", "command": "echo hello",
+                                 "status": status}})
         reasoning_id = self.item_id(turn_id, "reasoning")
         self.notify("item/started", {"threadId": thread_id, "turnId": turn_id,
                                      "item": {"type": "reasoning", "id": reasoning_id, "summary": [],
@@ -219,7 +277,10 @@ class FakeAppServer:
             self.complete(thread_id, turn_id, "failed", "fake: nobody stopped the turn")
             return
 
-        self.stream_message(thread_id, turn_id, ANSWER)
+        text = ANSWER
+        if self.scenario == "explicit-links":
+            text += "\n[direct](rt://event/1513?source=forged) [EID 1513](rt://resource/116618)"
+        self.stream_message(thread_id, turn_id, text)
         self.notify("thread/tokenUsage/updated", {"threadId": thread_id, "turnId": turn_id,
                                                   "tokenUsage": {"total": {"totalTokens": 4242},
                                                                  "last": {"totalTokens": 42},

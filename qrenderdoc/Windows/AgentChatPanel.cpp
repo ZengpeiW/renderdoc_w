@@ -1,6 +1,7 @@
 #include "AgentChatPanel.h"
 #include <QCoreApplication>
 #include <QDesktopServices>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -16,6 +17,8 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QUrl>
+#include <QUrlQuery>
+#include <QUuid>
 #include <QVBoxLayout>
 #include "Code/Agent/AgentMarkdown.h"
 #include "Code/Agent/CodexAppServerClient.h"
@@ -70,7 +73,8 @@ QStringList RenderedLinks(const QList<AgentItem> &items)
   {
     if(item.kind != AgentItem::Kind::Agent)
       continue;
-    QRegularExpressionMatchIterator it = href.globalMatch(AgentMarkdown::ToHtml(item.text));
+    QRegularExpressionMatchIterator it =
+        href.globalMatch(AgentMarkdown::ToHtml(item.text, item.referenceToken));
     while(it.hasNext())
     {
       QString link = it.next().captured(1);
@@ -84,6 +88,7 @@ QStringList RenderedLinks(const QList<AgentItem> &items)
 
 AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(parent), m_Ctx(ctx)
 {
+  m_ReferenceToken = QUuid::createUuid().toString().mid(1, 36);
   setWindowTitle(tr("AI Assistant"));
 
   m_Status = new QLabel(this);
@@ -139,8 +144,6 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   connect(m_StopTimer, &QTimer::timeout, this, &AgentChatPanel::ForceStop);
 
   m_Client = new CodexAppServerClient(this);
-  connect(m_Client, &CodexAppServerClient::notificationReceived, this,
-          &AgentChatPanel::OnNotification);
   connect(m_Client, &CodexAppServerClient::serverRequestAnswered, this,
           &AgentChatPanel::OnServerRequest);
   connect(m_Client, &CodexAppServerClient::processExited, this, &AgentChatPanel::OnProcessExited);
@@ -168,26 +171,64 @@ AgentChatPanel::~AgentChatPanel()
 
 void AgentChatPanel::OnCaptureLoaded()
 {
+  CaptureChanged(tr("A capture was loaded. The next question starts a new conversation."));
   m_Chips.clear();
   m_IncludeEvent = true;
   UpdateChips();
-  if(!m_Conversation.Items().isEmpty())
-  {
-    m_Conversation.AddNotice(lit("info"), tr("A capture was loaded. Earlier answers may refer to "
-                                             "another capture; use New Chat to start fresh."));
-    ScheduleRender();
-  }
 }
 
 void AgentChatPanel::OnCaptureClosed()
 {
+  CaptureChanged(tr("The capture was closed. Its conversation and links are no longer active."));
   m_Chips.clear();
   UpdateChips();
-  if(!m_Conversation.Items().isEmpty())
-  {
-    m_Conversation.AddNotice(lit("info"), tr("The capture was closed."));
-    ScheduleRender();
-  }
+}
+
+void AgentChatPanel::CaptureChanged(const QString &message)
+{
+  m_ReferenceToken = QUuid::createUuid().toString().mid(1, 36);
+  // Invalidate callbacks before terminating the old process. Its MCP binding must never migrate.
+  KillSession();
+  m_PendingText.clear();
+  m_CaptureSessionId.clear();
+  if(m_Conversation.TurnRunning())
+    m_Conversation.EndTurn(lit("interrupted"), message);
+  else if(!m_Conversation.Items().isEmpty())
+    m_Conversation.AddNotice(lit("info"), message);
+  QuestionFinished();
+  ScheduleRender();
+  UpdateControls();
+}
+
+bool AgentChatPanel::ReadCaptureBinding(QString &instanceId, QString &sessionId) const
+{
+  instanceId.clear();
+  sessionId.clear();
+  RenderTestAgentIntegration *integration = m_Ctx.AgentIntegration();
+  if(!integration || !integration->IsRunning())
+    return false;
+  QJsonObject manifest = integration->ReadManifest();
+  const QString instance = integration->InstanceId();
+  if(instance.isEmpty() || manifest[lit("instanceId")].toString() != instance ||
+     manifest[lit("pid")].toDouble(-1) != double(QCoreApplication::applicationPid()) ||
+     manifest[lit("stopped")].toBool(true))
+    return false;
+  instanceId = instance;
+  const qint64 age = QDateTime::currentMSecsSinceEpoch() -
+                     qint64(manifest[lit("heartbeatUnixMs")].toDouble());
+  if(age < -5000 || age > 15000 || !m_Ctx.IsCaptureLoaded() || m_Ctx.IsCaptureLoading() ||
+     !manifest[lit("captureLoaded")].toBool(false))
+    return false;
+  QString bridgePath = QDir::cleanPath(QDir::fromNativeSeparators(manifest[lit("capturePath")].toString()));
+  QString uiPath = QDir::cleanPath(QDir::fromNativeSeparators(QString(m_Ctx.GetCaptureFilename())));
+#if defined(Q_OS_WIN32)
+  if(bridgePath.compare(uiPath, Qt::CaseInsensitive) != 0)
+#else
+  if(bridgePath != uiPath)
+#endif
+    return false;
+  sessionId = manifest[lit("captureSessionId")].toString();
+  return !sessionId.isEmpty();
 }
 
 void AgentChatPanel::OnEventChanged(uint32_t eventId)
@@ -315,6 +356,13 @@ QString AgentChatPanel::LinkError(const QUrl &url)
     return tr("Malformed link %1").arg(url.toString());
   if(!m_Ctx.IsCaptureLoaded())
     return tr("No capture is loaded.");
+  const QString source = QUrlQuery(url).queryItemValue(lit("source"));
+  if(source.isEmpty() || source != m_ReferenceToken)
+    return tr("This link belongs to an earlier capture or has no capture identity.");
+  QString instance, session;
+  if(!ReadCaptureBinding(instance, session) || instance != m_InstanceId ||
+     session != m_CaptureSessionId)
+    return tr("The capture identity changed; this link cannot be opened.");
 
   if(url.host() == lit("event"))
   {
@@ -389,6 +437,14 @@ void AgentChatPanel::Send()
 
 void AgentChatPanel::SendText(const QString &text)
 {
+  QString instance, session;
+  ReadCaptureBinding(instance, session);
+  if(m_InstanceId != instance || m_CaptureSessionId != session)
+  {
+    CaptureChanged(tr("The capture binding changed. Started a new conversation."));
+    m_InstanceId = instance;
+    m_CaptureSessionId = session;
+  }
   QList<AgentContextChip> context = ContextSnapshot();
   QJsonArray contextJson;
   for(const AgentContextChip &chip : context)
@@ -399,7 +455,7 @@ void AgentChatPanel::SendText(const QString &text)
   m_Chips.clear();
   m_Prefill.clear();
   UpdateChips();
-  m_Conversation.BeginTurn();
+  m_Conversation.BeginTurn(m_ReferenceToken);
   m_QuestionActive = true;
   m_StopRequested = false;
 
@@ -421,20 +477,17 @@ void AgentChatPanel::SendText(const QString &text)
 
 QString AgentChatPanel::BuildTurnText(const QString &question, const QList<AgentContextChip> &context)
 {
-  RenderTestAgentIntegration *integration = m_Ctx.AgentIntegration();
-  QJsonObject manifest = integration ? integration->ReadManifest() : QJsonObject();
   const bool loaded = m_Ctx.IsCaptureLoaded();
 
   QStringList lines;
   lines << lit("<rendertest_context>");
-  QString instance = integration ? integration->InstanceId() : QString();
-  lines << lit("instanceId: %1").arg(instance.isEmpty() ? lit("unavailable") : instance);
+  lines << lit("instanceId: %1").arg(m_InstanceId.isEmpty() ? lit("unavailable") : m_InstanceId);
   lines << lit("captureLoaded: %1").arg(loaded ? lit("true") : lit("false"));
+  lines << lit("captureToolsAvailable: %1").arg(m_CaptureSessionId.isEmpty() ? lit("false") : lit("true"));
   if(loaded)
   {
-    QString session = manifest[lit("captureSessionId")].toString();
-    if(!session.isEmpty())
-      lines << lit("captureSessionId: %1").arg(session);
+    if(!m_CaptureSessionId.isEmpty())
+      lines << lit("captureSessionId: %1").arg(m_CaptureSessionId);
     lines << lit("capture: %1").arg(QDir::fromNativeSeparators(QString(m_Ctx.GetCaptureFilename())));
   }
   for(const AgentContextChip &chip : context)
@@ -476,17 +529,16 @@ void AgentChatPanel::StartSession()
 {
   const int generation = ++m_Generation;
 
-  RenderTestAgentIntegration *integration = m_Ctx.AgentIntegration();
-  m_InstanceId = integration ? integration->InstanceId() : QString();
-  if(m_InstanceId.isEmpty())
+  if(m_CaptureSessionId.isEmpty())
   {
     m_Conversation.AddNotice(
         lit("warning"),
-        tr("The RenderTest agent bridge is not running in this window, so capture tools are "
-           "unavailable. Unset RENDERTEST_AGENT_BRIDGE=0 and restart to enable them."));
+        tr("No capture is safely bound to this conversation. Capture tools are disabled; "
+           "plain chat is available."));
   }
 
-  m_Launch = AgentLaunchConfig::Resolve(m_InstanceId, RenderTestAgentIntegration::AgentRoot());
+  m_Launch = AgentLaunchConfig::Resolve(m_InstanceId, m_CaptureSessionId,
+                                      RenderTestAgentIntegration::AgentRoot());
   if(!m_Launch.error.isEmpty())
   {
     SessionFailed(SessionState::Error, m_Launch.error);
@@ -500,6 +552,12 @@ void AgentChatPanel::StartSession()
   m_OtherServers.clear();
 
   m_Client->SetLogPath(LogPath());
+  disconnect(m_Client, &CodexAppServerClient::notificationReceived, this, nullptr);
+  connect(m_Client, &CodexAppServerClient::notificationReceived, this,
+          [this, generation](const QString &method, const QJsonObject &params) {
+            if(generation == m_Generation)
+              OnNotification(method, params);
+          });
   QString error;
   if(!m_Client->Start(m_Launch.program, m_Launch.arguments, m_Launch.workingDir, error))
   {
@@ -607,7 +665,7 @@ void AgentChatPanel::BeginThread(int generation)
         if(generation != m_Generation)
           return;
         QStringList disabled;
-        if(error.isEmpty())
+        if(error.isEmpty() && result.toObject()[lit("config")].toObject()[lit("mcp_servers")].isObject())
         {
           QJsonObject servers =
               result.toObject()[lit("config")].toObject()[lit("mcp_servers")].toObject();
@@ -619,9 +677,9 @@ void AgentChatPanel::BeginThread(int generation)
         }
         else
         {
-          m_Conversation.AddNotice(lit("warning"), tr("Could not read the Codex config to isolate "
-                                                      "other MCP servers: %1")
-                                                       .arg(ErrorMessage(error)));
+          SessionFailed(SessionState::Error, tr("Could not verify MCP isolation: %1")
+                                                 .arg(ErrorMessage(error)));
+          return;
         }
         StartThread(generation, disabled);
       });
@@ -632,6 +690,7 @@ void AgentChatPanel::StartThread(int generation, const QStringList &disabledServ
   QJsonObject config;
   for(const QString &name : disabledServers)
     config[lit("mcp_servers.%1.enabled").arg(name)] = false;
+  config[lit("mcp_servers.rendertest.enabled")] = m_Launch.captureTools;
 
   QJsonObject params;
   params[lit("cwd")] = m_Launch.workingDir;
@@ -678,17 +737,50 @@ void AgentChatPanel::StartThread(int generation, const QStringList &disabledServ
                     });
 }
 
-void AgentChatPanel::PollMcpStatus(int generation, int attempt)
+void AgentChatPanel::PollMcpStatus(int generation, int attempt, const QString &cursor,
+                                  const QJsonArray &entries, const QStringList &seenCursors)
 {
   QJsonObject params;
   params[lit("threadId")] = m_Conversation.ThreadId();
   params[lit("detail")] = lit("toolsAndAuthOnly");
   params[lit("limit")] = 100;
+  if(!cursor.isEmpty())
+    params[lit("cursor")] = cursor;
   m_Client->Request(
       lit("mcpServerStatus/list"), params, ConfigTimeoutMs,
-      [this, generation, attempt](const QJsonValue &result, const QJsonObject &error) {
+      [this, generation, attempt, entries, seenCursors, cursor](const QJsonValue &result,
+                                                               const QJsonObject &error) {
         if(generation != m_Generation)
           return;
+
+        if(!error.isEmpty() || !result.toObject()[lit("data")].isArray())
+        {
+          SessionFailed(SessionState::Error, tr("Could not verify MCP server status: %1")
+                                                 .arg(ErrorMessage(error)));
+          return;
+        }
+        QJsonArray all = entries;
+        for(const QJsonValue &entry : result.toObject()[lit("data")].toArray())
+          all << entry;
+        QJsonValue nextValue = result.toObject()[lit("nextCursor")];
+        if(!nextValue.isNull() && !nextValue.isString())
+        {
+          SessionFailed(SessionState::Error, tr("MCP status response has no valid pagination cursor."));
+          return;
+        }
+        QString next = nextValue.toString();
+        if(!next.isEmpty())
+        {
+          if(next == cursor || seenCursors.contains(next) || seenCursors.size() >= 100)
+          {
+            SessionFailed(SessionState::Error, tr("MCP status pagination did not complete."));
+            return;
+          }
+          QStringList seen = seenCursors;
+          seen << next;
+          PollMcpStatus(generation, attempt, next, all, seen);
+          return;
+        }
 
         const QString server = QString::fromLatin1(AgentLaunchConfig::ServerName);
         QString status = lit("unknown");
@@ -697,7 +789,7 @@ void AgentChatPanel::PollMcpStatus(int generation, int attempt)
         QStringList others;
         if(error.isEmpty())
         {
-          for(const QJsonValue &value : result.toObject()[lit("data")].toArray())
+          for(const QJsonValue &value : all)
           {
             QJsonObject entry = value.toObject();
             QString name = entry[lit("name")].toString();
@@ -715,7 +807,14 @@ void AgentChatPanel::PollMcpStatus(int generation, int attempt)
           }
         }
 
-        if((status == lit("starting") || status == lit("notStarted")) && attempt + 1 < McpPollAttempts)
+        if(m_Launch.isolate && !others.isEmpty())
+        {
+          SessionFailed(SessionState::Error,
+                        tr("MCP isolation failed; other servers are enabled: %1").arg(others.join(lit(", "))));
+          return;
+        }
+        if(m_Launch.captureTools && (status == lit("starting") || status == lit("notStarted")) &&
+           attempt + 1 < McpPollAttempts)
         {
           m_McpStatus = status;
           UpdateControls();
@@ -729,19 +828,13 @@ void AgentChatPanel::PollMcpStatus(int generation, int attempt)
         m_McpStatus = status;
         m_McpTools = tools;
         m_OtherServers = others;
-        if(!error.isEmpty())
-          m_Conversation.AddNotice(
-              lit("warning"), tr("Could not query MCP server status: %1").arg(ErrorMessage(error)));
-        else if(status != lit("connected"))
-          m_Conversation.AddNotice(
-              lit("warning"),
-              tr("The rendertest MCP server is %1%2; capture tools may be "
-                 "unavailable.")
-                  .arg(status, toolsError.isEmpty() ? QString() : lit(": ") + toolsError));
-        if(m_Launch.isolate && !others.isEmpty())
-          m_Conversation.AddNotice(
-              lit("warning"),
-              tr("Other MCP servers are still enabled: %1").arg(others.join(lit(", "))));
+        if(status != (m_Launch.captureTools ? lit("connected") : lit("disabled")))
+        {
+          SessionFailed(SessionState::Error,
+                        tr("The rendertest MCP server must be %1, but is %2: %3")
+                            .arg(m_Launch.captureTools ? lit("connected") : lit("disabled"), status, toolsError));
+          return;
+        }
 
         SetState(SessionState::Ready);
         ScheduleRender();
@@ -752,7 +845,16 @@ void AgentChatPanel::PollMcpStatus(int generation, int attempt)
 
 void AgentChatPanel::StartTurn()
 {
+  QString instance, session;
+  ReadCaptureBinding(instance, session);
+  if(instance != m_InstanceId || session != m_CaptureSessionId)
+  {
+    SessionFailed(SessionState::Error,
+                  tr("The capture changed while connecting. Send the question again."));
+    return;
+  }
   const int generation = m_Generation;
+  const int turnRequest = ++m_TurnRequest;
   QString text = m_PendingText;
   m_PendingText.clear();
   m_TurnTexts << text;
@@ -766,15 +868,17 @@ void AgentChatPanel::StartTurn()
   params[lit("input")] = QJsonArray({input});
 
   m_Client->Request(
-      lit("turn/start"), params, TurnTimeoutMs,
-      [this, generation](const QJsonValue &result, const QJsonObject &error) {
-        if(generation != m_Generation)
+      lit("turn/start"), params, m_Autotest.active ? m_Autotest.turnTimeoutMs : TurnTimeoutMs,
+      [this, generation, turnRequest](const QJsonValue &result, const QJsonObject &error) {
+        if(generation != m_Generation || turnRequest != m_TurnRequest ||
+           !m_Conversation.TurnRunning())
           return;
         if(!error.isEmpty())
         {
-          m_Conversation.EndTurn(lit("failed"),
-                                 tr("Could not start the turn: %1").arg(ErrorMessage(error)));
-          QuestionFinished();
+          // A missing response does not prove that the server never started the turn.
+          // End this process generation before allowing another question.
+          SessionFailed(SessionState::Error,
+                        tr("Could not start the turn; the session was stopped: %1").arg(ErrorMessage(error)));
           return;
         }
         m_Conversation.SetTurnId(result.toObject()[lit("turn")].toObject()[lit("id")].toString());
@@ -858,6 +962,8 @@ void AgentChatPanel::NewChat()
 
 void AgentChatPanel::OnNotification(const QString &method, const QJsonObject &params)
 {
+  if(m_State != SessionState::Ready || !m_Conversation.TurnRunning())
+    return;
   bool changed = m_Conversation.Apply(method, params);
 
   if(m_Autotest.active && !m_Autotest.stopOnTool.isEmpty() &&
@@ -1022,7 +1128,7 @@ QString AgentChatPanel::RenderItem(const AgentItem &item) const
       if(item.text.isEmpty())
         return QString();
       return lit("<div style=\"margin-top:6px;\"><b>%1</b>%2</div>")
-          .arg(tr("AI"), AgentMarkdown::ToHtml(item.text));
+          .arg(tr("AI"), AgentMarkdown::ToHtml(item.text, item.referenceToken));
     }
     case AgentItem::Kind::Reasoning:
     {
@@ -1127,6 +1233,9 @@ void AgentChatPanel::RunAutotest(const QJsonObject &config)
   m_Autotest.stopOnTool = config[lit("stopOnTool")].toString();
   m_Autotest.stopAfterMs = config[lit("stopAfterMs")].toInt(0);
   m_Autotest.stopQuestion = config[lit("stopQuestion")].toInt(0);
+  m_Autotest.turnTimeoutMs = qMax(1, config[lit("turnTimeoutMs")].toInt(TurnTimeoutMs));
+  m_Autotest.captureChangeAfterMs = config[lit("captureChangeAfterMs")].toInt(0);
+  m_Autotest.captureChangeBeforeLinks = config[lit("captureChangeBeforeLinks")].toBool(false);
   m_Autotest.waitForCapture = config[lit("waitForCapture")].toBool(false);
   m_Autotest.captureTimeoutMs = config[lit("captureTimeoutMs")].toInt(180000);
   m_Autotest.selectEvent = qint64(config[lit("selectEvent")].toDouble(-1.0));
@@ -1185,6 +1294,13 @@ void AgentChatPanel::AutotestNext()
     QTimer::singleShot(m_Autotest.stopAfterMs, this, [this, index]() {
       if(m_Autotest.active && m_Autotest.index - 1 == index && m_QuestionActive)
         Stop();
+    });
+  }
+  if(m_Autotest.captureChangeAfterMs > 0 && index == 0)
+  {
+    QTimer::singleShot(m_Autotest.captureChangeAfterMs, this, [this, index]() {
+      if(m_Autotest.active && m_Autotest.index - 1 == index && m_QuestionActive)
+        OnCaptureClosed();
     });
   }
 }
@@ -1265,6 +1381,8 @@ void AgentChatPanel::AutotestAskDone(int index, const QJsonObject &ask, bool ok,
 
 void AgentChatPanel::AutotestClickLinks()
 {
+  if(m_Autotest.captureChangeBeforeLinks)
+    OnCaptureClosed();
   m_Autotest.eventAfter = m_Ctx.IsCaptureLoaded() ? qint64(m_Ctx.CurEvent()) : -1;
 
   const QStringList rendered = RenderedLinks(m_Conversation.Items());
@@ -1312,6 +1430,9 @@ void AgentChatPanel::WriteTranscript()
   }
   session[lit("stateMessage")] = m_StateMessage;
   session[lit("instanceId")] = m_InstanceId;
+  session[lit("captureSessionId")] = m_CaptureSessionId;
+  session[lit("captureTools")] = m_Launch.captureTools;
+  session[lit("referenceToken")] = m_ReferenceToken;
   session[lit("accountType")] = m_AccountType;
   session[lit("mcpStatus")] = m_McpStatus;
   session[lit("mcpTools")] = m_McpTools;

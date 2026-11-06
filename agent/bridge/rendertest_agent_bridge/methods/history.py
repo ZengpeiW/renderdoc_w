@@ -3,7 +3,8 @@ from ..paging import paginate, query_key
 from ..values import enum_name, number
 from .common import (action_index, get_bool, get_choice, get_int, invalid, renderdoc_module,
                      result, session_of)
-from .textures import INTEGER_COMP_TYPES, _interpret, _prepare, _subresource, _texture_info
+from .textures import (INTEGER_COMP_TYPES, _component_type, _interpret, _prepare, _subresource,
+                       _texture_info, _type_cast)
 
 ORDERS = ("newest", "oldest")
 FRAGMENT_LIMIT = 64
@@ -13,26 +14,26 @@ FAILURE_FLAGS = ("sampleMasked", "backfaceCulled", "depthClipped", "depthBoundsF
 INVALID_MARKER = (0xdeadbeef, 0xdeadf00d)
 
 
-def _value(texture, value):
+def _value(texture, value, type_cast):
     if tuple(int(item) for item in list(value.col.uintValue)[:2]) == INVALID_MARKER:
         return None
-    _, color = _interpret(texture, value.col)
+    _, color = _interpret(texture, value.col, type_cast)
     depth = float(value.depth)
     stencil = int(value.stencil)
     return {"color": color, "depth": number(depth) if depth >= 0.0 else None,
             "stencil": stencil if stencil >= 0 else None}
 
 
-def _fragment(texture, item):
+def _fragment(texture, item, type_cast):
     failures = [name for name in FAILURE_FLAGS if bool(getattr(item, name, False))]
     return {
         "fragIndex": int(item.fragIndex),
         "primitiveId": int(item.primitiveID),
         "passed": not failures,
         "failures": failures,
-        "preMod": _value(texture, item.preMod),
-        "shaderOut": _value(texture, item.shaderOut),
-        "postMod": _value(texture, item.postMod),
+        "preMod": _value(texture, item.preMod, type_cast),
+        "shaderOut": _value(texture, item.shaderOut, type_cast),
+        "postMod": _value(texture, item.postMod, type_cast),
         "directShaderWrite": bool(item.directShaderWrite),
         "unboundPS": bool(item.unboundPS),
     }
@@ -64,7 +65,7 @@ def _event(actions, event_id, fragments):
     }
 
 
-def _group(texture, actions, history, event_id):
+def _group(texture, actions, history, event_id, type_cast):
     grouped = []
     for item in history:
         item_event = int(item.eventId)
@@ -72,7 +73,7 @@ def _group(texture, actions, history, event_id):
             continue
         if not grouped or grouped[-1][0] != item_event:
             grouped.append((item_event, []))
-        grouped[-1][1].append(_fragment(texture, item))
+        grouped[-1][1].append(_fragment(texture, item, type_cast))
     return [(_event(actions, item_event, fragments), fragments)
             for item_event, fragments in grouped]
 
@@ -115,6 +116,7 @@ def pixel_history(runtime, context):
     order = get_choice(params, "order", ORDERS, "newest")
     include_fragments = get_bool(params, "include_fragments", False)
     key, resources, event_id, view = _prepare(runtime, context)
+    type_cast = _type_cast(context)
     x = get_int(params, "x", required=True)
     y = get_int(params, "y", required=True)
     if x >= view["width"] or y >= view["height"]:
@@ -131,9 +133,16 @@ def pixel_history(runtime, context):
         if properties is not None and not getattr(properties(), "pixelHistory", True):
             raise AgentBridgeError("UNSUPPORTED", "This capture's API does not support pixel "
                                    "history.")
+        # Vulkan's PixelHistory currently decodes using the image's original format and ignores
+        # typeCast. Do not reinterpret that float/int union as though the requested cast ran.
+        api = enum_name(getattr(properties(), "pipelineType", None)) if properties else None
+        if (api == "Vulkan" and type_cast != "Typeless"
+                and type_cast != enum_name(texture.format.compType)):
+            raise AgentBridgeError("UNSUPPORTED", "Vulkan pixel history does not support this "
+                                   "type cast; query the original format with type_cast=Typeless.")
         history = controller.PixelHistory(handle, x, y, _subresource(rd, view),
-                                          rd.CompType.Typeless)
-        grouped = _group(texture, actions, history, event_id)
+                                          getattr(rd.CompType, type_cast))
+        grouped = _group(texture, actions, history, event_id, type_cast)
         discards = [int(usage.eventId) for usage in controller.GetUsage(handle)
                     if int(usage.eventId) <= event_id and enum_name(usage.usage) == "Discard"]
         return grouped, discards
@@ -143,7 +152,8 @@ def pixel_history(runtime, context):
         meta.update(replay_meta)
         return value
 
-    cache_key = ("pixelHistory", key, x, y, view["mip"], view["slice"], view["sample"], event_id)
+    cache_key = ("pixelHistory", key, x, y, view["mip"], view["slice"], view["sample"], event_id,
+                 type_cast)
     grouped, discards = runtime.cache.get(session, cache_key, build)
     events = [item for item, _ in grouped]
     ordered = list(reversed(grouped)) if order == "newest" else grouped
@@ -161,7 +171,8 @@ def pixel_history(runtime, context):
         "texture": _texture_info(resources, key, view),
         "x": x,
         "y": y,
-        "interpretedAs": INTEGER_COMP_TYPES.get(enum_name(texture.format.compType), "float"),
+        "interpretedAs": INTEGER_COMP_TYPES.get(_component_type(texture, type_cast), "float"),
+        "typeCast": type_cast,
         "order": order,
         "total": total,
         "summary": _summary(events),

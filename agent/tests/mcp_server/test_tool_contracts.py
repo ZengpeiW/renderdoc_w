@@ -35,6 +35,11 @@ def test_server_exposes_exact_p0_tools() -> None:
     assert set(by_name) == set(TOOL_NAMES)
     assert by_name["set_event"].inputSchema["required"] == ["event_id"]
     assert by_name["get_resource"].inputSchema["properties"]["resource_id"]["pattern"] == r"^[0-9]{1,20}$"
+    for name in ("pick_pixel", "pixel_history"):
+        cast = by_name[name].inputSchema["properties"]["type_cast"]
+        assert cast["default"] == "Typeless"
+        assert "UNormSRGB" in cast["enum"] and "UInt" in cast["enum"]
+    assert by_name["read_artifact"].inputSchema["required"] == ["path"]
 
 
 def test_tool_annotations_follow_effects() -> None:
@@ -77,6 +82,9 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "get_debug_messages": {},
         }
         results = {name: structured(call_tool(server, name, arguments)) for name, arguments in calls.items()}
+        results["read_artifact"] = structured(call_tool(
+            server, "read_artifact", {"path": results["debug_pixel"]["artifacts"][0]["path"]}
+        ))
 
     assert set(results) == set(TOOL_NAMES)
     assert results["list_instances"]["data"]["instances"][0]["instanceId"] == bridge.instance_id
@@ -86,6 +94,7 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["get_buffer_data"]["data"]["hex"] == "04050607"
     assert results["pixel_history"]["data"]["summary"]["lastPassedEventId"] == 10
     assert results["debug_pixel"]["data"]["outputs"][0]["name"] == "SV_Target0"
+    assert results["read_artifact"]["data"]["lines"][0]["text"] == '{"record":"header"}'
     assert Path(results["debug_pixel"]["artifacts"][0]["path"]).is_file()
     assert results["debug_vertex"]["data"]["outputs"][0]["name"] == "SV_Position"
     assert Path(results["debug_vertex"]["artifacts"][0]["path"]).is_file()

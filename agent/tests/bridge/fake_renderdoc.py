@@ -52,8 +52,13 @@ class CompType(enum.IntEnum):
     Typeless = 0
     Float = 1
     UNorm = 2
+    SNorm = 3
     UInt = 4
     SInt = 5
+    UScaled = 6
+    SScaled = 7
+    Depth = 8
+    UNormSRGB = 9
 
 
 class FileType(enum.IntEnum):

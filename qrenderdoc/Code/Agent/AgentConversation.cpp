@@ -55,6 +55,7 @@ void AgentConversation::Clear()
 {
   m_Items.clear();
   m_Turns.clear();
+  m_ClosedTurnIds.clear();
   m_ThreadId.clear();
   m_Model.clear();
   m_TurnId.clear();
@@ -89,15 +90,16 @@ void AgentConversation::AddNotice(const QString &level, const QString &text)
   m_Items << item;
 }
 
-void AgentConversation::BeginTurn()
+void AgentConversation::BeginTurn(const QString &referenceToken)
 {
+  m_ReferenceToken = referenceToken;
   m_TurnRunning = true;
   m_TurnId.clear();
 }
 
 void AgentConversation::SetTurnId(const QString &turnId)
 {
-  if(m_TurnRunning && m_TurnId.isEmpty())
+  if(m_TurnRunning && m_TurnId.isEmpty() && !m_ClosedTurnIds.contains(turnId))
     m_TurnId = turnId;
 }
 
@@ -118,6 +120,8 @@ void AgentConversation::EndTurn(const QString &status, const QString &message)
   if(!message.isEmpty())
     turn[lit("error")] = message;
   m_Turns << turn;
+  if(!m_TurnId.isEmpty())
+    m_ClosedTurnIds.insert(m_TurnId);
 
   m_LastTurnStatus = status;
   if(!message.isEmpty())
@@ -179,13 +183,13 @@ void AgentConversation::UpdateFromItem(AgentItem &item, const QJsonObject &json,
   {
     item.kind = AgentItem::Kind::Other;
     item.status = json[lit("status")].toString();
-    item.text = lit("Command blocked (read-only): %1").arg(json[lit("command")].toString());
+    item.text = lit("Command (%1): %2").arg(item.status, json[lit("command")].toString());
   }
   else if(type == lit("fileChange"))
   {
     item.kind = AgentItem::Kind::Other;
     item.status = json[lit("status")].toString();
-    item.text = lit("File change blocked (read-only)");
+    item.text = lit("File change (%1)").arg(item.status);
   }
   else
   {
@@ -198,8 +202,22 @@ void AgentConversation::UpdateFromItem(AgentItem &item, const QJsonObject &json,
 bool AgentConversation::Apply(const QString &method, const QJsonObject &params)
 {
   const QString threadId = params[lit("threadId")].toString();
-  if(!threadId.isEmpty() && !m_ThreadId.isEmpty() && threadId != m_ThreadId)
+  if(m_ThreadId.isEmpty() || threadId != m_ThreadId)
     return false;
+
+  if(method != lit("thread/tokenUsage/updated") && !m_TurnRunning)
+    return false;
+  const QString turnId = method == lit("turn/started") || method == lit("turn/completed")
+                             ? params[lit("turn")].toObject()[lit("id")].toString()
+                             : params[lit("turnId")].toString();
+  if(!turnId.isEmpty() && m_ClosedTurnIds.contains(turnId))
+    return false;
+  if(!turnId.isEmpty() && !m_TurnId.isEmpty() && turnId != m_TurnId)
+    return false;
+  // Some servers emit an item before the start response/notification. Claim that turn, but
+  // never let a late notification from an already-finished turn claim a new pending question.
+  if(!turnId.isEmpty())
+    SetTurnId(turnId);
 
   if(method == lit("turn/started"))
   {
@@ -221,6 +239,7 @@ bool AgentConversation::Apply(const QString &method, const QJsonObject &params)
     if(!item)
     {
       AgentItem created;
+      created.referenceToken = m_ReferenceToken;
       created.id = id;
       created.turnId = params[lit("turnId")].toString();
       m_Items << created;
@@ -238,6 +257,7 @@ bool AgentConversation::Apply(const QString &method, const QJsonObject &params)
     if(!item)
     {
       AgentItem created;
+      created.referenceToken = m_ReferenceToken;
       created.id = id;
       created.turnId = params[lit("turnId")].toString();
       created.kind = reasoning ? AgentItem::Kind::Reasoning : AgentItem::Kind::Agent;
@@ -312,6 +332,8 @@ QJsonObject AgentConversation::ToJson() const
     QJsonObject json;
     json[lit("kind")] = QString::fromLatin1(KindName(item.kind));
     json[lit("type")] = item.type;
+    if(!item.referenceToken.isEmpty())
+      json[lit("referenceToken")] = item.referenceToken;
     if(!item.id.isEmpty())
       json[lit("id")] = item.id;
     if(!item.turnId.isEmpty())

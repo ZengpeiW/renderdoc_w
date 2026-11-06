@@ -98,4 +98,7 @@ P0_TOOL_NAMES = (
 
 P1_TOOL_NAMES = ("pixel_history", "debug_pixel", "debug_vertex", "get_mesh_data")
 
-TOOL_NAMES = P0_TOOL_NAMES + P1_TOOL_NAMES
+LOCAL_TOOL_NAMES = ("read_artifact",)
+
+# Local tools never enter the bridge mailbox or METHOD_SPECS.
+TOOL_NAMES = P0_TOOL_NAMES + P1_TOOL_NAMES + LOCAL_TOOL_NAMES

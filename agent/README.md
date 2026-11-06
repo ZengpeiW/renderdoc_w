@@ -2,7 +2,7 @@
 
 RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打开的 capture。设计见 [docs/MVP_DESIGN.md](docs/MVP_DESIGN.md)。
 
-当前进度：**M4 P1 调试工具已完成**。
+当前进度：**M4 和 M5a/M5b 已完成，M5 边界修复已接入**。M5c/M5d（完整设置、登录、历史恢复）仍按 [M5 设计](docs/M5_DESIGN.md) 后续实现。
 
 - M0：MCP Server、文件 mailbox IPC、fake Bridge 和协议测试。
 - M1：qrendertest 启动时从 `integrations/rendertest_agent/python` 固定加载 Bridge，写实例清单和心跳，跟踪 capture 加载、关闭和选中事件，支持 `ping` / `get_status` / `get_context`。
@@ -21,6 +21,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
 | Buffer | `get_buffer_data`（64 KiB 内 base64，1 KiB 内附 hex，更大写 artifact；`format="float4, uint"` 可解码行） |
 | 消息 | `get_debug_messages` |
+| 文本 artifact | `read_artifact`（MCP 本地只读，不经 replay） |
 
 ## P1 工具（M4）
 
@@ -37,6 +38,8 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - 列表工具都分页：`limit` 1–1000（默认 200），`nextCursor` 绑定 capture session 和查询条件。
 - 绑定条目里 `name` 是 Shader 反射中的绑定名，`resourceName` 是资源名。
 - artifact 写到 `<root>/artifacts/<instanceId>/<captureSessionId>/replay/`，结果里带路径、大小和 SHA-256。
+- `pick_pixel` / `pixel_history` 支持 `type_cast`（RenderDoc 枚举名，如 `UInt`、`SInt`、`Depth`、`UNormSRGB`），返回的值和解释与此参数对应；历史缓存和游标包含该参数。Vulkan PixelHistory 的底层驱动忽略不同于原格式的 cast，此时返回 `UNSUPPORTED`，可用 `Typeless` 查看原始格式。
+- `read_artifact(path, start_line=1, limit=100, search=None, max_bytes=65536)` 读取同一 MCP 进程此前工具返回的文本 artifact，支持按行分页和字面搜索，续页使用 `data.nextLine`。文件上限 64 MiB，单页上限 128 KiB；每次校验路径、实例/session、大小和完整 SHA-256，不接受任意文件、符号链接或 junction。重启 MCP 后需重新调用生成 artifact 的工具。
 
 ## 目录
 
@@ -132,14 +135,15 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 菜单 `Window → AI Assistant` 打开可停靠面板。第一次发送消息时，面板启动 `codex app-server`，并把 rendertest MCP 绑定到本窗口的 Bridge 实例；不需要改 `~/.codex/config.toml`。
 
 - 前提：已经安装 Codex CLI（`npm install -g @openai/codex`），并执行过 `codex login`；`agent/mcp_server/.venv` 已创建。
-- 只读：thread 使用 `read-only` 沙箱和 `never` 审批，所有审批请求都会被拒绝；默认关闭 shell、web search 和其它 MCP server。
+- 只读：thread 使用 `read-only` 沙箱和 `never` 审批，所有审批请求都会被拒绝；shell 和 web search 始终关闭，其它 MCP server 默认隔离。隔离检查失败会阻止对话。
 - 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息会新建 thread。“New Chat”清空对话。
 - 每条消息前会附上 `<rendertest_context>`（实例 id、capture、当前 EID），这是发送时的快照。
+- MCP 固定绑定发送时的实例和 capture session，包括 `get_context` / `get_status` 都不能重新绑定。capture 加载/关闭会停止旧会话；下次发送建立新 thread，旧消息仍保留但旧链接失效。没有可验证的 capture 或 bridge 时禁用 rendertest MCP，允许纯聊天，不会自动连接其它窗口。
 - 上下文 chip：输入框上方显示本条消息会带上的上下文。“Current EID”默认附带，点 × 去掉，点 “+ Current EID” 加回；其它 chip 发送后清空，并显示在用户气泡下方。每个 chip 以 `selection: {json}` 写进 `<rendertest_context>`，字段名和 MCP 工具参数一致（`event_id`、`resource_id`、`x`/`y`（左上原点）、`mip`、`slice`、`sample`、`vertex`、`instance`、`view`）。
 - “问 AI”入口（只添加 chip 并预填可编辑的问题，不自动发送）：
   - Event Browser 右键 → `Ask AI about this event`
   - Texture Viewer 缩略图右键 → `Ask AI about this resource`
-  - Texture Viewer 的 Pixel Context 面板 → `Ask AI`（用当前拾取的像素，坐标换算和 Pixel History 一致）
+  - Texture Viewer 的 Pixel Context 面板 → `Ask AI`（使用资源值和当前类型解释，坐标换算和 Pixel History 一致；MSAA Average val 模式需先选择具体 sample，显示 Shader/overlay 的值不作为资源值）
   - Mesh Viewer VS In / VS Out 表格右键 → `Ask AI about this Vertex`
 - 回答里的 `EID 1459`、`event 1459`、`ResourceId::116618` 会变成链接：点击 EID 跳到该事件；点击资源时纹理在 Texture Viewer 打开，缓冲在 Buffer Viewer 打开，其它资源在 Resource Inspector 打开。
 - 日志：`<agent root>/logs/chat-<instanceId>.log`，包含启动参数和 app-server 的 stderr 尾部。
@@ -148,7 +152,8 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 
 - `RENDERTEST_AGENT_CODEX_COMMAND`：替换 codex 命令（按空格拆分，支持引号），默认查找 npm 安装的 `codex.exe`，再查 PATH。
 - `RENDERTEST_MCP_PYTHON`：MCP Server 使用的 Python，默认是 exe 上层目录中的 `agent/mcp_server/.venv/Scripts/python.exe`。
-- `RENDERTEST_AGENT_ISOLATE=0`：不关闭用户自己的 Codex feature 和 MCP server。
+- `RENDERTEST_AGENT_ISOLATE=0`：不关闭用户其它 Codex feature 和 MCP server；shell 与 web search 仍然禁用。
+- `RENDERTEST_AGENT_FIXED_INSTANCE_ID` / `RENDERTEST_AGENT_CAPTURE_SESSION_ID`：面板为其 MCP 子进程设置的强制绑定，必须成对有效；不同实例参数或 capture session 会被拒绝。外部 CLI 不设置这两个变量时仍可按原规则选择实例。
 - `RENDERTEST_AGENT_CHAT_AUTOTEST`：测试钩子（JSON 或 JSON 文件路径），由 `chat_panel_e2e.py` 使用。
 
 验收：

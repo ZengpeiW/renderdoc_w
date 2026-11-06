@@ -172,6 +172,78 @@ def test_resources_and_usage(loaded) -> None:
     assert usage[0]["actionName"] == "DrawIndexed(36)"
 
 
+@pytest.mark.parametrize("type_cast,kind", [("UInt", "uint"), ("SInt", "int")])
+def test_pixel_type_cast_reaches_replay_and_selects_value_union(loaded, monkeypatch, type_cast, kind):
+    from fake_renderdoc import CompType
+
+    ctx, api = loaded
+    ctx.controller.textures[0].format.compType = CompType.Typeless
+    original = ctx.controller.PickPixel
+    casts = []
+
+    def pick(texture, x, y, sub, cast):
+        casts.append(cast)
+        return original(texture, x, y, sub, cast)
+
+    monkeypatch.setattr(ctx.controller, "PickPixel", pick)
+    data = call(api, "pick_pixel", resource_id="100", x=2, y=1, event_id=5,
+                type_cast=type_cast).result["data"]
+    assert casts == [getattr(CompType, type_cast)]
+    assert data["typeCast"] == type_cast and data["interpretedAs"] == kind
+    assert data["value"] == [2, 1, 0, 1]
+    assert ctx.controller.current == 9
+
+
+def test_history_type_cast_has_separate_cache_and_cursor(loaded, monkeypatch):
+    from fake_renderdoc import CompType
+
+    ctx, api = loaded
+    ctx.controller.textures[0].format.compType = CompType.Typeless
+    original = ctx.controller.PixelHistory
+    casts = []
+
+    def history(texture, x, y, sub, cast):
+        casts.append(cast)
+        return original(texture, x, y, sub, cast)
+
+    monkeypatch.setattr(ctx.controller, "PixelHistory", history)
+    params = dict(resource_id="100", x=1, y=1, event_id=8, limit=1, order="oldest")
+    floats = call(api, "pixel_history", type_cast="Float", **params).result
+    integers = call(api, "pixel_history", type_cast="UInt", **params).result
+    assert floats["data"]["events"][0]["postMod"]["color"] == [0.5, 0.5, 0.5, 1.0]
+    assert integers["data"]["events"][0]["postMod"]["color"] == [127, 127, 127, 255]
+    assert integers["data"]["interpretedAs"] == "uint"
+    assert integers["data"]["typeCast"] == "UInt"
+    call(api, "pixel_history", type_cast="UInt", **params)
+    assert casts == [CompType.Float, CompType.UInt]
+    assert error_code(api, "pixel_history", type_cast="UInt", cursor=floats["nextCursor"],
+                      **params) == "INVALID_REQUEST"
+
+
+@pytest.mark.parametrize("method", ["pick_pixel", "pixel_history"])
+def test_pixel_queries_reject_average_sample_and_invalid_cast(loaded, method):
+    ctx, api = loaded
+    ctx.controller.textures[0].msSamp = 4
+    params = dict(resource_id="100", x=1, y=1, event_id=5)
+    assert error_code(api, method, sample=0xffffffff, **params) == "INVALID_REQUEST"
+    assert error_code(api, method, type_cast="not-a-component-type", **params) == "INVALID_REQUEST"
+    data = call(api, method, sample=3, **params).result["data"]
+    assert data["texture"]["sample"] == 3
+
+
+def test_vulkan_history_rejects_cast_ignored_by_driver(loaded, monkeypatch):
+    ctx, api = loaded
+    monkeypatch.setattr(ctx.controller, "GetAPIProperties",
+                        lambda: types.SimpleNamespace(pixelHistory=True, pipelineType="Vulkan"))
+    params = dict(resource_id="100", x=1, y=1, event_id=5)
+    assert error_code(api, "pixel_history", type_cast="UInt", **params) == "UNSUPPORTED"
+    assert ctx.controller.history_calls == []
+    data = call(api, "pixel_history", type_cast="UNorm", **params).result["data"]
+    assert data["events"][0]["postMod"]["color"] == [0.5, 0.5, 0.5, 1.0]
+    data = call(api, "pixel_history", **params).result["data"]
+    assert data["typeCast"] == "Typeless"
+
+
 def test_texture_tools(loaded) -> None:
     ctx, api = loaded
     pixel = call(api, "pick_pixel", resource_id="100", x=2, y=1, event_id=5).result["data"]

@@ -3,6 +3,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
+#include <QSet>
 #include <QString>
 
 // One rendered entry of the AI panel transcript.
@@ -24,6 +25,8 @@ struct AgentItem
   // app-server item type, or the notice level (info, warning, error) for notices
   QString type;
   QString turnId;
+  // Assigned locally, never taken from model text. Invalidated on capture changes.
+  QString referenceToken;
   // message text, reasoning summary, notice text or a one-line summary for other items
   QString text;
   // tool calls
@@ -54,7 +57,7 @@ public:
   void AddNotice(const QString &level, const QString &text);
 
   // the turn was requested; the id arrives with the turn/start response or turn/started
-  void BeginTurn();
+  void BeginTurn(const QString &referenceToken);
   void SetTurnId(const QString &turnId);
   // ends the running turn locally, e.g. when the app-server was killed or crashed
   void EndTurn(const QString &status, const QString &message);
@@ -79,7 +82,9 @@ private:
   QString m_Model;
   QString m_TurnId;
   QString m_LastTurnStatus;
+  QString m_ReferenceToken;
   QList<QJsonObject> m_Turns;
+  QSet<QString> m_ClosedTurnIds;
   bool m_TurnRunning = false;
   qint64 m_TotalTokens = 0;
 };

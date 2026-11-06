@@ -96,7 +96,7 @@ AgentAskRequest AgentAsk::Resource(ICaptureContext &ctx, ResourceId id, uint32_t
 
 AgentAskRequest AgentAsk::Pixel(ICaptureContext &ctx, ResourceId id, uint32_t x, uint32_t y,
                                 uint32_t mip, uint32_t slice, uint32_t sample, uint32_t view,
-                                uint32_t eventId)
+                                uint32_t eventId, CompType typeCast)
 {
   AgentAskRequest request;
   QString name = ResourceName(ctx, id);
@@ -112,6 +112,11 @@ AgentAskRequest AgentAsk::Pixel(ICaptureContext &ctx, ResourceId id, uint32_t x,
   sel[lit("mip")] = double(mip);
   sel[lit("slice")] = double(slice);
   sel[lit("sample")] = double(sample);
+  // These two display names differ from the RenderDoc enum names used by the MCP contract.
+  sel[lit("type_cast")] = typeCast == CompType::Depth       ? lit("Depth")
+                          : typeCast == CompType::UNormSRGB ? lit("UNormSRGB")
+                                                            : ToQStr(typeCast);
+  sel[lit("value_source")] = lit("resource");
   sel[lit("view")] = double(view);
   sel[lit("event_id")] = double(eventId);
   request.question = Translate("Why does this pixel have this value? Which event wrote it?");

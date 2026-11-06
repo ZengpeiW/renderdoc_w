@@ -11,6 +11,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from .artifacts import ArtifactReader, DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES
 from .errors import RenderTestAgentError
 from .ipc_client import BridgeClient, BridgeResponse
 from .protocol import (EFFECT_ARTIFACT, EFFECT_READ, EFFECT_UI, LONG_TIMEOUT_SECONDS, METHOD_SPECS,
@@ -21,6 +22,8 @@ ActionFlag = Literal["draw", "dispatch", "marker", "clear", "copy", "resolve", "
 ResourceKind = Literal["texture", "buffer", "shader", "pipeline", "sampler", "other"]
 TextureFormat = Literal["png", "exr", "dds"]
 TextureChannels = Literal["rgba", "rgb", "r", "g", "b", "a", "depth", "stencil"]
+TextureTypeCast = Literal["Typeless", "Float", "UNorm", "SNorm", "UInt", "SInt", "UScaled",
+                          "SScaled", "Depth", "UNormSRGB"]
 HistoryOrder = Literal["newest", "oldest"]
 MeshStage = Literal["vs_out", "gs_out"]
 MaxSteps = Annotated[int, Field(ge=1, le=200000, description="Shader steps to execute at most.")]
@@ -100,11 +103,14 @@ def _envelope(response: BridgeResponse, effect: str) -> dict[str, Any]:
 
 def create_server(client: BridgeClient | None = None) -> FastMCP:
     bridge = client or BridgeClient()
+    artifacts = ArtifactReader(bridge)
     server = FastMCP(
         name="rendertest",
         instructions=(
             "Inspect the capture currently open in RenderTest. Tools are read-only unless their "
-            "effect is ui or artifact. ResourceId values are exact decimal strings."
+            "effect is ui or artifact. ResourceId values are exact decimal strings. "
+            "Use read_artifact on returned text artifact paths to read shader disassembly and "
+            "debug traces, including when shell tools are unavailable."
         ),
     )
 
@@ -134,14 +140,42 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             )
         except RenderTestAgentError as error:
             raise _tool_error(error) from error
+        await anyio.to_thread.run_sync(artifacts.register, response)
         return _envelope(response, METHOD_SPECS[method]["effect"])
+
+    @tool()
+    async def read_artifact(
+        path: Annotated[str, Field(min_length=1, max_length=4096)],
+        start_line: Annotated[int, Field(ge=1)] = 1,
+        limit: Limit = 100,
+        search: Annotated[str | None, Field(min_length=1, max_length=256)] = None,
+        max_bytes: Annotated[int, Field(ge=256, le=MAX_PAGE_BYTES)] = DEFAULT_PAGE_BYTES,
+    ) -> dict[str, Any]:
+        """Read UTF-8 text from an artifact returned by a tool in this MCP process.
+
+        Supports .txt/.jsonl/.json/.csv/.log files up to 64 MiB. Lines are 1-based; pass
+        data.nextLine as start_line to continue. search is a case-sensitive literal substring,
+        not a regex. max_bytes bounds JSON line entries; an oversized first matching line
+        returns LIMIT_EXCEEDED, so skip it or search for other lines. File contents must still
+        match the returned size and SHA-256. Restarting MCP requires regenerating the artifact.
+        """
+        try:
+            return await anyio.to_thread.run_sync(partial(
+                artifacts.read, path, start_line=start_line, limit=limit,
+                search=search, max_bytes=max_bytes,
+            ))
+        except RenderTestAgentError as error:
+            raise _tool_error(error) from error
 
     @tool()
     async def list_instances(include_offline: bool = False) -> dict[str, Any]:
         """List RenderTest instances that expose the agent bridge."""
-        instances = await anyio.to_thread.run_sync(
-            partial(bridge.list_instances, include_offline=include_offline)
-        )
+        try:
+            instances = await anyio.to_thread.run_sync(
+                partial(bridge.list_instances, include_offline=include_offline)
+            )
+        except RenderTestAgentError as error:
+            raise _tool_error(error) from error
         return {
             "schema": RESULT_SCHEMA,
             "instanceId": None,
@@ -346,6 +380,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         mip: NonNegativeInt = 0,
         slice: NonNegativeInt = 0,
         sample: NonNegativeInt = 0,
+        type_cast: TextureTypeCast = "Typeless",
         instance_id: InstanceId = None,
     ) -> dict[str, Any]:
         """Read one texel from a texture view."""
@@ -359,6 +394,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                 mip=mip,
                 slice=slice,
                 sample=sample,
+                type_cast=type_cast,
             ),
             instance_id=instance_id,
         )
@@ -394,6 +430,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         mip: NonNegativeInt = 0,
         slice: NonNegativeInt = 0,
         sample: NonNegativeInt = 0,
+        type_cast: TextureTypeCast = "Typeless",
         order: HistoryOrder = "newest",
         include_fragments: bool = False,
         cursor: Cursor = None,
@@ -417,6 +454,7 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                 mip=mip,
                 slice=slice,
                 sample=sample,
+                type_cast=type_cast,
                 order=order,
                 include_fragments=include_fragments,
                 cursor=cursor,

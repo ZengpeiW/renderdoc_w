@@ -32,7 +32,8 @@ ResourceId ResourceIdFromNumber(qulonglong number);
 AgentAskRequest Event(ICaptureContext &ctx, uint32_t eventId);
 AgentAskRequest Resource(ICaptureContext &ctx, ResourceId id, uint32_t eventId);
 AgentAskRequest Pixel(ICaptureContext &ctx, ResourceId id, uint32_t x, uint32_t y, uint32_t mip,
-                      uint32_t slice, uint32_t sample, uint32_t view, uint32_t eventId);
+                      uint32_t slice, uint32_t sample, uint32_t view, uint32_t eventId,
+                      CompType typeCast);
 AgentAskRequest Vertex(ICaptureContext &ctx, uint32_t eventId, uint32_t vertex, uint32_t index,
                        uint32_t instance, uint32_t view, const QString &stage);
 

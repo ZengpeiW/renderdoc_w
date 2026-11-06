@@ -22,6 +22,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlsplit
 
 AGENT_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = AGENT_DIR.parent
@@ -194,7 +195,7 @@ class Run:
 
 def fake_env(run: Run, scenario: str) -> dict[str, str]:
     command = f'"{sys.executable}" "{FAKE}" --scenario {scenario} --log "{run.fake_log}" --state-dir "{run.root}"'
-    return {"RENDERTEST_AGENT_CODEX_COMMAND": command}
+    return {"RENDERTEST_AGENT_CODEX_COMMAND": command, "RENDERTEST_AGENT_ISOLATE": "1"}
 
 
 def methods(messages: list[dict[str, Any]]) -> list[str]:
@@ -220,10 +221,12 @@ def scenario_a1(run: Run) -> None:
               "developerInstructions lack the instance id")
     run.check(start.get("config", {}).get("mcp_servers.blender.enabled") is False,
               f"other MCP servers not disabled: {start.get('config')}")
-    run.check("mcp_servers.rendertest.enabled" not in start.get("config", {}), "rendertest disabled")
+    run.check(start.get("config", {}).get("mcp_servers.rendertest.enabled") is False,
+              "capture tools were enabled without a capture")
     argv = next((e["argv"] for e in read_jsonl(run.fake_log) if e.get("event") == "start"), [])
     joined = " ".join(argv)
-    run.check(f'RENDERTEST_AGENT_INSTANCE_ID="{instance}"' in joined, "launch args lack the instance id")
+    run.check("mcp_servers.rendertest.enabled=false" in joined, "unbound MCP was not disabled at launch")
+    run.check("RENDERTEST_AGENT_FIXED_INSTANCE_ID" not in joined, "pure chat should not start a bound MCP")
     run.check("features.shell_tool=false" in joined, "launch args are not isolated")
     turn = next((m["params"] for m in received if m.get("method") == "turn/start"), {})
     text = (turn.get("input") or [{}])[0].get("text", "")
@@ -233,7 +236,7 @@ def scenario_a1(run: Run) -> None:
     run.check(any(i.get("type") == "reasoning" for i in run.items("reasoning")), "no reasoning item")
     run.check([r.get("status") for r in run.results()] == ["completed"], f"results {run.results()}")
     run.check(run.transcript.get("totalTokens") == 4242, "token usage not applied")
-    run.check(run.session().get("mcpStatus") == "connected" and run.session().get("mcpTools") == 22,
+    run.check(run.session().get("mcpStatus") == "disabled" and run.session().get("mcpTools") == 0,
               f"mcp status {run.session().get('mcpStatus')} {run.session().get('mcpTools')}")
 
 
@@ -339,10 +342,9 @@ def scenario_a6_bad_python(run: Run) -> None:
     run.launch({"questions": ["hello"]}, env)
     if not run.wait_transcript(60):
         return
-    run.check(run.session().get("state") == "error", f"state {run.session().get('state')}")
-    run.check("RENDERTEST_MCP_PYTHON" in " ".join(i.get("text", "") for i in run.items("notice")),
-              "no MCP python guidance")
-    run.check(not run.fake_log.exists(), "app-server started without an MCP python")
+    run.check(run.session().get("state") == "ready", f"state {run.session().get('state')}")
+    run.check(run.session().get("mcpStatus") == "disabled", "plain chat enabled capture MCP")
+    run.check([r.get("status") for r in run.results()] == ["completed"], f"results {run.results()}")
 
 
 def scenario_exit(run: Run) -> None:
@@ -399,16 +401,122 @@ def scenario_b1_ask(run: Run) -> None:
     run.check(len(users) == 2 and "context" not in users[1], f"second user context {users[1:]}")
     auto = run.transcript.get("autotest", {})
     links = auto.get("renderedLinks", [])
-    run.check("rt://event/1513" in links and "rt://resource/116618" in links, f"rendered links {links}")
+    bases = [link.split("?", 1)[0] for link in links]
+    run.check("rt://event/1513" in bases and "rt://resource/116618" in bases, f"rendered links {links}")
+    run.check(all(parse_qs(urlsplit(link).query).get("source") for link in links),
+              f"references lack capture identity: {links}")
     clicks = auto.get("linkClicks", [])
     run.check(len(clicks) == 2, f"link clicks {clicks}")
     if len(clicks) == 2:
-        run.check(clicks[0].get("link") == "rt://event/1513" and clicks[0].get("ok") is False,
+        run.check(clicks[0].get("link", "").startswith("rt://event/1513?") and clicks[0].get("ok") is False,
                   f"first-event click {clicks[0]}")
         run.check(clicks[1].get("ok") is False, f"malformed link click {clicks[1]}")
     notices = " ".join(i.get("text", "") for i in run.items("notice"))
     run.check("No capture is loaded" in notices and "Malformed link" in notices, f"link notices {notices!r}")
     run.check([r.get("status") for r in run.results()] == ["completed", "completed"], f"results {run.results()}")
+
+
+def scenario_isolation_failure(run: Run) -> None:
+    scenario = run.name.removeprefix("guard-")
+    run.launch({"questions": ["hello"]}, fake_env(run, scenario))
+    if not run.wait_transcript(60):
+        return
+    run.check([r.get("status") for r in run.results()] == ["failed"], f"results {run.results()}")
+    run.check("turn/start" not in methods(run.received()), "a turn started despite unverifiable isolation")
+    run.check(not run.session().get("appServerRunning"), "unsafe process is still running")
+    if scenario == "status-page-foreign":
+        pages = [m["params"].get("cursor") for m in run.received() if m.get("method") == "mcpServerStatus/list"]
+        run.check(pages == [None, "page2"], f"did not inspect second status page: {pages}")
+
+
+def scenario_status_pages(run: Run) -> None:
+    run.launch({"questions": ["hello"]}, fake_env(run, "status-pages"))
+    if not run.wait_transcript(60):
+        return
+    pages = [m["params"].get("cursor") for m in run.received() if m.get("method") == "mcpServerStatus/list"]
+    run.check(pages == [None, "page2"], f"status pages {pages}")
+    run.check([r.get("status") for r in run.results()] == ["completed"], f"results {run.results()}")
+
+
+def scenario_start_timeout(run: Run) -> None:
+    run.launch({"questions": ["first", "second"], "turnTimeoutMs": 250},
+               fake_env(run, "turn-timeout-once"))
+    if not run.wait_transcript(60):
+        return
+    run.check([r.get("status") for r in run.results()] == ["failed", "completed"], f"results {run.results()}")
+    pids = run.fake_pids()
+    run.check(len(pids) == 2, f"accepted remote turn was not terminated: {pids}")
+    if pids:
+        run.check(not alive(pids[0]), f"old process {pids[0]} still running")
+    run.check(len(run.session().get("threadIds", [])) == 2, "no fresh thread after timeout")
+
+
+def scenario_capture_change(run: Run) -> None:
+    run.launch({"questions": ["first", "second"], "captureChangeAfterMs": 500}, fake_env(run, "hang"))
+    if not run.wait_transcript(60):
+        return
+    run.check([r.get("status") for r in run.results()] == ["interrupted", "completed"], f"results {run.results()}")
+    pids = run.fake_pids()
+    run.check(len(pids) == 2 and not alive(pids[0]), f"capture change did not kill old process: {pids}")
+    run.check(len(run.session().get("threadIds", [])) == 2, "capture change reused old thread")
+    tools = run.items("tool")
+    run.check(tools and tools[0].get("status") == "interrupted", f"pending tools {tools}")
+
+
+def scenario_late_items(run: Run) -> None:
+    run.launch({"questions": ["first", "second"]}, fake_env(run, "late-items"))
+    if not run.wait_transcript(60):
+        return
+    run.check([i.get("text") for i in run.items("agent")] == [ANSWER, ANSWER], "stale notification contaminated transcript")
+
+
+def scenario_late_pending(run: Run) -> None:
+    scenario = run.name.removeprefix("guard-")
+    run.launch({"questions": ["first", "second"]}, fake_env(run, scenario))
+    if not run.wait_transcript(60):
+        return
+    expected = [ANSWER, "EARLY ITEM", ANSWER] if scenario == "late-before-start" else [ANSWER, ANSWER]
+    run.check([i.get("text") for i in run.items("agent")] == expected,
+              "late events claimed a pending turn, or a valid early item was discarded")
+    run.check([r.get("status") for r in run.results()] == ["completed", "completed"], f"results {run.results()}")
+    run.check(len(run.fake_pids()) == 1, "late response interrupted the next turn")
+
+
+def scenario_disabled_bridge(run: Run) -> None:
+    env = fake_env(run, "stream")
+    env.update(RENDERTEST_AGENT_BRIDGE="0", RENDERTEST_AGENT_ISOLATE="0")
+    run.launch({"questions": ["hello"]}, env)
+    if not run.wait_transcript(60):
+        return
+    run.check(not run.session().get("instanceId"), "bridge-disabled process acquired an instance")
+    run.check(run.session().get("mcpStatus") == "disabled", "unbound capture MCP was enabled")
+    argv = next((e["argv"] for e in read_jsonl(run.fake_log) if e.get("event") == "start"), [])
+    run.check("features.shell_tool=false" in argv and "features.unified_exec=false" in argv,
+              "non-isolated mode enabled shell")
+    run.check([r.get("status") for r in run.results()] == ["completed"], f"results {run.results()}")
+
+
+def scenario_reference_scope(run: Run) -> None:
+    run.launch({"questions": ["hello"], "captureChangeBeforeLinks": True, "clickLinks": ["first-event"]},
+               fake_env(run, "explicit-links"))
+    if not run.wait_transcript(60):
+        return
+    links = run.transcript.get("autotest", {}).get("renderedLinks", [])
+    token = run.items("agent")[0].get("referenceToken") if run.items("agent") else None
+    run.check(token and token != run.session().get("referenceToken"), "capture change retained old reference identity")
+    run.check(links and all(parse_qs(urlsplit(link).query).get("source") == [token] for link in links),
+              f"explicit or automatic reference escaped its message scope: {links}")
+    run.check(all(not c.get("ok") for c in run.transcript.get("autotest", {}).get("linkClicks", [])),
+              "stale reference navigated")
+
+
+def scenario_command_status(run: Run) -> None:
+    run.launch({"questions": ["hello"]}, fake_env(run, "command-status"))
+    if not run.wait_transcript(60):
+        return
+    items = run.items("other")
+    run.check(len(items) == 6 and all(f"({item['status']})" in item.get("text", "") for item in items),
+              f"command/file status misrepresented: {items}")
 
 
 SCENARIOS: dict[str, Callable[[Run], None]] = {
@@ -422,6 +530,17 @@ SCENARIOS: dict[str, Callable[[Run], None]] = {
     "A6-bad-codex": scenario_a6_bad_codex,
     "A6-bad-python": scenario_a6_bad_python,
     "B1-ask": scenario_b1_ask,
+    **{f"guard-{name}": scenario_isolation_failure for name in (
+        "config-error", "config-malformed", "status-error", "status-foreign", "status-page-foreign", "status-loop")},
+    "guard-status-pages": scenario_status_pages,
+    "guard-start-timeout": scenario_start_timeout,
+    "guard-capture-change": scenario_capture_change,
+    "guard-late-items": scenario_late_items,
+    "guard-late-before-start": scenario_late_pending,
+    "guard-late-response": scenario_late_pending,
+    "guard-disabled-bridge": scenario_disabled_bridge,
+    "guard-reference-scope": scenario_reference_scope,
+    "guard-command-status": scenario_command_status,
     "exit": scenario_exit,
 }
 
@@ -519,7 +638,7 @@ def run_real_ask(args) -> int:
         print("links:", auto.get("renderedLinks"), "clicks:", clicks)
         run.check(len(clicks) == 1 and clicks[0].get("ok"), f"link click {clicks}")
         if clicks and clicks[0].get("link", "").startswith("rt://event/"):
-            eid = int(clicks[0]["link"].rsplit("/", 1)[1])
+            eid = int(urlsplit(clicks[0]["link"]).path.rsplit("/", 1)[1])
             run.check(clicks[0].get("eventAfter") == eid, f"link did not move the UI to {eid}: {clicks[0]}")
         run.check(auto.get("eventBefore") == auto.get("eventAfter") == args.event,
                   f"UI event changed before the click {auto.get('eventBefore')} -> {auto.get('eventAfter')}")

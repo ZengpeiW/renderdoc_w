@@ -30,6 +30,7 @@ from .protocol import (
 )
 
 _SESSION_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_INSTANCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -61,15 +62,58 @@ class BridgeClient:
         self.poll_interval = poll_interval
         self.stale_after = stale_after
         self.default_instance_id = self.environ.get("RENDERTEST_AGENT_INSTANCE_ID", "").strip()
+        self.fixed_instance_id = self.environ.get("RENDERTEST_AGENT_FIXED_INSTANCE_ID", "").strip()
+        self.fixed_capture_session_id = ""
+        if self.fixed_instance_id:
+            session = self.environ.get("RENDERTEST_AGENT_CAPTURE_SESSION_ID", "").strip()
+            if (
+                not _INSTANCE_PATTERN.fullmatch(self.fixed_instance_id)
+                or not _SESSION_PATTERN.fullmatch(session)
+            ):
+                raise RenderTestAgentError(
+                    "INVALID_REQUEST",
+                    "Fixed-instance mode requires a valid instance id and capture session id.",
+                )
+            self.fixed_capture_session_id = session
         self._capture_sessions: dict[str, str] = {}
+        if self.fixed_instance_id:
+            self._capture_sessions[self.fixed_instance_id] = self.fixed_capture_session_id
         self._lock = threading.Lock()
 
     def list_instances(self, *, include_offline: bool = False) -> list[dict[str, Any]]:
         instances = discover_instances(self.instances_root, stale_after=self.stale_after)
+        if self.fixed_instance_id:
+            instances = [item for item in instances if item.instance_id == self.fixed_instance_id]
+            for item in instances:
+                if include_offline or item.online:
+                    self.validate_artifact_scope(item.instance_id, item.capture_session_id)
         return [item.summary() for item in instances if include_offline or item.online]
 
     def pinned_capture_session(self, instance_id: str) -> str | None:
         return self._capture_sessions.get(instance_id)
+
+    def _validate_fixed_instance(self, instance_id: str | None) -> None:
+        if self.fixed_instance_id and instance_id and instance_id != self.fixed_instance_id:
+            raise RenderTestAgentError(
+                "INVALID_REQUEST",
+                "The AI panel can only access its fixed RenderTest instance.",
+                details={"expectedInstanceId": self.fixed_instance_id},
+            )
+
+    def validate_artifact_scope(self, instance_id: str, capture_session_id: str | None) -> None:
+        """Enforce the panel's immutable scope for locally read artifacts and returned data."""
+        if not self.fixed_instance_id:
+            return
+        if instance_id != self.fixed_instance_id:
+            raise RenderTestAgentError(
+                "INVALID_REQUEST", "The data belongs to another RenderTest instance."
+            )
+        if capture_session_id != self.fixed_capture_session_id:
+            raise RenderTestAgentError(
+                "CAPTURE_MISMATCH",
+                "The capture no longer matches this AI panel conversation; start a new conversation.",
+                details={"expectedCaptureSessionId": self.fixed_capture_session_id},
+            )
 
     def call(
         self,
@@ -87,18 +131,22 @@ class BridgeClient:
         deadline_ms = int(timeout * 1000)
         if deadline_ms < 1 or deadline_ms > MAX_DEADLINE_MS:
             raise RenderTestAgentError("INVALID_REQUEST", "The request timeout is out of range.")
+        self._validate_fixed_instance(instance_id)
 
         with self._lock:
             instances = discover_instances(self.instances_root, stale_after=self.stale_after)
             instance = select_instance(
                 instances,
-                instance_id=instance_id or self.default_instance_id or None,
+                instance_id=self.fixed_instance_id or instance_id or self.default_instance_id or None,
                 effect=spec["effect"],
             )
             should_bind = method not in UNBOUND_METHODS if bind_capture is None else bind_capture
             expected: dict[str, str] = {"instanceId": instance.instance_id}
             pinned_session = self._capture_sessions.get(instance.instance_id)
-            if should_bind and pinned_session:
+            if self.fixed_instance_id:
+                # Even status/context and bind_capture=False must keep the send-time snapshot.
+                expected["captureSessionId"] = self.fixed_capture_session_id
+            elif should_bind and pinned_session:
                 expected["captureSessionId"] = pinned_session
 
             request_id = uuid.uuid4().hex
@@ -213,6 +261,7 @@ class BridgeClient:
         if ok is not True or "result" not in response:
             raise RenderTestAgentError("INVALID_RESPONSE", "The bridge success response is invalid.")
 
+        self.validate_artifact_scope(instance.instance_id, meta.get("captureSessionId"))
         result = response["result"]
         self._validate_artifacts(instance.instance_id, result)
         return BridgeResponse(request_id, instance.instance_id, result, meta)
@@ -224,6 +273,8 @@ class BridgeClient:
         if not isinstance(artifacts, list):
             raise RenderTestAgentError("INVALID_RESPONSE", "Bridge artifacts must be a list.")
         allowed_root = (self.artifacts_root / instance_id).resolve()
+        if self.fixed_instance_id:
+            allowed_root = (allowed_root / self.fixed_capture_session_id).resolve()
         for artifact in artifacts:
             if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str):
                 raise RenderTestAgentError("INVALID_RESPONSE", "A bridge artifact is invalid.")
@@ -234,7 +285,7 @@ class BridgeClient:
             if not resolved.is_relative_to(allowed_root) or not resolved.is_file():
                 raise RenderTestAgentError(
                     "INVALID_RESPONSE",
-                    "A bridge artifact is outside its instance artifact directory.",
+                    "A bridge artifact is outside its allowed artifact directory.",
                     details={"path": artifact["path"]},
                 )
             expected_bytes = artifact.get("bytes")
@@ -247,6 +298,8 @@ class BridgeClient:
     def _update_capture_session(
         self, instance_id: str, method: str, response: BridgeResponse
     ) -> None:
+        if self.fixed_instance_id:
+            return
         session = response.meta.get("captureSessionId")
         if isinstance(session, str) and _SESSION_PATTERN.match(session):
             self._capture_sessions[instance_id] = session

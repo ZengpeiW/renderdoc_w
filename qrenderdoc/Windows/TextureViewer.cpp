@@ -450,7 +450,11 @@ void TextureViewer::UI_UpdateCachedTexture()
       ui->debugPixelContext->setToolTip(tr("Shader Debugging not supported on this API"));
     }
 
-    m_AskAIPixel->setEnabled(true);
+    const bool individualSample = m_CachedTexture->msSamp <= 1 || m_TexDisplay.subresource.sample != ~0U;
+    m_AskAIPixel->setEnabled(individualSample);
+    m_AskAIPixel->setToolTip(
+        individualSample ? tr("Ask about the resource pixel value, before display shaders and overlays")
+                         : tr("Choose an individual MSAA sample before asking about pixel history"));
 
     if(m_Ctx.APIProps().pixelHistory)
     {
@@ -949,6 +953,12 @@ void TextureViewer::UI_UpdateStatusText()
   TextureDescription *texptr = GetCurrentTexture();
   if(texptr == NULL)
     return;
+
+  const bool individualSample = texptr->msSamp <= 1 || m_TexDisplay.subresource.sample != ~0U;
+  m_AskAIPixel->setEnabled(individualSample && m_PickedPoint.x() >= 0 && m_PickedPoint.y() >= 0);
+  m_AskAIPixel->setToolTip(
+      individualSample ? tr("Ask about the resource pixel value, before display shaders and overlays")
+                       : tr("Choose an individual MSAA sample before asking about pixel history"));
 
   TextureDescription &tex = *texptr;
 
@@ -3895,6 +3905,9 @@ void TextureViewer::on_mipLevel_currentIndexChanged(int index)
       m_TexDisplay.subresource.sample = ~0U;
   }
 
+  // Refresh the Ask AI sample constraint immediately, before replay finishes re-picking.
+  UI_UpdateStatusText();
+
   // For 3D textures, update the slice list for this mip
   if(tex.depth > 1)
   {
@@ -4193,6 +4206,10 @@ bool TextureViewer::AskAIAboutPixel()
   if(!texptr || m_PickedPoint.x() < 0 || m_PickedPoint.y() < 0)
     return false;
 
+  // Pixel history describes a concrete sample, not the viewer's MSAA average.
+  if(texptr->msSamp > 1 && m_TexDisplay.subresource.sample == ~0U)
+    return false;
+
   int x = MipCoordFromBase(m_PickedPoint.x(), texptr->width);
   int y = MipCoordFromBase(m_PickedPoint.y(), texptr->height);
 
@@ -4202,10 +4219,18 @@ bool TextureViewer::AskAIAboutPixel()
     y = (int)(mipHeight - 1) - y;
 
   uint32_t view = m_TexDisplay.subresource.slice - m_Following.GetFirstArraySlice(m_Ctx);
-  AgentAsk::Request(m_Ctx,
-                    AgentAsk::Pixel(m_Ctx, texptr->resourceId, (uint32_t)x, (uint32_t)y,
-                                    m_TexDisplay.subresource.mip, m_TexDisplay.subresource.slice,
-                                    m_TexDisplay.subresource.sample, view, m_Ctx.CurEvent()));
+  AgentAskRequest request = AgentAsk::Pixel(
+      m_Ctx, texptr->resourceId, (uint32_t)x, (uint32_t)y, m_TexDisplay.subresource.mip,
+      m_TexDisplay.subresource.slice, texptr->msSamp > 1 ? m_TexDisplay.subresource.sample : 0,
+      view, m_Ctx.CurEvent(),
+      m_TexDisplay.typeCast);
+  if(m_TexDisplay.customShaderId != ResourceId() || m_TexDisplay.overlay != DebugOverlay::NoOverlay)
+  {
+    request.chip.label += tr(" (before display shader/overlay)");
+    request.question = tr("Why does this resource pixel have this value before display shaders "
+                          "and overlays? Which event wrote it?");
+  }
+  AgentAsk::Request(m_Ctx, request);
   return true;
 }
 

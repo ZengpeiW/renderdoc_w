@@ -15,13 +15,16 @@ public:
   QString workingDir;
   QString mcpPython;
   QString instanceId;
+  QString captureSessionId;
+  bool captureTools = false;
   QString agentRoot;
   QStringList skillRoots;
   bool isolate = true;
   // set when the launch cannot proceed; describes how to fix it
   QString error;
 
-  static AgentLaunchConfig Resolve(const QString &instanceId, const QString &agentRoot);
+  static AgentLaunchConfig Resolve(const QString &instanceId, const QString &captureSessionId,
+                                   const QString &agentRoot);
 
   // splits a command line on whitespace, honouring double quotes
   static QStringList SplitCommand(const QString &command);
