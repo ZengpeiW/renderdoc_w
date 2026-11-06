@@ -9,7 +9,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
 - M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
-- 分析工具扩展：Shader 内嵌源码读取、资源大小统计、事件统计、CBuffer 成员查询和单 EID Overlay；当前共 27 个 MCP 工具，Codex 和 Claude 共用。
+- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、资源大小统计、事件统计、CBuffer 成员查询和单 EID Overlay；当前共 28 个 MCP 工具，Codex 和 Claude 共用。
 
 ## P0 工具
 
@@ -17,7 +17,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 | --- | --- |
 | 实例/上下文 | `list_instances`、`get_status`、`get_context`（含当前 EID 的 Pipeline 摘要） |
 | Action | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`set_event`（唯一会改变 UI 的工具） |
-| Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`get_cbuffer`（支持成员路径和子成员分页） |
+| Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`decompile_shader`（生成 HLSL/GLSL）、`get_cbuffer`（支持成员路径和子成员分页） |
 | 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
 | 诊断图 | `export_overlay`（单 EID 的离屏 Overlay PNG，不改变 UI） |
@@ -39,7 +39,27 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - `export_overlay(resource_id, overlay, event_id=None, mip=0, slice=0, sample=0, type_cast="Typeless", range_min=0, range_max=1, max_dimension=1024, include_image=false)`：创建临时 headless ReplayOutput，导出与纹理显示路径一致的诊断合成 PNG。支持 `Drawcall`、`Wireframe`、`Depth`、`Stencil`、`BackfaceCull`、`ViewportScissor`、`QuadOverdrawDraw`、`TriangleSizeDraw`、`NaN`、`Clipping`。Draw 类模式要求实际 raster draw 和当时绑定的目标子资源；NaN/Clipping 可检查普通 2D 纹理。暂不支持 Mesh Shader draw、MSAA Overdraw、pass 级或 ClearBefore 模式。
 - Overlay 是 `artifact` 操作，不移动 UI 选中事件，也不修改 Texture Viewer 设置；输出始终在 `finally` 释放，并强制恢复共享诊断资源。图像是 8-bit RGB 可视化，默认最长边 1024，`max_dimension` 上限 4096，并受 2M 输出像素预算约束。源纹理及关联深度纹理限制为 16M 存储 texel（包括 mip/slice/sample），超限或 API 不支持时明确报错。结果提供 `legend`、原始/输出尺寸及 `displayTransform`；不要把缩放后的坐标、诊断色或 Overdraw 热图当作原始像素值、精确写入次数或 GPU 耗时。需要实际看图时指定 `include_image=true`。
 
-例如：“读取当前 Pixel Shader 的 Lights 数组第 123 项 Color”、“分页查看这个常量缓冲后面的成员”、“导出当前 Draw 的深度测试和背面剔除 Overlay，解释哪些区域被挡住”。Shader 反编译工具接入另行安排，优先评估可用的 release 二进制。
+例如：“读取当前 Pixel Shader 的 Lights 数组第 123 项 Color”、“分页查看这个常量缓冲后面的成员”、“导出当前 Draw 的深度测试和背面剔除 Overlay，解释哪些区域被挡住”。
+
+## Shader 反编译（现成 release）
+
+`decompile_shader(stage, event_id=None, language="auto")` 读取绑定 Shader 的原始字节码，默认优先生成 HLSL（SM 6.0）；HLSL 文本后端不支持时自动回退 GLSL（450 Vulkan），并给出原因。可显式指定 `hlsl` 或 `glsl`，此时不切换语言。`requestedLanguage` 记录请求，`outputLanguage` 记录实际输出。结果包含 `decompiledArtifact`，可用 `read_artifact` 分页或搜索；同时记录输入编码、大小、SHA-256、Shader/入口身份、release 和组件校验信息。`generated=true`、`isOriginalSource=false` 明确区分生成代码与内嵌源码。反编译无法保证恢复原始变量名、宏、注释或等价行为；翻译可能重映射绑定和接口位置，应以 `get_shader` / `get_pipeline_state` 的原始反射与实际绑定为准。
+
+使用 [HLSL-Decompiler v0.6](https://github.com/YYadorigi/HLSL-Decompiler/releases/tag/v0.6) 的 Windows x64 预编译包，不从源码构建。安装器固定 ZIP SHA-256 `57748e4a9db0dfc40f094da8284c5e274ce45e06831c3a2fd61a844436984caa` 并核对每个文件，仅安装三个组件 CLI 及其 DLL；不安装或执行 wrapper/bat。组件版本和许可证来源保存在 `decompiler_release.py`，二进制不提交 Git。
+
+从仓库根目录执行：
+
+```powershell
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\install_shader_decompiler.py
+# 离线时可用 --archive <已下载的 HLSLDecompiler.zip>；仍必须匹配固定 SHA-256
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\install_shader_decompiler.py --verify-only
+```
+
+默认安装到 `x64/Release/integrations/rendertest_agent/tools/shader_decompiler`。其他部署目录用 `--output`，并在启动 RenderTest 前设置 `RENDERTEST_SHADER_DECOMPILER_DIR`；运行时仍验证固定二进制哈希，不接受任意命令或可执行文件。非空目录只校验、不覆盖；损坏时先将该目录改名保留，再重新安装。更新 Bridge、Skill 后重启 RenderTest 并新建 AI 对话即可使用，例如：“当前 Pixel Shader 没有源码，反编译并解释颜色计算，结合实际 CBuffer 核对参数。”
+
+支持 DXBC→DXIL→SPIR-V→文本、DXIL→SPIR-V→文本及 Vulkan SPIR-V→文本。暂不接受 GLSL/OpenGLSPIRV；该 release 的 HLSL 后端不支持 hull/domain，auto 直接选择 GLSL。HLSL 中无法表达的部分波操作也会在 auto 下回退 GLSL。其他不受支持的指令或目标特性会返回 `UNSUPPORTED` 和有界诊断，不能保证任意 Shader 都能转换成功。取消、超时、超限、缺少工具或字节码转换失败不会触发语言重试；失败时保留反汇编分析路径，不把反汇编冒充源码。
+
+反编译为 `artifact` 操作：先短暂回放并复制字节码、恢复事件，再在 Bridge worker 执行固定参数的进程。UI 选择和 capture 保持不变；总转换硬超时 60 秒，输入/中间产物/生成文本上限 16 MiB、单步日志上限 1 MiB，结束时清理临时文件及进程。该实例的其他 MCP 请求会排队；面板 Stop 不保证立即中断已开始的转换，Bridge 退出或请求超时会终止进程。
 
 ## P1 工具（M4）
 
@@ -66,7 +86,9 @@ agent/
   bridge/rendertest_agent_bridge/   # qrenderdoc 内嵌 Bridge，保持 Python 3.6 兼容
   mcp_server/src/rendertest_mcp/    # 外部 stdio MCP Server，Python >= 3.10
   devtools/fake_bridge.py           # 不依赖 qrenderdoc 的 Bridge 模拟器
-  devtools/smoke_live.py            # 对运行中的 qrendertest 冒烟；--all-p0 跑全部 P0 工具
+  devtools/smoke_live.py            # 常规 P0 冒烟；可选反编译依赖由 decompile_live 单独验证
+  devtools/install_shader_decompiler.py # 校验并安装固定的预编译 release
+  devtools/decompile_live.py        # 独立 capture 进程验证反编译与 artifact 读取
   devtools/codex_config.py          # 输出 Codex 的 MCP 配置片段（toml 或 -c 参数）
   devtools/codex_e2e.py             # codex exec 跑 3 个端到端验收问题
   devtools/live_lifecycle.py        # 启动 qrendertest，自动验收加载/选中/关闭/重载/退出
@@ -85,7 +107,7 @@ agent/
 
 - `rendertest-core`：目标选择、capture/session 身份、工具效果、实测与推断的区分。
 - `rendertest-event-analysis`：解释 EID/pass 的输入、计算和输出，统计 frame/pass 事件及纹理/缓冲大小。
-- `rendertest-shader-debug`：Shader 内嵌源码、反射、绑定、CBuffer 和反汇编，`debug_pixel` / `debug_vertex` 单步调试。
+- `rendertest-shader-debug`：Shader 内嵌源码、生成 HLSL/GLSL、反射、绑定、CBuffer 和反汇编，`debug_pixel` / `debug_vertex` 单步调试。
 - `rendertest-pixel-investigation`：像素取值、用 `pixel_history` 找最后改变它的事件和失败原因，必要时 `debug_pixel` 看 Shader 计算；不支持时退回资源用途比较。
 
 ## 环境
@@ -124,6 +146,8 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --analysis-only --launch "E:\Captures\some.rdc" --event-id 3820
 # 验证 CBuffer 成员读取、分页和诊断 Overlay PNG，结束后退出独立进程
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --second-batch --launch "E:\Captures\some.rdc" --event-id 3820
+# 已安装反编译 release：验证绑定 VS/PS 的 auto/GLSL 及文本 artifact
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\decompile_live.py --launch "E:\Captures\some.rdc" --event 3820
 # 额外检查指定像素的 pixel_history（可重复）
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --all-p0 --launch "E:\Captures\some.rdc" --pixel-history 116618:1513:1:1
 # 额外对指定像素跑 debug_pixel（自动取 pixel_history 里通过的 primitive，可重复）

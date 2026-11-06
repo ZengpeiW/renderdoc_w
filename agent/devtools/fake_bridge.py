@@ -521,6 +521,29 @@ class FakeRenderTestBridge:
             data.update(file=source, sourceArtifact=str(path))
         return BridgeResult(_payload(data, artifacts=artifacts), self._read_meta(event))
 
+    def _method_decompile_shader(self, params: dict[str, Any]) -> BridgeResult:
+        event, shader = self._shader_id(params)
+        requested_language = params.get("language", "auto")
+        if requested_language not in ("auto", "hlsl", "glsl"):
+            raise AgentBridgeError("INVALID_REQUEST", "Unknown output language.")
+        language = "hlsl" if requested_language == "auto" else requested_language
+        directory = artifact_directory(str(self.root), self.instance_id, self.capture_session_id, "replay")
+        path = Path(directory) / f"shader-decompiled-{uuid.uuid4().hex}.txt"
+        text = ("// Synthetic generated shader fixture, not original source\n" +
+                ("float4 main() : SV_Target { return 1; }\n" if language == "hlsl"
+                 else "#version 450\nvoid main() {}\n"))
+        path.write_text(text, encoding="utf-8", newline="")
+        artifact = describe_artifact(str(path), "shader-decompiled", "text/plain; charset=utf-8",
+                                     source={"event": event, "stage": params["stage"],
+                                             "shaderResourceId": shader, "generated": True})
+        return BridgeResult(_payload(
+            {"eventId": event, "stage": params["stage"], "shader": {"resourceId": shader},
+             "available": True, "generated": True, "isOriginalSource": False,
+             "inputEncoding": "DXIL", "outputLanguage": language, "requestedLanguage": requested_language,
+             "decompiledArtifact": str(path), "readArtifactCompatible": True},
+            artifacts=[artifact], warnings=["Synthetic generated shader; no release tool was run."]),
+            self._read_meta(event))
+
     def _method_list_resources(self, params: dict[str, Any]) -> dict[str, Any]:
         kind = params.get("kind")
         query = str(params.get("query") or "").casefold()

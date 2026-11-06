@@ -29,6 +29,7 @@ TextureTypeCast = Literal["Typeless", "Float", "UNorm", "SNorm", "UInt", "SInt",
 DiagnosticOverlay = Literal["Drawcall", "Wireframe", "Depth", "Stencil", "BackfaceCull",
                             "ViewportScissor", "QuadOverdrawDraw", "TriangleSizeDraw", "NaN",
                             "Clipping"]
+ShaderLanguage = Literal["auto", "hlsl", "glsl"]
 FiniteNumber = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 HistoryOrder = Literal["newest", "oldest"]
 MeshStage = Literal["vs_out", "gs_out"]
@@ -71,7 +72,7 @@ StrictLimit = Annotated[
 ]
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "export_overlay", "get_buffer_data", "pixel_history",
-                                   "debug_pixel", "debug_vertex", "get_mesh_data"})
+                                   "debug_pixel", "debug_vertex", "get_mesh_data", "decompile_shader"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -413,6 +414,30 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             "get_shader_source",
             _clean_params(stage=stage, event_id=event_id, file_index=file_index,
                           cursor=cursor, limit=limit),
+            instance_id=instance_id,
+        )
+
+    @tool()
+    async def decompile_shader(
+        stage: Stage,
+        event_id: StrictOptionalEventId = None,
+        language: ShaderLanguage = "auto",
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Generate HLSL or GLSL from the shader bytecode bound at an event.
+
+        auto tries HLSL first and falls back to GLSL with a warning only when SPIRV-Cross
+        cannot generate HLSL. Explicit hlsl/glsl requests never switch languages. Check
+        requestedLanguage and outputLanguage in the result.
+        The generated code is not the original source and is not guaranteed to recompile
+        or behave equivalently. Prefer get_shader_source when embedded source is available.
+        Unsupported formats, stages or converter features return an error with details;
+        a failed conversion is never substituted with disassembly. Read a successful text
+        artifact with read_artifact for line paging or search. Does not replace the shader.
+        """
+        return await invoke(
+            "decompile_shader",
+            _clean_params(stage=stage, event_id=event_id, language=language),
             instance_id=instance_id,
         )
 

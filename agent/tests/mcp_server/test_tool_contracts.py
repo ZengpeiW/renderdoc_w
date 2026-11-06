@@ -48,7 +48,8 @@ def test_tool_annotations_follow_effects() -> None:
 
     read_only = {name for name, tool in tools.items() if tool.annotations.readOnlyHint}
     assert read_only == set(TOOL_NAMES) - {"set_event", "export_texture", "debug_pixel",
-                                              "debug_vertex", "get_shader_source", "export_overlay"}
+                                              "debug_vertex", "get_shader_source", "export_overlay",
+                                              "decompile_shader"}
     for tool in tools.values():
         assert tool.annotations.destructiveHint is False
         assert tool.annotations.openWorldHint is False
@@ -69,6 +70,7 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "get_pipeline_state": {"event_id": 20},
             "get_shader": {"event_id": 30, "stage": "pixel", "include_disassembly": True},
             "get_shader_source": {"event_id": 30, "stage": "pixel", "file_index": 0},
+            "decompile_shader": {"event_id": 30, "stage": "pixel"},
             "get_cbuffer": {"event_id": 30, "stage": "pixel", "index": 0},
             "list_resources": {"kind": "texture"},
             "get_resource_stats": {"kind": "all", "top_n": 1},
@@ -91,6 +93,10 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
         ))
         source = structured(call_tool(server, "read_artifact", {
             "path": results["get_shader_source"]["data"]["sourceArtifact"],
+            "search": "float4", "limit": 1,
+        }))
+        decompiled = structured(call_tool(server, "read_artifact", {
+            "path": results["decompile_shader"]["data"]["decompiledArtifact"],
             "search": "float4", "limit": 1,
         }))
 
@@ -116,6 +122,10 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["get_resource_stats"]["data"]["knownTotalBytes"] == 448
     assert results["get_resource_stats"]["data"]["hasMoreLargest"]
     assert results["get_shader_source"]["effect"] == "artifact"
+    assert results["decompile_shader"]["effect"] == "artifact"
+    assert results["decompile_shader"]["data"]["generated"] is True
+    assert results["decompile_shader"]["data"]["isOriginalSource"] is False
+    assert decompiled["data"]["lines"][0]["text"] == "float4 main() : SV_Target { return 1; }"
     assert results["export_overlay"]["effect"] == "artifact"
     assert results["export_overlay"]["data"]["overlay"] == "Depth"
     assert Path(results["export_overlay"]["artifacts"][0]["path"]).read_bytes().startswith(b"\x89PNG")
