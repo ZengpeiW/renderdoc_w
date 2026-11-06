@@ -136,14 +136,15 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 
 ## qrendertest 内的 AI 面板（M5a–M5d）
 
-菜单 `Window → AI Assistant` 打开可停靠面板。第一次发送消息时，面板启动 `codex app-server`，并把 rendertest MCP 绑定到本窗口的 Bridge 实例；不需要改 `~/.codex/config.toml`。
+菜单 `Window → AI Assistant` 打开可停靠面板。在 `Settings → Backend` 选择 Codex 或 Claude；第一次发送消息时启动所选 harness，并把 rendertest MCP 固定绑定到当前窗口的 Bridge 实例。
 
-- 前提：已经安装 Codex CLI（`npm install -g @openai/codex`）；`agent/mcp_server/.venv` 已创建。可沿用已有 Codex 登录，或在未登录提示出现后点面板的 `Log in`，在浏览器完成登录后重新发送问题；等待时可点 `Cancel login`。
-- 设置：点 `Settings` 配置原生 codex 可执行文件、MCP Python、模型、推理强度和隔离开关；设置保存到 RenderTest 配置文件，下一条问题重新建立会话。留空沿用自动查找或 Codex 配置。首次打开设置就会独立加载模型列表，无需先发送问题或配置 MCP Python；窗口显示加载、失败和空列表状态，可点 `Refresh` 重试。加载完成会保留已输入的模型和推理强度；自定义 provider 可以手填，已列出的模型会在保存时校验其支持的推理强度。
-- 只读：thread 使用 `read-only` 沙箱和 `never` 审批，所有审批请求都会被拒绝；shell 和 web search 始终关闭，其它 MCP server 默认隔离。隔离检查失败会阻止对话。
+- Codex 前提：安装 Codex CLI（`npm install -g @openai/codex`）并创建 `agent/mcp_server/.venv`。可沿用已有 Codex 登录，或在未登录提示出现后点面板的 `Log in`；浏览器完成登录后重新发送问题，等待时可点 `Cancel login`。
+- Claude 前提：用面板所选的 Python 安装可选依赖，在仓库根目录运行 `agent\mcp_server\.venv\Scripts\python.exe -m pip install -e "agent/mcp_server[claude]"`。`Claude executable` 留空使用 SDK 默认 runtime，也可指定原生 `claude.exe`。认证由 Claude 管理：可使用其支持的 API 环境配置，或在原生 CLI 中执行 `claude auth login`；RenderTest 不保存 API key，也不提供 Claude 的浏览器登录按钮。环境变量凭据改变后需重启 RenderTest。
+- 设置：Codex 和 Claude 分别保存模型、推理强度和可执行文件路径；切换后端会保存旧对话并开始新对话。打开设置即可独立加载所选后端的模型目录，显示加载、失败和空目录状态，支持 `Refresh` 和手填模型。Codex 目录查询不依赖 MCP Python；Claude 目录查询使用已安装 SDK 的 Python。加载完成会保留输入，已列出的模型会校验支持的推理强度。
+- 工具权限：Codex 使用 `read-only` 沙箱和 `never` 审批，shell/web search 关闭，其它 MCP 默认隔离。Claude 使用 SDK 的空内置工具集、严格 MCP 配置及工具白名单，只开放绑定的 rendertest 工具；关闭用户/项目配置、插件、hook、shell、文件和 web 工具，不能关闭隔离。Claude 的这套工具限制不等同于 Codex 的操作系统沙箱。两种后端均需确认权限和 MCP 状态后才发送问题。
 - 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息重新连接并恢复 thread。“New Chat”保存当前对话后清空面板，下一问创建独立 thread。
-- 历史：点 `History` 搜索并打开已保存对话；消息在本地显示，发送新问题时才启动 Codex 并恢复上下文。历史位于 `<agent root>/conversations/<UUID>.json`，流式更新每 2 秒保存，回合结束和关闭时立即保存；使用原子写入和会话锁。另一窗口正在使用的记录可只读查看。
-- 续聊要求：本地已保存的 capture 必须匹配规范路径、大小、修改时间和完整 SHA-256；校验在后台完成。不同、远程、临时或缺失的 capture 只能查看历史；纯聊天仅在没有 capture 时恢复。旧消息的 EID/资源跳转链接保持失效，新回复可正常跳转。Codex rollout 不存在或恢复校验失败时保留只读历史，可以 `New Chat` 重新开始。M5a–M5c 的旧 ephemeral thread 不会自动迁移。
+- 历史：点 `History` 搜索并打开已保存对话；消息在本地显示，发送新问题时才启动原后端并恢复上下文。历史位于 `<agent root>/conversations/<UUID>.json`，流式更新每 2 秒保存，回合结束和关闭时立即保存；使用原子写入和会话锁。另一窗口正在使用的记录可只读查看。列表显示后端，跨后端记录只能查看；选择原后端后重新打开记录才能续聊。新保存使用 v2 格式，旧 v1 默认属于 Codex，继续保存时升级；旧版程序会拒绝 v2，避免误用会话 ID。
+- 续聊要求：本地已保存的 capture 必须匹配规范路径、大小、修改时间和完整 SHA-256；校验在后台完成。不同、远程、临时或缺失的 capture 只能查看历史；纯聊天仅在没有 capture 时恢复。旧消息的 EID/资源跳转链接保持失效，新回复可正常跳转。所选 harness 的原生会话丢失或恢复校验失败时保留只读历史，可以 `New Chat` 重新开始。Claude 额外在 `<agent root>/claude-sessions/` 保存会话绑定信息，原生消息仍由 Claude runtime 保存；不要只拷贝 UI 快照来迁移上下文。M5a–M5c 的旧 ephemeral thread 不会自动迁移。
 - 每条消息前会附上 `<rendertest_context>`（实例 id、capture、当前 EID），这是发送时的快照。
 - MCP 固定绑定发送时的实例和 capture session，包括 `get_context` / `get_status` 都不能重新绑定。capture 加载/关闭会停止旧会话并将它保存为只读历史；新建对话或从 `History` 打开匹配记录后继续。恢复时重新设置当前实例/session 并检查隔离。没有可验证的 capture 或 bridge 时禁用 rendertest MCP，允许纯聊天，不会自动连接其它窗口。
 - 上下文 chip：输入框上方显示本条消息会带上的上下文。“Current EID”默认附带，点 × 去掉，点 “+ Current EID” 加回；其它 chip 发送后清空，并显示在用户气泡下方。每个 chip 以 `selection: {json}` 写进 `<rendertest_context>`，字段名和 MCP 工具参数一致（`event_id`、`resource_id`、`x`/`y`（左上原点）、`mip`、`slice`、`sample`、`vertex`、`instance`、`view`）。
@@ -154,15 +155,17 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
   - Mesh Viewer VS In / VS Out 表格右键 → `Ask AI about this Vertex`
 - 回答里的 `EID 1459`、`event 1459`、`ResourceId::116618` 会变成链接：点击 EID 跳到该事件；点击资源时纹理在 Texture Viewer 打开，缓冲在 Buffer Viewer 打开，其它资源在 Resource Inspector 打开。
 - 工具卡默认折叠，点击展开参数、错误和结果；参数最多 8 KiB、结果最多 4 KiB（UTF-8）。完整结果里的 PNG artifact 会独立提取为最多 256×256 缩略图，点击用系统查看器打开。图片必须属于工具响应中的实例/session 目录，并通过文件大小、SHA-256、PNG 格式和路径校验；拒绝越界、符号链接/junction、超过 8 MiB、单边超过 8192 或超过 16 MP 的图片。图片不可用时显示原因。
-- 4 个 Skills 随构建部署到 `integrations/rendertest_agent/skills/`，并在 `.agents/skills/` 保留 cwd 自动发现副本；不依赖从仓库目录启动。
+- 4 个 Skills 随构建部署到 `integrations/rendertest_agent/skills/`，并在 `.agents/skills/` 保留 Codex cwd 自动发现副本。Claude 适配器读取这些受信任的部署文件作为启动指令，不启用任意文件读取或全局 Skill；不依赖从仓库目录启动。
 - 日志：`<agent root>/logs/chat-<instanceId>.log`，包含启动参数和 app-server 的 stderr 尾部。
 
 环境变量：
 
-- `RENDERTEST_AGENT_CODEX_COMMAND`：替换 codex 命令（按空格拆分，支持引号），优先于设置；未配置时查找 npm 安装的 `codex.exe`，再查 PATH。
-- `RENDERTEST_MCP_PYTHON`：MCP Server 使用的 Python，优先于设置；未配置时查找 exe 上层目录中的 `agent/mcp_server/.venv/Scripts/python.exe`。
+- `RENDERTEST_AGENT_BACKEND`：覆盖保存的后端，仅接受 `codex` 或 `claude`。
+- `RENDERTEST_AGENT_CODEX_COMMAND`：替换 Codex 命令（按空格拆分，支持引号），优先于设置；未配置时查找 npm 安装的 `codex.exe`，再查 PATH。
+- `RENDERTEST_AGENT_CLAUDE_COMMAND`：替换 Claude 桥接进程命令，供测试/部署使用；协议须实现 RenderTest 后端接口，不是直接填普通 `claude` 交互命令。
+- `RENDERTEST_MCP_PYTHON`：MCP Server / Claude SDK 适配器使用的 Python，优先于设置；未配置时查找 exe 上层目录中的 `agent/mcp_server/.venv/Scripts/python.exe`。
 - `RENDERTEST_AGENT_MODEL` / `RENDERTEST_AGENT_REASONING_EFFORT`：覆盖保存的模型和推理强度，分别传给 `thread/start.model` 和 `turn/start.effort`。
-- `RENDERTEST_AGENT_ISOLATE=0`：不关闭用户其它 Codex feature 和 MCP server；shell 与 web search 仍然禁用。
+- `RENDERTEST_AGENT_ISOLATE=0`：仅影响 Codex，不关闭其其它 feature 和 MCP server；shell 与 web search 仍然禁用。Claude 始终隔离。
 - `RENDERTEST_AGENT_FIXED_INSTANCE_ID` / `RENDERTEST_AGENT_CAPTURE_SESSION_ID`：面板为其 MCP 子进程设置的强制绑定，必须成对有效；不同实例参数或 capture session 会被拒绝。外部 CLI 不设置这两个变量时仍可按原规则选择实例。
 - `RENDERTEST_AGENT_CHAT_AUTOTEST`：测试钩子（JSON 或 JSON 文件路径），由 `chat_panel_e2e.py` 使用。
 
@@ -176,6 +179,9 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_schema_check.
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_skills_check.py
 # 真实 Codex + 仅 localhost 的 Responses fixture：验证跨进程恢复包含上一问答
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_history_check.py
+# Claude GUI fake 回归；真实 Claude SDK/CLI + localhost Messages fixture + fake Bridge
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --scenario claude
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\claude_backend_check.py
 # M5d fake 回归；真实 capture + fake server，不调用模型
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --scenario M5d
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --history-capture --capture "E:\Captures\some.rdc"

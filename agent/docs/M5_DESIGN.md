@@ -404,6 +404,20 @@ M5c 回归覆盖：登录成功后重新发送、失败可恢复、取消后迟�
 
 设置窗口的模型目录独立于聊天会话：打开时使用当前 Codex 路径启动短生命周期 app-server，仅执行初始化和分页 `model/list`，不依赖 capture、MCP Python 或第一条问题。窗口提供加载状态、错误、空目录提示和刷新按钮，关闭时终止查询进程。异步结果保留用户正在编辑的模型与推理强度；已知模型未列出的强度在保存时提示选择有效值。`chat_panel_e2e.py --scenario model-settings` 覆盖首次打开分页、加载中手填、已知模型的强度校验、失败、空目录、取消和循环 cursor。
 
+### Claude harness 扩展
+
+面板通过 `AgentBackend` 的类型化操作调用后端。v1 进程协议保留既有 `thread`/`turn`/`item` 字段供 UI reducer 使用：Codex 原生实现这些方法；`rendertest_mcp.claude_backend` 把 Claude Agent SDK 的原生会话和事件转换为相同的显示契约。ClaudeSDKClient 负责 agent 循环和模型调用，适配器不自行实现 LLM 循环。DeepSeek harness 暂不接入。
+
+- `Settings → Backend` 在 Codex / Claude 间选择；各自保存可执行文件、模型及推理强度。切换时取消旧目录查询、保留各自草稿；保存后端切换会保存旧对话并开始新对话。Claude 使用 MCP Python 环境中的可选 `claude-agent-sdk`，路径留空使用 SDK 默认 runtime。
+- Claude 的 SDK connect/disconnect 在同一 owner task 中执行，模型目录与账户读取串行化；流式内容、思考、回合状态和 token 数转换为已有展示事件。流式块与完整 AssistantMessage 进行幂等合并，避免重复显示。
+- Claude 仅挂载进程内 `rendertest` MCP，复用现有 FastMCP 工具和固定实例/session 的 BridgeClient。工具响应保留完整 `structuredContent`、artifact 和 capture 身份，随后交给已有工具卡及文件校验。无 capture 时不挂载 MCP。
+- Claude 配置 `tools=[]`、严格 MCP、空 setting sources/plugins/hooks 和工具白名单，并注入受信任部署的四份 Skill；每次调用再次检查 capture 绑定。回执明确表示工具限制，不能伪称提供 Codex 的操作系统沙箱。Claude 认证由原生 CLI/环境配置管理，面板不存凭据或复用 Codex OAuth。
+- 本地历史新写 v2，顶层记录 `backend`，`threadId` 表示该后端的原生 session id。兼容 v1 并默认 Codex；不同后端仅可查看快照。恢复前后及异步 capture 校验后均复查后端，拒绝把同一 UUID 改写为另一后端；旧程序拒绝 v2。
+- Claude 另存原生会话与 capture 的绑定 ledger；已提交 query 的会话必须能验证原生历史才可恢复。明确尚未提交过 query 的预备会话可在 Stop 后以同一预分配 UUID 重新建立，返回 `prepared` 状态；不能把原生历史丢失误报为恢复成功。
+- Stop 优先调用 SDK interrupt，超时仍由 Qt 的 Windows Job Object 回收整个进程树；进程自然退出或崩溃也立即释放 job。异常断连通知面板重新连接，避免显示 Ready 却无法发送。取消发生在重连期间时，不再启动迟到的 query。
+
+验证入口：`chat_panel_e2e.py --scenario claude`、Python `test_claude_backend.py`、native history tests。`claude_backend_check.py` 使用真实 SDK/CLI、仅 localhost 的 Messages SSE fixture 及 fake Bridge，验证实际工具调用/PNG artifact、工具白名单、跨进程上下文恢复和进程回收；不调用在线模型或读取真实 capture。
+
 M5d 回归：`chat_panel_e2e.py --scenario M5d` 覆盖新建分开保存、跨进程续聊、恢复去重、无 app-server 查看、损坏记录跳过、capture 不匹配、远端不存在、配置读取失败、其它 MCP 启用和 sandbox 错误。拒绝恢复必须不改写原历史文件。`--history-capture --capture FILE.rdc` 使用真实 capture + fake app-server，验证同文件重开后保持对话/thread、更新实例/session、拒绝旧链接并检查历史列表截图；不发送 capture 给模型。
 
 另外：

@@ -1,11 +1,11 @@
-"""End-to-end checks for the qrendertest AI panel (M5a-M5d).
+"""End-to-end checks for the qrendertest AI panel (M5a-M5d and Claude harness).
 
 Usage:
-    python devtools/chat_panel_e2e.py [--scenario all|M5d|model-settings|A1|A2|...] [--exe qrendertest.exe]
+    python devtools/chat_panel_e2e.py [--scenario all|M5d|model-settings|claude|A1|A2|...] [--exe qrendertest.exe]
     python devtools/chat_panel_e2e.py --history-capture --capture FILE.rdc [--event EID]
     python devtools/chat_panel_e2e.py --real --capture FILE.rdc [--question TEXT] [--ask-pixel]
 
-Fake mode points the panel at ``fake_app_server.py`` through RENDERTEST_AGENT_CODEX_COMMAND, drives
+Fake mode points the panel at ``fake_app_server.py`` through the selected backend's command override, drives
 it with the RENDERTEST_AGENT_CHAT_AUTOTEST hook and asserts on both the transcript the panel writes
 and the messages the fake received. Real mode uses the installed Codex CLI against a capture, then
 checks the tool calls, the stop latency and that no codex or MCP process outlives qrendertest.
@@ -145,9 +145,14 @@ class Run:
         self.transcript = {}
         self.log_offset = len(read_jsonl(self.fake_log))
         autotest = dict(autotest, transcript=str(self.transcript_path))
+        # Make test backend/model selection independent of the developer's persisted settings
+        # and environment. Individual scenarios explicitly supply the backend under test.
+        autotest["settings"] = dict({"backend": "codex"}, **autotest.get("settings", {}))
         environ = dict(os.environ)
-        environ.pop("RENDERTEST_AGENT_CODEX_COMMAND", None)
-        environ.pop("RENDERTEST_MCP_PYTHON", None)
+        for name in ("RENDERTEST_AGENT_CODEX_COMMAND", "RENDERTEST_AGENT_CLAUDE_COMMAND",
+                     "RENDERTEST_AGENT_BACKEND", "RENDERTEST_MCP_PYTHON", "RENDERTEST_AGENT_MODEL",
+                     "RENDERTEST_AGENT_REASONING_EFFORT", "RENDERTEST_AGENT_ISOLATE"):
+            environ.pop(name, None)
         environ["RENDERTEST_AGENT_ROOT"] = str(self.root / "agent-root")
         environ["RENDERTEST_AGENT_CHAT_AUTOTEST"] = json.dumps(autotest, ensure_ascii=False)
         environ.update(env)
@@ -201,6 +206,10 @@ class Run:
         return [entry["pid"] for entry in read_jsonl(self.fake_log)[self.log_offset:]
                 if entry.get("event") == "start"]
 
+    def cleanup_child_pids(self) -> list[int]:
+        return [entry["pid"] for entry in read_jsonl(self.fake_log)[self.log_offset:]
+                if entry.get("event") == "cleanup-child"]
+
     def history_records(self) -> list[dict[str, Any]]:
         records = []
         for path in (self.root / "agent-root" / "conversations").glob("*.json"):
@@ -221,6 +230,64 @@ class Run:
 def fake_env(run: Run, scenario: str) -> dict[str, str]:
     command = f'"{sys.executable}" "{FAKE}" --scenario {scenario} --log "{run.fake_log}" --state-dir "{run.root}"'
     return {"RENDERTEST_AGENT_CODEX_COMMAND": command, "RENDERTEST_AGENT_ISOLATE": "1"}
+
+
+def claude_env(run: Run, scenario: str) -> dict[str, str]:
+    command = subprocess.list2cmdline([sys.executable, str(FAKE), "--backend", "claude", "--scenario", scenario,
+                                      "--log", str(run.fake_log), "--state-dir", str(run.root)])
+    return {"RENDERTEST_AGENT_BACKEND": "claude", "RENDERTEST_AGENT_CLAUDE_COMMAND": command,
+            # The selected harness must ignore an unusable Codex command and enforce its own
+            # restrictions even if the optional Codex isolation switch is explicitly disabled.
+            "RENDERTEST_AGENT_CODEX_COMMAND": str(run.root / "must-not-launch-codex.exe"),
+            "RENDERTEST_AGENT_ISOLATE": "0"}
+
+
+def claude_settings() -> dict[str, Any]:
+    return {"backend": "claude", "claudePath": sys.executable, "mcpPython": sys.executable,
+            "claudeModel": "fake-deep", "claudeReasoningEffort": "ultra",
+            "model": "codex-independent-model", "reasoningEffort": "codex-independent-effort",
+            "isolate": False}
+
+
+def check_claude_launch(run: Run, *, discovery: bool = False) -> None:
+    starts = [entry for entry in read_jsonl(run.fake_log)[run.log_offset:] if entry.get("event") == "start"]
+    run.check(bool(starts) and all(entry.get("backend") == "claude" for entry in starts),
+              "Claude command override did not launch the intended fake harness")
+    for entry in starts:
+        argv = entry.get("argv", [])
+        for flag in ("--claude-path", "--mcp-python"):
+            value = argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else ""
+            run.check(os.path.normcase(os.path.normpath(value)) == os.path.normcase(os.path.normpath(sys.executable)),
+                      f"Claude launch lost {flag}: {argv}")
+        run.check("-c" not in argv and not any(value.startswith(("features.", "mcp_servers.")) for value in argv),
+                  f"Claude process received Codex-specific command-line overrides: {argv}")
+        run.check("--instance" not in argv and "--capture-session" not in argv,
+                  "plain-chat/catalog Claude process acquired a capture scope")
+        if not discovery:
+            root = argv[argv.index("--agent-root") + 1] if "--agent-root" in argv else ""
+            run.check(os.path.normcase(os.path.normpath(root)) ==
+                      os.path.normcase(os.path.normpath(str(run.root / "agent-root"))),
+                      "Claude process did not receive the isolated test agent root")
+            run.check("--skills-root" in argv, "Claude process did not receive deployed RenderTest skills")
+    run.check(run.session().get("backend") == "claude", f"selected backend {run.session().get('backend')}")
+
+
+def check_claude_params(run: Run, *, resume: bool = False) -> None:
+    session_method = "thread/resume" if resume else "thread/start"
+    sessions = [message.get("params", {}) for message in run.received() if message.get("method") == session_method]
+    run.check(len(sessions) == 1, f"Claude {session_method} request count {len(sessions)}")
+    for params in sessions:
+        run.check(params.get("model") == "fake-deep", "Claude session used Codex's independent model setting")
+        run.check(params.get("config") == {"mcp_servers.rendertest.enabled": False},
+                  f"Claude plain-chat session inherited another MCP configuration: {params.get('config')}")
+    turns = [message.get("params", {}) for message in run.received() if message.get("method") == "turn/start"]
+    run.check(all(params.get("effort") == "ultra" for params in turns),
+              "Claude turn used Codex's independent reasoning effort")
+    run.check(run.session().get("selectedModel") == "fake-deep" and
+              run.session().get("selectedEffort") == "ultra" and run.session().get("isolate") is True,
+              "Claude launch did not apply independent model/effort and forced isolation")
+    run.check(not any(message.get("method", "").startswith("account/login/") for message in run.received()),
+              "Claude received a Codex browser login operation")
 
 
 def methods(messages: list[dict[str, Any]]) -> list[str]:
@@ -340,15 +407,28 @@ def scenario_a4_hang(run: Run) -> None:
 
 
 def scenario_a5(run: Run) -> None:
-    run.launch({"questions": ["first", "second"]}, fake_env(run, "crash-once"))
+    retry = run.name != "A5-crash-child"
+    run.launch({"questions": ["first", "second"] if retry else ["first"]}, fake_env(run, "crash-once"))
     if not run.wait_transcript(60):
         return
     results = run.results()
-    run.check([r.get("status") for r in results] == ["failed", "completed"], f"results {results}")
+    run.check([r.get("status") for r in results] == (["failed", "completed"] if retry else ["failed"]),
+              f"results {results}")
     notices = " ".join(i.get("text", "") for i in run.items("notice"))
     run.check("simulated crash" in notices, "stderr tail not shown after crash")
-    check_thread_rebound(run, "crash")
-    run.check(len(run.fake_pids()) == 2, f"app-server not restarted: {run.fake_pids()}")
+    if retry:
+        check_thread_rebound(run, "crash")
+        run.check(len(run.fake_pids()) == 2, f"app-server not restarted: {run.fake_pids()}")
+    else:
+        run.check(len(run.fake_pids()) == 1 and run.process is not None and run.process.poll() is None,
+                  "crash cleanup fixture retried or closed the UI before checking its child")
+        run.check(run.session().get("state") == "error" and not run.session().get("appServerRunning"),
+                  "crashed backend was not marked stopped")
+    if os.name == "nt":
+        children = run.cleanup_child_pids()
+        run.check(bool(children), "crash fixture did not create a surviving child")
+        # A5-crash-child does not retry, so cleanup cannot be deferred to the next Start/Kill.
+        run.check_no_survivors(children)
 
 
 def scenario_a6_logged_out(run: Run) -> None:
@@ -389,12 +469,16 @@ def scenario_a6_bad_python(run: Run) -> None:
 def scenario_exit(run: Run) -> None:
     run.launch({"questions": ["never finishes"]}, fake_env(run, "hang"))
     deadline = time.time() + 60
-    while time.time() < deadline and "turn/start" not in methods(run.received()):
+    while time.time() < deadline and ("turn/start" not in methods(run.received()) or
+                                     (os.name == "nt" and not run.cleanup_child_pids())):
         time.sleep(0.2)
     pids = run.fake_pids()
     run.check(bool(pids), "fake app-server never started a turn")
     run.close()
-    run.check_no_survivors(pids)
+    children = run.cleanup_child_pids()
+    if os.name == "nt":
+        run.check(bool(children), "exit fixture did not create a child process")
+    run.check_no_survivors(pids + children)
 
 
 PIXEL_CHIP = {
@@ -685,7 +769,11 @@ def scenario_model_settings(run: Run) -> None:
 
 def scenario_tool_artifacts(run: Run) -> None:
     rejected = run.name == "C-tool-artifacts-rejected"
-    run.launch({"questions": ["show the texture"], "clickLinks": ["first-tool", "first-artifact"]},
+    claude = run.name == "E-claude-tool-artifacts"
+    autotest = {"questions": ["show the texture"], "clickLinks": ["first-tool", "first-artifact"]}
+    if claude:
+        autotest["settings"] = claude_settings()
+    run.launch(autotest, claude_env(run, "tool-artifacts") if claude else
                fake_env(run, "tool-artifacts-rejected" if rejected else "tool-artifacts"))
     if not run.wait_transcript(60):
         return
@@ -708,6 +796,11 @@ def scenario_tool_artifacts(run: Run) -> None:
     if rejected:
         run.check(clicks and clicks[-1].get("link", "").startswith("agent-artifact://"),
                   "unsafe artifact was never clicked")
+    if claude:
+        check_claude_launch(run)
+        check_claude_params(run)
+        run.check([result.get("status") for result in run.results()] == ["completed"],
+                  f"Claude artifact turn did not complete: {run.results()}")
 
 
 def scenario_first_settings(run: Run) -> None:
@@ -789,6 +882,8 @@ def scenario_first_settings(run: Run) -> None:
     elif case == "-cancel":
         run.check(dialog.get("accepted") is False and dialog.get("catalogState") == "loading",
                   f"Settings was not canceled while discovery was pending: {dialog}")
+        run.check(order.count("model/list") == 1 and any(entry.get("event") == "model-list-delayed"
+                  for entry in read_jsonl(run.fake_log)), "Settings canceled before the catalog request was pending")
         run.check(not any(entry.get("event") == "model-list-response" for entry in read_jsonl(run.fake_log)),
                   "delayed discovery survived cancel and returned a result")
     else:
@@ -807,9 +902,11 @@ def scenario_first_settings(run: Run) -> None:
                       "manual model/effort could not be saved without a catalog")
 
 
-def seed_history(run: Run) -> dict[str, Any] | None:
+def seed_history(run: Run, backend: str = "codex") -> dict[str, Any] | None:
     """Finish and close one real UI process; retain only this test's local fake/history files."""
-    run.launch({"questions": ["saved first question"]}, fake_env(run, "persistent"))
+    settings = claude_settings() if backend == "claude" else {"backend": "codex"}
+    env = claude_env(run, "persistent") if backend == "claude" else fake_env(run, "persistent")
+    run.launch({"questions": ["saved first question"], "settings": settings}, env)
     if not run.wait_transcript(60):
         return None
     run.check([r.get("status") for r in run.results()] == ["completed"], f"seed results {run.results()}")
@@ -823,6 +920,8 @@ def seed_history(run: Run) -> dict[str, Any] | None:
     record = next((entry for entry in records if entry.get("metadata", {}).get("id") == saved["historyId"]), None)
     run.check(record is not None, "completed conversation was not saved to disk")
     if record:
+        run.check(record.get("version") == 2 and record.get("backend") == backend,
+                  f"history did not preserve its version/backend: {record.get('version')}/{record.get('backend')}")
         run.check(record["metadata"].get("captureIdentity", {}).get("kind") == "none",
                   "plain chat was not saved with an explicit no-capture identity")
         run.check(record["metadata"].get("threadId") == saved["threadId"], "saved thread id differs from live binding")
@@ -876,6 +975,12 @@ def scenario_history_restore(run: Run) -> None:
     saved = seed_history(run)
     if not saved:
         return
+    if run.name == "D-legacy-restore":
+        history_path = run.root / "agent-root" / "conversations" / f"{saved['historyId']}.json"
+        legacy = json.loads(history_path.read_text(encoding="utf-8"))
+        legacy["version"] = 1
+        legacy.pop("backend", None)
+        history_path.write_text(json.dumps(legacy), encoding="utf-8")
     replay = run.name == "D-resume-replay"
     run.launch({"loadHistoryId": "latest", "questions": ["continued second question"],
                 "settings": {"model": "fake-deep", "reasoningEffort": "ultra"},
@@ -908,6 +1013,11 @@ def scenario_history_restore(run: Run) -> None:
     resume = next((m["params"] for m in run.received() if m.get("method") == "thread/resume"), {})
     turn = next((m["params"] for m in run.received() if m.get("method") == "turn/start"), {})
     run.check(resume.get("model") == "fake-deep" and turn.get("effort") == "ultra", "resume ignored current model/effort settings")
+    if run.name == "D-legacy-restore":
+        upgraded = next((entry for entry in run.history_records()
+                         if entry.get("metadata", {}).get("id") == saved["historyId"]), {})
+        run.check(upgraded.get("version") == 2 and upgraded.get("backend") == "codex",
+                  "continuing v1 history did not upgrade it with its original Codex backend")
 
 
 def scenario_history_view(run: Run) -> None:
@@ -971,6 +1081,235 @@ def scenario_history_rejected(run: Run) -> None:
     run.check(history_path.read_bytes() == before, "read-only rejection rewrote the original saved history")
 
 
+def scenario_claude_stream(run: Run) -> None:
+    run.launch({"questions": ["Claude first question", "Claude follow up"], "settings": claude_settings()},
+               claude_env(run, "stream"))
+    if not run.wait_transcript(60):
+        return
+    check_claude_launch(run)
+    check_claude_params(run)
+    run.check([result.get("status") for result in run.results()] == ["completed", "completed"],
+              f"Claude follow-up results {run.results()}")
+    run.check([item.get("text") for item in run.items("agent")] == [ANSWER, ANSWER],
+              "Claude streaming failed to reduce to exactly two complete assistant messages")
+    run.check(len(run.items("reasoning")) == 2, "Claude reasoning items were lost")
+    order = methods(run.received())
+    run.check(order.count("thread/start") == 1 and order.count("turn/start") == 2 and
+              "thread/resume" not in order, "Claude follow-up did not reuse the live session")
+    run.check(run.session().get("accountType") == "external" and not run.session().get("loginVisible"),
+              "Claude external account was rendered as Codex browser authentication")
+    records = run.history_records()
+    run.check(len(records) == 1 and records[0].get("version") == 2 and records[0].get("backend") == "claude",
+              "Claude conversation was persisted without its backend identity")
+
+
+def scenario_claude_stop(run: Run) -> None:
+    hang = run.name.endswith("-hang")
+    run.launch({"questions": ["Claude slow question", "Claude after stop"], "settings": claude_settings(),
+                "stopOnTool": "pixel_history", "stopQuestion": 0}, claude_env(run, "hang" if hang else "interrupt"))
+    if not run.wait_transcript(60):
+        return
+    check_claude_launch(run)
+    run.check([result.get("status") for result in run.results()] == ["interrupted", "completed"],
+              f"Claude stop/follow-up results {run.results()}")
+    latency = run.results()[0].get("stopLatencyMs", 1e9) if run.results() else 1e9
+    run.check(latency < (2600 if hang else 2000), f"Claude stop latency {latency}")
+    run.check("turn/interrupt" in methods(run.received()), "Claude interrupt was not requested")
+    if hang:
+        pids = run.fake_pids()
+        run.check(len(pids) == 2 and not alive(pids[0]), "unresponsive Claude harness was not killed before restart")
+        check_thread_rebound(run, "Claude forced stop")
+    else:
+        run.check(len(run.fake_pids()) == 1 and len(run.session().get("threadIds", [])) == 1,
+                  "graceful Claude interruption replaced its process/session")
+
+
+def scenario_claude_resume(run: Run) -> None:
+    saved = seed_history(run, "claude")
+    if not saved:
+        return
+    run.launch({"loadHistoryId": saved["historyId"], "questions": ["Claude resumed question"],
+                "settings": claude_settings(), "clickLinks": ["first-event"]},
+               claude_env(run, "persistent"), preserve=True)
+    if not run.wait_transcript(60):
+        return
+    check_claude_launch(run)
+    check_claude_params(run, resume=True)
+    order = methods(run.received())
+    run.check("thread/start" not in order and order.count("thread/resume") == 1 and order.count("turn/start") == 1,
+              "Claude history restore created a replacement session")
+    resume = next((message["params"] for message in run.received() if message.get("method") == "thread/resume"), {})
+    run.check(resume.get("threadId") == saved["threadId"] and resume.get("excludeTurns") is True,
+              "Claude resume lost native session identity or duplicated server history")
+    run.check(run.session().get("historyId") == saved["historyId"] and
+              run.session().get("historyReadOnly") is False and run.session().get("historyLoaded") is True,
+              f"Claude history could not continue: {run.session().get('historyError')}")
+    run.check([item.get("text") for item in run.items("user")] == ["saved first question", "Claude resumed question"] and
+              [item.get("text") for item in run.items("agent")] == [ANSWER, ANSWER],
+              "Claude resumed transcript lost or duplicated messages")
+    run.check([result.get("status") for result in run.results()] == ["completed"], f"Claude resume results {run.results()}")
+    clicks = run.transcript.get("autotest", {}).get("linkClicks", [])
+    run.check(len(clicks) == 1 and clicks[0].get("ok") is False, "Claude loaded reference retained navigation authority")
+    records = run.history_records()
+    run.check(len(records) == 1 and records[0].get("backend") == "claude" and
+              records[0].get("metadata", {}).get("threadId") == saved["threadId"], "Claude resume changed persisted identity")
+
+
+def scenario_claude_cross_backend(run: Run) -> None:
+    saved_backend = "codex" if run.name.endswith("from-codex") else "claude"
+    selected_backend = "claude" if saved_backend == "codex" else "codex"
+    saved = seed_history(run, saved_backend)
+    if not saved:
+        return
+    path = run.root / "agent-root" / "conversations" / f"{saved['historyId']}.json"
+    before = path.read_bytes()
+    run.launch({"loadHistoryId": saved["historyId"], "questions": ["must not cross backends"],
+                "settings": claude_settings() if selected_backend == "claude" else {"backend": "codex"}},
+               claude_env(run, "persistent") if selected_backend == "claude" else fake_env(run, "persistent"),
+               preserve=True)
+    if not run.wait_transcript(60):
+        return
+    run.check(run.session().get("backend") == selected_backend and run.session().get("historyReadOnly") is True,
+              f"cross-backend history is editable: {run.session()}")
+    run.check(bool(run.session().get("historyError")) and run.session().get("sendEnabled") is False,
+              "cross-backend refusal lacks visible explanation or send guard")
+    run.check(not run.fake_pids() and not run.received(), "cross-backend history started a harness or tried native resume")
+    run.check([result.get("status") for result in run.results()] == ["blocked"], f"cross-backend results {run.results()}")
+    run.check([item.get("text") for item in run.items("agent")] == [ANSWER], "cross-backend refusal hid saved answers")
+    run.check(path.read_bytes() == before, "cross-backend refusal modified the original record")
+
+
+def scenario_claude_policy(run: Run) -> None:
+    scenario = run.name.removeprefix("E-")
+    resume = "resume-policy" in scenario
+    saved = seed_history(run, "claude") if resume else None
+    if resume and not saved:
+        return
+    autotest = {"questions": ["must not run without Claude restrictions"], "settings": claude_settings()}
+    before = None
+    if saved:
+        autotest["loadHistoryId"] = saved["historyId"]
+        path = run.root / "agent-root" / "conversations" / f"{saved['historyId']}.json"
+        before = path.read_bytes()
+    run.launch(autotest, claude_env(run, scenario), preserve=resume)
+    if not run.wait_transcript(60):
+        return
+    check_claude_launch(run)
+    order = methods(run.received())
+    run.check(("thread/resume" if resume else "thread/start") in order, "Claude policy fixture was not reached")
+    run.check("turn/start" not in order and "mcpServerStatus/list" not in order,
+              "unconfirmed Claude policy was used to send a turn or inspect tools")
+    run.check(run.session().get("state") == "error" and not run.session().get("appServerRunning"),
+              "rejected Claude policy left its harness usable")
+    run.check([result.get("status") for result in run.results()] == ["failed"], f"Claude policy rejection {run.results()}")
+    notices = " ".join(item.get("text", "") for item in run.items("notice"))
+    run.check("tool restrictions" in notices, "Claude policy failure lacks an explanation")
+    if before is not None:
+        run.check(run.session().get("historyReadOnly") is True and path.read_bytes() == before,
+                  "Claude resume policy refusal rewrote or unlocked the saved history")
+
+
+def scenario_claude_external_login(run: Run) -> None:
+    run.launch({"questions": ["Claude auth check"], "settings": claude_settings(), "autoLogin": True},
+               claude_env(run, "logged-out"))
+    if not run.wait_transcript(60):
+        return
+    check_claude_launch(run)
+    run.check(run.session().get("state") == "notLoggedIn" and run.session().get("loginVisible") is False,
+              "Claude external authentication exposed the Codex browser login UI")
+    order = methods(run.received())
+    run.check("account/read" in order and not any(method.startswith("account/login/") for method in order) and
+              "thread/start" not in order and "turn/start" not in order, f"external-auth request sequence {order}")
+    notices = " ".join(item.get("text", "") for item in run.items("notice"))
+    run.check("claude auth login" in notices and "Click Log in" not in notices,
+              "Claude external authentication guidance was replaced by Codex login instructions")
+    run.check([result.get("status") for result in run.results()] == ["failed"], f"external-auth results {run.results()}")
+
+
+def scenario_claude_first_settings(run: Run) -> None:
+    screenshot = run.root / "claude-first-settings.png"
+    run.launch({"questions": [], "settings": claude_settings(), "settingsScreenshot": str(screenshot),
+                "settingsAccept": True}, claude_env(run, "model-pages"))
+    if not run.wait_transcript(60):
+        return
+    check_claude_launch(run, discovery=True)
+    order = methods(run.received())
+    run.check(set(order) <= {"initialize", "initialized", "model/list"} and order.count("initialize") == 1 and
+              order.count("model/list") == 2, f"Claude settings-only catalog sequence {order}")
+    run.check(not run.results() and not run.items("user") and not run.transcript.get("threadId"),
+              "Claude model discovery created a conversation")
+    dialog = run.transcript.get("autotest", {}).get("settingsDialog", {})
+    run.check(dialog.get("catalogState") == "ready" and dialog.get("modelCount") == 3 and
+              not dialog.get("timedOut"), f"Claude first model catalog {dialog}")
+    run.check(dialog.get("model") == dialog.get("appliedModel") == "fake-deep" and
+              dialog.get("effort") == dialog.get("appliedEffort") == "ultra" and
+              dialog.get("appliedBackend") == "claude" and dialog.get("accepted") is True,
+              f"Claude Settings did not read/save its independent model/effort: {dialog}")
+    run.check(dialog.get("savedCodexModel") == "codex-independent-model" and
+              dialog.get("savedCodexEffort") == "codex-independent-effort" and
+              dialog.get("savedClaudeModel") == "fake-deep" and dialog.get("savedClaudeEffort") == "ultra",
+              "saving Claude model settings changed the independent Codex settings")
+    run.check(dialog.get("effortOptions") == ["", "medium", "ultra"] and dialog.get("effortEditable") is False,
+              "Claude catalog efforts were not applied to its settings control")
+    run.check(dialog.get("screenshotSaved") is True and screenshot.is_file(), "Claude Settings screenshot missing")
+    run.check_no_survivors(run.fake_pids())
+
+
+def scenario_claude_disconnected(run: Run) -> None:
+    scenario = run.name.removeprefix("E-")
+    auth = scenario.endswith("-auth")
+    completed = scenario.endswith("-completed")
+    questions = ["before Claude disconnect"] if auth else ["before Claude disconnect", "after reconnect"]
+    run.launch({"questions": questions, "settings": claude_settings()}, claude_env(run, scenario))
+    if not run.wait_transcript(60):
+        return
+    check_claude_launch(run)
+    events = [entry for entry in read_jsonl(run.fake_log)[run.log_offset:]
+              if entry.get("event") == "backend-disconnected"]
+    run.check(len(events) == 1 and events[0].get("requiresAuth") is auth,
+              "backend/disconnected notification fixture was not exercised exactly once")
+    order = methods(run.received())
+    run.check(not any(method.startswith("account/login/") for method in order) and
+              run.session().get("loginVisible") is False, "Claude disconnect exposed Codex browser login")
+    if auth:
+        run.check(run.session().get("state") == "notLoggedIn" and not run.session().get("appServerRunning"),
+                  "Claude auth disconnect retained a connected/usable harness")
+        run.check([result.get("status") for result in run.results()] == ["failed"], f"auth disconnect results {run.results()}")
+        notices = " ".join(item.get("text", "") for item in run.items("notice"))
+        run.check("claude auth login" in notices and "Click Log in" not in notices,
+                  "auth disconnect did not show external authentication instructions")
+        run.check_no_survivors(run.fake_pids())
+    else:
+        expected = ["completed" if completed else "failed", "completed"]
+        run.check([result.get("status") for result in run.results()] == expected, f"disconnect/reconnect results {run.results()}")
+        pids = run.fake_pids()
+        run.check(len(pids) == 2 and not alive(pids[0]), "next question reused the disconnected harness")
+        check_thread_rebound(run, "Claude backend disconnect")
+        run.check(len(run.items("agent")) == (2 if completed else 1) and
+                  all(item.get("text") == ANSWER for item in run.items("agent")),
+                  "disconnect/reconnect duplicated or lost assistant messages")
+        run.check(run.session().get("state") == "ready" and run.session().get("appServerRunning") is True,
+                  "Claude did not recover after the disconnection")
+
+
+def scenario_claude_account_updated(run: Run) -> None:
+    run.launch({"questions": ["before Claude account expires"], "settings": claude_settings()},
+               claude_env(run, "account-updated"))
+    if not run.wait_transcript(60):
+        return
+    check_claude_launch(run)
+    order = methods(run.received())
+    run.check(order.count("account/read") == 2, "Claude account update did not recheck external authentication")
+    run.check(run.session().get("state") == "notLoggedIn" and run.session().get("loginVisible") is False and
+              not run.session().get("accountType"), "expired Claude account retained ready state or showed Codex login")
+    run.check(not any(method.startswith("account/login/") for method in order), "Claude auth update initiated OAuth")
+    notices = " ".join(item.get("text", "") for item in run.items("notice"))
+    run.check("claude auth login" in notices and "Codex is no longer logged in" not in notices,
+              "Claude account update did not use external-login guidance")
+    run.check([result.get("status") for result in run.results()] == ["completed"],
+              "post-turn account expiry changed the completed turn result")
+
+
 SCENARIOS: dict[str, Callable[[Run], None]] = {
     "A1": scenario_a1,
     "A2": scenario_a2,
@@ -978,6 +1317,7 @@ SCENARIOS: dict[str, Callable[[Run], None]] = {
     "A4": scenario_a4,
     "A4-hang": scenario_a4_hang,
     "A5": scenario_a5,
+    "A5-crash-child": scenario_a5,
     "A6-logged-out": scenario_a6_logged_out,
     "A6-bad-codex": scenario_a6_bad_codex,
     "A6-bad-python": scenario_a6_bad_python,
@@ -1015,6 +1355,7 @@ SCENARIOS: dict[str, Callable[[Run], None]] = {
     "C-first-settings-loop": scenario_first_settings,
     "D-new-chat": scenario_history_new_chat,
     "D-restart-restore": scenario_history_restore,
+    "D-legacy-restore": scenario_history_restore,
     "D-resume-replay": scenario_history_restore,
     "D-history-view": scenario_history_view,
     "D-bad-history": scenario_history_view,
@@ -1023,6 +1364,23 @@ SCENARIOS: dict[str, Callable[[Run], None]] = {
     "D-resume-config-error": scenario_history_rejected,
     "D-resume-foreign": scenario_history_rejected,
     "D-resume-unsafe": scenario_history_rejected,
+    "E-claude-stream": scenario_claude_stream,
+    "E-claude-tool-artifacts": scenario_tool_artifacts,
+    "E-claude-stop": scenario_claude_stop,
+    "E-claude-stop-hang": scenario_claude_stop,
+    "E-claude-resume": scenario_claude_resume,
+    "E-claude-cross-to-codex": scenario_claude_cross_backend,
+    "E-claude-cross-from-codex": scenario_claude_cross_backend,
+    **{f"E-claude-policy-{case}": scenario_claude_policy
+       for case in ("missing", "tools", "builtin", "external", "approvals", "type")},
+    "E-claude-resume-policy-missing": scenario_claude_policy,
+    "E-claude-resume-policy-bad": scenario_claude_policy,
+    "E-claude-external-login": scenario_claude_external_login,
+    "E-claude-first-settings": scenario_claude_first_settings,
+    "E-claude-disconnect-completed": scenario_claude_disconnected,
+    "E-claude-disconnect-failed": scenario_claude_disconnected,
+    "E-claude-disconnect-auth": scenario_claude_disconnected,
+    "E-claude-account-updated": scenario_claude_account_updated,
     "exit": scenario_exit,
 }
 
@@ -1248,7 +1606,7 @@ def split_turns(run: Run) -> list[tuple[list[str], str]]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--scenario", default="all", help="all, M5d, model-settings, or one of: " + ", ".join(SCENARIOS))
+    parser.add_argument("--scenario", default="all", help="all, M5d, model-settings, claude, or one of: " + ", ".join(SCENARIOS))
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--real", action="store_true")
     parser.add_argument("--history-capture", action="store_true",
@@ -1277,6 +1635,8 @@ def main(argv: list[str] | None = None) -> int:
         names = [name for name in SCENARIOS if name.startswith("D-")]
     elif args.scenario == "model-settings":
         names = [name for name in SCENARIOS if name.startswith("C-first-settings")]
+    elif args.scenario == "claude":
+        names = [name for name in SCENARIOS if name.startswith("E-claude-")]
     elif args.scenario in SCENARIOS:
         names = [args.scenario]
     else:

@@ -16,6 +16,8 @@ struct AgentHistoryEntry
   QString threadId;
   QString model;
   QString mode;
+  // Copied from the record's backend for listing and searching; not duplicated in metadata JSON.
+  QString backend = QStringLiteral("codex");
   QJsonObject captureIdentity;
   // A list-time hint only. Acquire() is the authoritative ownership check.
   bool locked = false;
@@ -23,6 +25,8 @@ struct AgentHistoryEntry
 
 struct AgentHistoryRecord
 {
+  // threadId in metadata/conversation is the native session ID for this backend.
+  QString backend = QStringLiteral("codex");
   AgentHistoryEntry metadata;
   QJsonObject conversation;
 };
@@ -41,10 +45,12 @@ public:
   void Release();
   QString LockedId() const { return m_LockedId; }
 
-  // Newest first. Invalid/oversized records are skipped and reported in warning.
+  // Newest first. Invalid/oversized/unsupported-backend records are skipped with a warning.
   QList<AgentHistoryEntry> List(QString &warning) const;
   bool Load(const QString &id, AgentHistoryRecord &record, QString &error) const;
   // Requires ownership of record.metadata.id. Sets creation/update timestamps after commit.
+  // Writes version 2; reads version 1 as Codex when no backend was saved. A persisted UUID cannot
+  // change backend: switching harnesses must start a new record.
   bool Save(AgentHistoryRecord &record, QString &error);
 
   // Returns the selected id, or empty on cancellation. A locked entry is still viewable.

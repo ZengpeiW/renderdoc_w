@@ -1017,6 +1017,7 @@
     <ClInclude Include="Code\Agent\AgentConversation.h" />
     <ClInclude Include="Code\Agent\AgentCaptureIdentity.h" />
     <ClInclude Include="Code\Agent\AgentHistory.h" />
+    <ClInclude Include="Code\Agent\AgentBackend.h" />
     <ClInclude Include="Code\Agent\AgentLaunchConfig.h" />
     <ClInclude Include="Code\Agent\AgentAsk.h" />
     <ClInclude Include="Code\Agent\AgentMarkdown.h" />

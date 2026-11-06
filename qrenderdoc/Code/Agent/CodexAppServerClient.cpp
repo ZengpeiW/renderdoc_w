@@ -159,6 +159,9 @@ void CodexAppServerClient::ProcessEnded(int exitCode, const QString &reason)
   if(m_Ended)
     return;
   m_Ended = true;
+  // A runtime can exit while SDK/native helper processes still exist. Reap the job immediately,
+  // including on unexpected exits, instead of retaining those children until the next launch.
+  CloseJob();
 
   bool killed = m_Killing;
   AppendLog(lit("app-server %1 (code %2)").arg(killed ? lit("killed") : reason).arg(exitCode));
@@ -166,7 +169,7 @@ void CodexAppServerClient::ProcessEnded(int exitCode, const QString &reason)
     AppendLog(lit("stderr tail:\n%1").arg(StderrTail()));
 
   emit processExited(exitCode, killed, killed ? tr("killed") : reason);
-  FailPending(tr("The Codex app-server stopped."));
+  FailPending(tr("The agent backend stopped."));
 }
 
 void CodexAppServerClient::FailPending(const QString &message)
@@ -192,7 +195,7 @@ qint64 CodexAppServerClient::Request(const QString &method, const QJsonObject &p
   {
     QJsonObject error;
     error[lit("code")] = -32000;
-    error[lit("message")] = tr("The Codex app-server is not running.");
+    error[lit("message")] = tr("The agent backend is not running.");
     if(callback)
       QTimer::singleShot(0, this, [callback, error]() { callback(QJsonValue(), error); });
     return id;

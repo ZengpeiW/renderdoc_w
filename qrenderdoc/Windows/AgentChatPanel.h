@@ -14,7 +14,7 @@
 #include "Code/Interface/QRDInterface.h"
 
 class CaptureContext;
-class CodexAppServerClient;
+class AgentBackend;
 class FlowLayout;
 class QLabel;
 class QPlainTextEdit;
@@ -24,7 +24,7 @@ class QTimer;
 class QUrl;
 struct AgentToolImage;
 
-// Dockable "AI Assistant" panel. Runs `codex app-server` bound to this window's agent bridge
+// Dockable "AI Assistant" panel. Runs the selected harness bound to this window's agent bridge
 // instance and shows a read-only chat with streamed answers and one-line tool cards.
 class AgentChatPanel : public QFrame, public ICaptureViewer
 {
@@ -73,6 +73,7 @@ private:
   void MakeHistoryReadOnly(const QString &reason);
   void EnsureHistory(const QString &title);
   void SaveHistory();
+  QString ConfiguredBackend() const;
   void RefreshCaptureIdentity(bool loaded);
   void VerifyHistoryIdentity();
   bool CaptureFileUnchanged() const;
@@ -124,7 +125,7 @@ private:
   void WriteTranscript();
 
   CaptureContext &m_Ctx;
-  CodexAppServerClient *m_Client = NULL;
+  AgentBackend *m_Client = NULL;
   AgentConversation m_Conversation;
   AgentLaunchConfig m_Launch;
   AgentHistory *m_History = NULL;

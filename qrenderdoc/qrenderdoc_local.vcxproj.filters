@@ -866,6 +866,9 @@
     <ClInclude Include="Code\Agent\AgentHistory.h">
       <Filter>Code\Agent</Filter>
     </ClInclude>
+    <ClInclude Include="Code\Agent\AgentBackend.h">
+      <Filter>Code\Agent</Filter>
+    </ClInclude>
     <ClInclude Include="Code\Agent\AgentLaunchConfig.h">
       <Filter>Code\Agent</Filter>
     </ClInclude>

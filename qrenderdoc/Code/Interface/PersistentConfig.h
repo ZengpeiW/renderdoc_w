@@ -380,9 +380,25 @@ DECLARE_REFLECTION_STRUCT(BugReport);
       "type: List[str]");                                                                          \
   CONFIG_SETTING(public, QVariantList, rdcarray<rdcstr>, TextureViewer_ShaderDirs)                 \
                                                                                                    \
+  DOCUMENT("The AI assistant backend: codex or claude."                                           \
+           "\n\n:type: str");                                                                    \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_Backend, "codex")                           \
+                                                                                                   \
   DOCUMENT("The native Codex executable for the AI assistant. Empty selects automatic detection." \
            "\n\n:type: str");                                                                    \
   CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_CodexPath, "")                                \
+                                                                                                   \
+  DOCUMENT("The native Claude Code executable. Empty uses the Claude Agent SDK default."          \
+           "\n\n:type: str");                                                                    \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_ClaudePath, "")                               \
+                                                                                                   \
+  DOCUMENT("The Claude Code model override. Empty follows the Claude configuration."               \
+           "\n\n:type: str");                                                                    \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_ClaudeModel, "")                              \
+                                                                                                   \
+  DOCUMENT("The Claude Code reasoning effort override. Empty follows the Claude configuration."    \
+           "\n\n:type: str");                                                                    \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, Agent_ClaudeReasoningEffort, "")                    \
                                                                                                    \
   DOCUMENT("The Python executable with the RenderTest MCP package installed."                     \
            "\n\n:type: str");                                                                    \

@@ -52,6 +52,104 @@ bool Write(const QString &path, const QByteArray &bytes)
   QFile file(path);
   return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
 }
+
+QByteArray Read(const QString &path)
+{
+  QFile file(path);
+  return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+}
+
+void CheckBackends()
+{
+  QTemporaryDir directory;
+  Check(directory.isValid(), "backend fixture directory");
+  if(!directory.isValid())
+    return;
+  AgentHistory writer(directory.path()), reader(directory.path());
+  QString error, warning;
+  const QString codexId = AgentHistory::NewId();
+  AgentHistoryRecord codex = MakeRecord(codexId), loaded;
+  Check(codex.backend == QStringLiteral("codex"), "new records default to Codex");
+  Check(writer.Acquire(codexId, error) && writer.Save(codex, error), "save Codex backend");
+  QJsonObject saved = QJsonDocument::fromJson(Read(Path(directory.path(), codexId))).object();
+  Check(saved[QStringLiteral("version")].toInt() == 2 &&
+            saved[QStringLiteral("backend")].toString() == QStringLiteral("codex"),
+        "new format identifies backend and prevents old reader resume");
+
+  const QString legacyId = AgentHistory::NewId();
+  QJsonObject legacy = saved;
+  legacy[QStringLiteral("version")] = 1;
+  legacy.remove(QStringLiteral("backend"));
+  QJsonObject metadata = legacy[QStringLiteral("metadata")].toObject();
+  metadata[QStringLiteral("id")] = legacyId;
+  legacy[QStringLiteral("metadata")] = metadata;
+  const QByteArray legacyBytes = QJsonDocument(legacy).toJson();
+  Check(Write(Path(directory.path(), legacyId), legacyBytes), "write original v1 fixture");
+  Check(reader.Load(legacyId, loaded, error) && loaded.backend == QStringLiteral("codex") &&
+            loaded.metadata.backend == QStringLiteral("codex"),
+        "v1 without backend loads as Codex");
+  Check(Read(Path(directory.path(), legacyId)) == legacyBytes, "loading legacy history never rewrites it");
+  Check(writer.Acquire(legacyId, error) && writer.Save(loaded, error), "continuing legacy record upgrades on save");
+  Check(QJsonDocument::fromJson(Read(Path(directory.path(), legacyId))).object()[QStringLiteral("version")].toInt() == 2,
+        "continued legacy record is version 2");
+
+  const QString claudeId = AgentHistory::NewId();
+  AgentHistoryRecord claude = MakeRecord(claudeId);
+  claude.backend = QStringLiteral("claude");
+  claude.metadata.threadId = QStringLiteral("claude-native-session");
+  claude.conversation[QStringLiteral("threadId")] = claude.metadata.threadId;
+  Check(writer.Acquire(claudeId, error) && writer.Save(claude, error), "save Claude backend");
+  Check(reader.Load(claudeId, loaded, error) && loaded.backend == QStringLiteral("claude") &&
+            loaded.metadata.backend == QStringLiteral("claude") &&
+            loaded.metadata.threadId == QStringLiteral("claude-native-session"),
+        "Claude roundtrip retains native session identity");
+  const QByteArray claudeBytes = Read(Path(directory.path(), claudeId));
+  loaded.backend = QStringLiteral("codex");
+  Check(!writer.Save(loaded, error) && Read(Path(directory.path(), claudeId)) == claudeBytes,
+        "a record cannot be reassigned to another backend");
+  loaded.backend = QStringLiteral("future-harness");
+  Check(!writer.Save(loaded, error) && Read(Path(directory.path(), claudeId)) == claudeBytes,
+        "saving an unsupported backend preserves original bytes");
+
+  const QString unsupportedId = AgentHistory::NewId();
+  QJsonObject unsupported = saved;
+  metadata = unsupported[QStringLiteral("metadata")].toObject();
+  metadata[QStringLiteral("id")] = unsupportedId;
+  unsupported[QStringLiteral("metadata")] = metadata;
+  unsupported.remove(QStringLiteral("backend"));
+  QByteArray unsupportedBytes = QJsonDocument(unsupported).toJson();
+  Check(Write(Path(directory.path(), unsupportedId), unsupportedBytes), "write incomplete v2 fixture");
+  Check(!reader.Load(unsupportedId, loaded, error) &&
+            Read(Path(directory.path(), unsupportedId)) == unsupportedBytes,
+        "v2 cannot infer Codex from a missing backend");
+  Check(writer.Acquire(unsupportedId, error), "lock unsupported record for overwrite check");
+  const QJsonArray invalidBackends = {QJsonValue(QJsonValue::Null), QJsonValue(42),
+                                     QJsonValue(QString()), QJsonValue(QStringLiteral("Claude")),
+                                     QJsonValue(QStringLiteral("future-harness"))};
+  for(const QJsonValue &backend : invalidBackends)
+  {
+    unsupported[QStringLiteral("backend")] = backend;
+    unsupportedBytes = QJsonDocument(unsupported).toJson();
+    Check(Write(Path(directory.path(), unsupportedId), unsupportedBytes), "write unsupported backend fixture");
+    loaded = claude;
+    Check(!reader.Load(unsupportedId, loaded, error) && loaded.backend == QStringLiteral("claude"),
+          "unknown or malformed backend cannot replace loaded conversation");
+    AgentHistoryRecord replacement = MakeRecord(unsupportedId);
+    Check(!writer.Save(replacement, error) && Read(Path(directory.path(), unsupportedId)) == unsupportedBytes,
+          "unknown record cannot be overwritten as Codex");
+  }
+
+  const QList<AgentHistoryEntry> entries = reader.List(warning);
+  int codexEntries = 0, claudeEntries = 0;
+  for(const AgentHistoryEntry &entry : entries)
+  {
+    codexEntries += entry.backend == QStringLiteral("codex") ? 1 : 0;
+    claudeEntries += entry.backend == QStringLiteral("claude") ? 1 : 0;
+  }
+  Check(entries.size() == 3 && codexEntries == 2 && claudeEntries == 1 && !warning.isEmpty(),
+        "mixed backend list retains backend labels and skips unsupported records with a warning");
+  Check(Read(Path(directory.path(), unsupportedId)) == unsupportedBytes, "listing unsupported history never modifies it");
+}
 }
 
 int main(int argc, char **argv)
@@ -149,6 +247,7 @@ int main(int argc, char **argv)
         "failed acquire retains previous ownership");
   writer.Release();
   reader.Release();
+  CheckBackends();
   std::printf("%d/%d history checks passed\n", checks - failures, checks);
   return failures == 0 ? 0 : 1;
 }

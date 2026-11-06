@@ -247,27 +247,43 @@ QString AgentLaunchConfig::DeveloperInstructions(const QString &instanceId)
       .arg(instance);
 }
 
+QString AgentLaunchConfig::EffectiveBackend(const PersistentConfig &settings, QString *error)
+{
+  if(error)
+    error->clear();
+  QString backend = EnvValue("RENDERTEST_AGENT_BACKEND").toLower();
+  if(backend.isEmpty())
+    backend = QString(settings.Agent_Backend).trimmed().toLower();
+  if(backend.isEmpty())
+    backend = lit("codex");
+  if(backend == lit("codex") || backend == lit("claude"))
+    return backend;
+  if(error)
+    *error = tr("Unknown AI assistant backend '%1'. Choose codex or claude.").arg(backend);
+  return QString();
+}
+
 AgentLaunchConfig AgentLaunchConfig::Resolve(const QString &instanceId, const QString &captureSessionId,
                                             const QString &agentRoot, const PersistentConfig &settings)
 {
   AgentLaunchConfig config;
+  config.backend = EffectiveBackend(settings, &config.error);
+  if(!config.error.isEmpty())
+    return config;
+  const bool claude = config.backend == lit("claude");
   config.instanceId = instanceId;
   config.captureSessionId = captureSessionId;
   config.captureTools = !instanceId.isEmpty() && !captureSessionId.isEmpty();
-  config.agentRoot = Posix(agentRoot);
+  config.agentRoot = agentRoot.isEmpty() ? QString() : Posix(agentRoot);
   config.model = EnvValue("RENDERTEST_AGENT_MODEL");
   if(config.model.isEmpty())
-    config.model = QString(settings.Agent_Model).trimmed();
+    config.model = QString(claude ? settings.Agent_ClaudeModel : settings.Agent_Model).trimmed();
   config.reasoningEffort = EnvValue("RENDERTEST_AGENT_REASONING_EFFORT");
   if(config.reasoningEffort.isEmpty())
-    config.reasoningEffort = QString(settings.Agent_ReasoningEffort).trimmed();
+    config.reasoningEffort = QString(claude ? settings.Agent_ClaudeReasoningEffort
+                                           : settings.Agent_ReasoningEffort).trimmed();
 
-  QStringList prefixArgs;
-  config.program = FindCodex(settings, prefixArgs, config.error);
-  if(!config.error.isEmpty())
-    return config;
-
-  if(config.captureTools)
+  if(config.captureTools || claude)
   {
     config.mcpPython = FindMcpPython(settings, config.error);
     if(!config.error.isEmpty())
@@ -275,8 +291,8 @@ AgentLaunchConfig AgentLaunchConfig::Resolve(const QString &instanceId, const QS
   }
 
   QString isolate = EnvValue("RENDERTEST_AGENT_ISOLATE").toLower();
-  config.isolate = isolate.isEmpty() ? settings.Agent_IsolateMcpServers
-                                    : !(isolate == lit("0") || isolate == lit("false") || isolate == lit("off"));
+  config.isolate = claude || (isolate.isEmpty() ? settings.Agent_IsolateMcpServers
+                                    : !(isolate == lit("0") || isolate == lit("false") || isolate == lit("off")));
 
   QString workingDir = QDir(QCoreApplication::applicationDirPath())
                            .absoluteFilePath(lit("integrations/rendertest_agent"));
@@ -284,6 +300,63 @@ AgentLaunchConfig AgentLaunchConfig::Resolve(const QString &instanceId, const QS
     workingDir = QCoreApplication::applicationDirPath();
   config.workingDir = Posix(workingDir);
   config.skillRoots = FindSkillRoots();
+
+  if(claude)
+  {
+    const QString command = EnvValue("RENDERTEST_AGENT_CLAUDE_COMMAND");
+    if(command.isEmpty())
+    {
+      config.program = config.mcpPython;
+      config.arguments << lit("-m") << lit("rendertest_mcp.claude_backend");
+    }
+    else
+    {
+      config.arguments = SplitCommand(command);
+      if(config.arguments.isEmpty() || config.arguments.first().isEmpty())
+      {
+        config.error = tr("RENDERTEST_AGENT_CLAUDE_COMMAND does not name a program.");
+        return config;
+      }
+      const QString program = config.arguments.takeFirst();
+      config.program = QFileInfo(program).isAbsolute() ? program : QStandardPaths::findExecutable(program);
+      if(config.program.isEmpty() || !QFileInfo(config.program).isFile())
+      {
+        config.error = tr("The program from RENDERTEST_AGENT_CLAUDE_COMMAND was not found: %1").arg(program);
+        return config;
+      }
+    }
+    QString claudePath = QString(settings.Agent_ClaudePath).trimmed();
+    if(!claudePath.isEmpty())
+    {
+      const QString suffix = QFileInfo(claudePath).suffix().toLower();
+      if(suffix == lit("cmd") || suffix == lit("bat") || suffix == lit("ps1"))
+      {
+        config.error = tr("Choose the native Claude Code executable, not a command or PowerShell shim.");
+        return config;
+      }
+      const QString found = QFileInfo(claudePath).isAbsolute()
+                                ? claudePath : QStandardPaths::findExecutable(claudePath);
+      if(found.isEmpty() || !QFileInfo(found).isFile())
+      {
+        config.error = tr("The configured Claude Code executable was not found: %1").arg(claudePath);
+        return config;
+      }
+      config.arguments << lit("--claude-path") << Posix(found);
+    }
+    config.arguments << lit("--mcp-python") << config.mcpPython;
+    if(config.captureTools)
+      config.arguments << lit("--instance") << instanceId << lit("--capture-session") << captureSessionId;
+    if(!config.agentRoot.isEmpty())
+      config.arguments << lit("--agent-root") << config.agentRoot;
+    for(const QString &root : config.skillRoots)
+      config.arguments << lit("--skills-root") << root;
+    return config;
+  }
+
+  QStringList prefixArgs;
+  config.program = FindCodex(settings, prefixArgs, config.error);
+  if(!config.error.isEmpty())
+    return config;
 
   const QString server = QString::fromLatin1(ServerName);
   QStringList overrides;

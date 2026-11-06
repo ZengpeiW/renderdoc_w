@@ -31,7 +31,7 @@
 #include "Code/Agent/AgentCaptureIdentity.h"
 #include "Code/Agent/AgentSettingsDialog.h"
 #include "Code/Agent/AgentToolView.h"
-#include "Code/Agent/CodexAppServerClient.h"
+#include "Code/Agent/AgentBackend.h"
 #include "Code/Agent/RenderTestAgentIntegration.h"
 #include "Code/CaptureContext.h"
 #include "Windows/TextureViewer.h"
@@ -102,6 +102,10 @@ QString ErrorMessage(const QJsonObject &error)
 QJsonObject AgentSettingsSnapshot(const PersistentConfig &config)
 {
   QJsonObject result;
+  result[lit("backend")] = QString(config.Agent_Backend);
+  result[lit("claudePath")] = QString(config.Agent_ClaudePath);
+  result[lit("claudeModel")] = QString(config.Agent_ClaudeModel);
+  result[lit("claudeReasoningEffort")] = QString(config.Agent_ClaudeReasoningEffort);
   result[lit("codexPath")] = QString(config.Agent_CodexPath);
   result[lit("mcpPython")] = QString(config.Agent_McpPython);
   result[lit("model")] = QString(config.Agent_Model);
@@ -112,6 +116,14 @@ QJsonObject AgentSettingsSnapshot(const PersistentConfig &config)
 
 void ApplyAgentSettings(PersistentConfig &config, const QJsonObject &settings)
 {
+  if(settings.contains(lit("backend")))
+    config.Agent_Backend = settings[lit("backend")].toString();
+  if(settings.contains(lit("claudePath")))
+    config.Agent_ClaudePath = settings[lit("claudePath")].toString();
+  if(settings.contains(lit("claudeModel")))
+    config.Agent_ClaudeModel = settings[lit("claudeModel")].toString();
+  if(settings.contains(lit("claudeReasoningEffort")))
+    config.Agent_ClaudeReasoningEffort = settings[lit("claudeReasoningEffort")].toString();
   if(settings.contains(lit("codexPath")))
     config.Agent_CodexPath = settings[lit("codexPath")].toString();
   if(settings.contains(lit("mcpPython")))
@@ -228,10 +240,10 @@ AgentChatPanel::AgentChatPanel(CaptureContext &ctx, QWidget *parent) : QFrame(pa
   m_HistoryTimer->setInterval(2000);
   connect(m_HistoryTimer, &QTimer::timeout, this, &AgentChatPanel::SaveHistory);
 
-  m_Client = new CodexAppServerClient(this);
-  connect(m_Client, &CodexAppServerClient::serverRequestAnswered, this,
+  m_Client = new AgentBackend(this);
+  connect(m_Client, &AgentBackend::serverRequestAnswered, this,
           &AgentChatPanel::OnServerRequest);
-  connect(m_Client, &CodexAppServerClient::processExited, this, &AgentChatPanel::OnProcessExited);
+  connect(m_Client, &AgentBackend::processExited, this, &AgentChatPanel::OnProcessExited);
 
   connect(m_Send, &QPushButton::clicked, this, &AgentChatPanel::Send);
   connect(m_StopButton, &QPushButton::clicked, this, &AgentChatPanel::Stop);
@@ -350,11 +362,21 @@ bool AgentChatPanel::CaptureFileUnchanged() const
          AgentCaptureIdentity::FileUnchanged(m_LoadedIdentity, QString(m_Ctx.GetCaptureFilename()));
 }
 
+QString AgentChatPanel::ConfiguredBackend() const
+{
+  PersistentConfig settings;
+  ApplyAgentSettings(settings, AgentSettingsSnapshot(m_Ctx.Config()));
+  if(m_Autotest.active)
+    ApplyAgentSettings(settings, m_Autotest.settings);
+  return AgentLaunchConfig::EffectiveBackend(settings);
+}
+
 void AgentChatPanel::EnsureHistory(const QString &title)
 {
   if(!m_HistoryRecord.metadata.id.isEmpty())
     return;
   m_HistoryRecord = AgentHistoryRecord();
+  m_HistoryRecord.backend = ConfiguredBackend();
   m_HistoryRecord.metadata.id = AgentHistory::NewId();
   m_HistoryRecord.metadata.title = title.simplified().left(120);
   m_HistoryRecord.metadata.mode = m_Ctx.IsCaptureLoaded() ? lit("capture") : lit("chat");
@@ -464,6 +486,12 @@ bool AgentChatPanel::LoadHistory(const QString &id)
 
 void AgentChatPanel::VerifyHistoryIdentity()
 {
+  if(m_HistoryRecord.backend != ConfiguredBackend())
+  {
+    MakeHistoryReadOnly(tr("This conversation belongs to %1. Select that backend in Settings and reopen it from History to continue.")
+                            .arg(m_HistoryRecord.backend));
+    return;
+  }
   if(m_IdentityPending)
   {
     m_VerifyHistoryAfterIdentity = true;
@@ -510,6 +538,12 @@ void AgentChatPanel::VerifyHistoryIdentity()
 
 void AgentChatPanel::EnableHistoryContinuation(const QJsonObject &identity)
 {
+  if(m_HistoryRecord.backend != ConfiguredBackend())
+  {
+    MakeHistoryReadOnly(tr("The selected backend does not match this saved conversation. Reopen it after selecting %1 in Settings.")
+                            .arg(m_HistoryRecord.backend));
+    return;
+  }
   QString error;
   if(!AgentCaptureIdentity::Matches(m_LoadedIdentity, identity, &error) ||
      !AgentCaptureIdentity::Matches(m_HistoryRecord.metadata.captureIdentity, identity, &error))
@@ -519,7 +553,7 @@ void AgentChatPanel::EnableHistoryContinuation(const QJsonObject &identity)
   }
   if(m_HistoryRecord.metadata.threadId.isEmpty())
   {
-    MakeHistoryReadOnly(tr("This saved conversation has no Codex thread to resume. Start a new chat."));
+    MakeHistoryReadOnly(tr("This saved conversation has no backend session to resume. Start a new chat."));
     return;
   }
   if(!m_History->Acquire(m_HistoryRecord.metadata.id, error))
@@ -538,6 +572,11 @@ void AgentChatPanel::EnableHistoryContinuation(const QJsonObject &identity)
     return;
   }
   m_HistoryRecord = latest;
+  if(latest.backend != ConfiguredBackend())
+  {
+    MakeHistoryReadOnly(tr("The saved conversation belongs to a different backend."));
+    return;
+  }
   m_Conversation = conversation;
   m_HistoryReadOnly = false;
   m_HistoryError.clear();
@@ -843,6 +882,16 @@ void AgentChatPanel::SendText(const QString &text)
   }
   if(m_HistoryReadOnly)
     return;
+  if(ConfiguredBackend().isEmpty())
+  {
+    SessionFailed(SessionState::Error, tr("Select a supported AI backend in Settings."));
+    return;
+  }
+  if(!m_HistoryRecord.metadata.id.isEmpty() && m_HistoryRecord.backend != ConfiguredBackend())
+  {
+    MakeHistoryReadOnly(tr("The backend changed. Start a new chat or reopen this conversation with its original backend."));
+    return;
+  }
   EnsureHistory(text);
   m_ResumeValidationPending = !m_HistoryRecord.metadata.threadId.isEmpty() &&
                               (m_State != SessionState::Ready || !m_Client->IsRunning() ||
@@ -872,9 +921,17 @@ void AgentChatPanel::SendText(const QString &text)
   }
   else if(m_State == SessionState::NotLoggedIn && m_Client->IsRunning())
   {
-    // The initialized process stays alive for login. Recheck its account without initializing twice.
-    SetState(SessionState::Starting, tr("Checking account..."));
-    ReadAccount(m_Generation);
+    if(m_Client->SupportsBrowserLogin())
+    {
+      // Codex owns its browser login. Claude authenticates externally and reconnects below.
+      SetState(SessionState::Starting, tr("Checking account..."));
+      ReadAccount(m_Generation);
+    }
+    else
+    {
+      KillSession();
+      StartSession();
+    }
   }
   else if(m_State != SessionState::Starting)
   {
@@ -960,6 +1017,14 @@ void AgentChatPanel::StartSession()
     return;
   }
 
+  if(!m_HistoryRecord.metadata.id.isEmpty() && m_HistoryRecord.backend != m_Launch.backend)
+  {
+    const QString message = tr("Refusing to resume a conversation with a different backend.");
+    MakeHistoryReadOnly(message);
+    SessionFailed(SessionState::Error, message);
+    return;
+  }
+
   m_Account.clear();
   m_AccountType.clear();
   m_McpStatus.clear();
@@ -967,20 +1032,20 @@ void AgentChatPanel::StartSession()
   m_OtherServers.clear();
 
   m_Client->SetLogPath(LogPath());
-  disconnect(m_Client, &CodexAppServerClient::notificationReceived, this, nullptr);
-  connect(m_Client, &CodexAppServerClient::notificationReceived, this,
+  disconnect(m_Client, &AgentBackend::notificationReceived, this, nullptr);
+  connect(m_Client, &AgentBackend::notificationReceived, this,
           [this, generation](const QString &method, const QJsonObject &params) {
             if(generation == m_Generation)
               OnNotification(method, params);
           });
   QString error;
-  if(!m_Client->Start(m_Launch.program, m_Launch.arguments, m_Launch.workingDir, error))
+  if(!m_Client->Start(m_Launch, error))
   {
     SessionFailed(SessionState::Error, error);
     return;
   }
   m_ProcessIds << double(m_Client->ProcessId());
-  SetState(SessionState::Starting, tr("Starting Codex..."));
+  SetState(SessionState::Starting, tr("Starting %1...").arg(m_Client->DisplayName()));
 
   QJsonObject clientInfo;
   clientInfo[lit("name")] = lit("qrendertest");
@@ -992,7 +1057,7 @@ void AgentChatPanel::StartSession()
   params[lit("clientInfo")] = clientInfo;
   params[lit("capabilities")] = capabilities;
 
-  m_Client->Request(lit("initialize"), params, InitializeTimeoutMs,
+  m_Client->Request(AgentBackend::Operation::Initialize, params, InitializeTimeoutMs,
                     [this, generation](const QJsonValue &, const QJsonObject &error) {
                       if(generation != m_Generation)
                         return;
@@ -1000,10 +1065,10 @@ void AgentChatPanel::StartSession()
                       {
                         SessionFailed(
                             SessionState::Error,
-                            tr("Codex app-server did not initialize: %1").arg(ErrorMessage(error)));
+                            tr("%1 did not initialize: %2").arg(m_Client->DisplayName(), ErrorMessage(error)));
                         return;
                       }
-                      m_Client->Notify(lit("initialized"), QJsonObject());
+                      m_Client->Initialized();
                       ReadModels(generation);
                       ReadAccount(generation);
                     });
@@ -1014,26 +1079,28 @@ void AgentChatPanel::ReadAccount(int generation)
   QJsonObject params;
   params[lit("refreshToken")] = false;
   m_Client->Request(
-      lit("account/read"), params, AccountTimeoutMs,
+      AgentBackend::Operation::ReadAccount, params, AccountTimeoutMs,
       [this, generation](const QJsonValue &result, const QJsonObject &error) {
         if(generation != m_Generation)
           return;
         if(!error.isEmpty())
         {
           SessionFailed(SessionState::Error,
-                        tr("Could not read the Codex account: %1").arg(ErrorMessage(error)));
+                        tr("Could not read the %1 account: %2").arg(m_Client->DisplayName(), ErrorMessage(error)));
           return;
         }
         QJsonObject data = result.toObject();
         QJsonObject account = data[lit("account")].toObject();
-        if(account.isEmpty() && data[lit("requiresOpenaiAuth")].toBool(true))
+        if(account.isEmpty() && data[lit("requiresAuth")].toBool(data[lit("requiresOpenaiAuth")].toBool(true)))
         {
           // Keep the initialized process alive so the panel can complete browser login.
           m_Account.clear();
           m_AccountType.clear();
           m_PendingText.clear();
           m_Conversation.SetThread(QString(), m_Conversation.Model());
-          const QString message = tr("Codex is not logged in. Click Log in, then send your question.");
+          const QString message = m_Client->SupportsBrowserLogin()
+              ? tr("Codex is not logged in. Click Log in, then send your question.")
+              : data[lit("loginMessage")].toString(tr("Claude authentication is unavailable. Run claude auth login or configure an API key, then reconnect."));
           SetState(SessionState::NotLoggedIn, message);
           if(m_Conversation.TurnRunning())
             m_Conversation.EndTurn(lit("failed"), message);
@@ -1060,7 +1127,7 @@ void AgentChatPanel::ReadModels(int generation, const QString &cursor, const QJs
   params[lit("limit")] = 100;
   if(!cursor.isEmpty())
     params[lit("cursor")] = cursor;
-  m_Client->Request(lit("model/list"), params, ConfigTimeoutMs,
+  m_Client->Request(AgentBackend::Operation::ListModels, params, ConfigTimeoutMs,
                     [this, generation, models, seenCursors](const QJsonValue &result,
                                                            const QJsonObject &error) {
     if(generation != m_Generation)
@@ -1090,6 +1157,7 @@ void AgentChatPanel::EditSettings()
   if(m_Conversation.TurnRunning() || m_State == SessionState::Starting || m_LoginStarting ||
      !m_LoginId.isEmpty())
     return;
+  const QString previousBackend = ConfiguredBackend();
   bool accepted = false;
   if(m_Autotest.active)
   {
@@ -1098,15 +1166,28 @@ void AgentChatPanel::EditSettings()
     ApplyAgentSettings(settings, m_Autotest.settings);
     accepted = AgentSettingsDialog::Edit(settings, m_Models, this, false);
     m_Autotest.settingsDialog[lit("accepted")] = accepted;
-    m_Autotest.settingsDialog[lit("appliedModel")] = QString(settings.Agent_Model);
-    m_Autotest.settingsDialog[lit("appliedEffort")] = QString(settings.Agent_ReasoningEffort);
+    const QString backend = AgentLaunchConfig::EffectiveBackend(settings);
+    m_Autotest.settingsDialog[lit("appliedBackend")] = backend;
+    m_Autotest.settingsDialog[lit("savedCodexModel")] = QString(settings.Agent_Model);
+    m_Autotest.settingsDialog[lit("savedCodexEffort")] = QString(settings.Agent_ReasoningEffort);
+    m_Autotest.settingsDialog[lit("savedClaudeModel")] = QString(settings.Agent_ClaudeModel);
+    m_Autotest.settingsDialog[lit("savedClaudeEffort")] = QString(settings.Agent_ClaudeReasoningEffort);
+    m_Autotest.settingsDialog[lit("appliedModel")] = backend == lit("claude")
+        ? QString(settings.Agent_ClaudeModel) : QString(settings.Agent_Model);
+    m_Autotest.settingsDialog[lit("appliedEffort")] = backend == lit("claude")
+        ? QString(settings.Agent_ClaudeReasoningEffort) : QString(settings.Agent_ReasoningEffort);
+    if(accepted)
+      m_Autotest.settings = AgentSettingsSnapshot(settings);
   }
   else
     accepted = AgentSettingsDialog::Edit(m_Ctx.Config(), m_Models, this);
   if(!accepted)
     return;
+  SaveHistory();
   KillSession();
   m_Models = QJsonArray();
+  if(previousBackend != ConfiguredBackend())
+    NewChat();
   m_Conversation.AddNotice(lit("info"), tr("Settings saved. The next question starts a new session."));
   ScheduleRender();
   UpdateControls();
@@ -1119,7 +1200,7 @@ void AgentChatPanel::Login()
     CancelLogin();
     return;
   }
-  if(m_LoginStarting || !m_Client->IsRunning() || m_State != SessionState::NotLoggedIn)
+  if(!m_Client->SupportsBrowserLogin() || m_LoginStarting || !m_Client->IsRunning() || m_State != SessionState::NotLoggedIn)
     return;
   const int generation = m_Generation;
   const int request = ++m_LoginRequest;
@@ -1128,7 +1209,7 @@ void AgentChatPanel::Login()
   UpdateControls();
   QJsonObject params;
   params[lit("type")] = lit("chatgpt");
-  m_Client->Request(lit("account/login/start"), params, AccountTimeoutMs,
+  m_Client->Request(AgentBackend::Operation::Login, params, AccountTimeoutMs,
                     [this, generation, request](const QJsonValue &result, const QJsonObject &error) {
     if(generation != m_Generation || request != m_LoginRequest)
       return;
@@ -1174,7 +1255,7 @@ void AgentChatPanel::CancelLogin()
   m_LoginId.clear();    // Ignore any completion racing with the cancellation response.
   m_LoginStarting = true;
   UpdateControls();
-  m_Client->Request(lit("account/login/cancel"), params, AccountTimeoutMs,
+  m_Client->Request(AgentBackend::Operation::CancelLogin, params, AccountTimeoutMs,
                     [this, generation, request](const QJsonValue &result, const QJsonObject &error) {
     if(generation != m_Generation || request != m_LoginRequest)
       return;
@@ -1219,7 +1300,7 @@ void AgentChatPanel::SetSkillRoots(int generation)
 
   QJsonObject params;
   params[lit("extraRoots")] = QJsonArray::fromStringList(m_Launch.skillRoots);
-  m_Client->Request(lit("skills/extraRoots/set"), params, ConfigTimeoutMs,
+  m_Client->Request(AgentBackend::Operation::SetSkillRoots, params, ConfigTimeoutMs,
                     [this, generation](const QJsonValue &, const QJsonObject &error) {
                       if(generation != m_Generation)
                         return;
@@ -1242,7 +1323,7 @@ void AgentChatPanel::BeginThread(int generation)
   QJsonObject params;
   params[lit("cwd")] = m_Launch.workingDir;
   m_Client->Request(
-      lit("config/read"), params, ConfigTimeoutMs,
+      AgentBackend::Operation::ReadConfiguration, params, ConfigTimeoutMs,
       [this, generation](const QJsonValue &result, const QJsonObject &error) {
         if(generation != m_Generation)
           return;
@@ -1296,36 +1377,33 @@ void AgentChatPanel::StartThread(int generation, const QStringList &disabledServ
   if(!config.isEmpty())
     params[lit("config")] = config;
 
-  m_Client->Request(resume ? lit("thread/resume") : lit("thread/start"), params, ThreadTimeoutMs,
+  m_Client->Request(resume ? AgentBackend::Operation::ResumeSession : AgentBackend::Operation::CreateSession,
+                    params, ThreadTimeoutMs,
                     [this, generation, resume, resumeId](const QJsonValue &result, const QJsonObject &error) {
                       if(generation != m_Generation)
                         return;
                       if(!error.isEmpty())
                       {
                         const QString message = resume
-                            ? tr("Could not resume the Codex thread: %1. The saved conversation remains read-only; start a new chat to continue.").arg(ErrorMessage(error))
-                            : tr("Could not start a Codex thread: %1").arg(ErrorMessage(error));
+                            ? tr("Could not resume the saved session: %1. The saved conversation remains read-only; start a new chat to continue.").arg(ErrorMessage(error))
+                            : tr("Could not start a session: %1").arg(ErrorMessage(error));
                         SessionFailed(SessionState::Error, message);
                         if(resume)
                           MakeHistoryReadOnly(message);
                         return;
                       }
                       QJsonObject data = result.toObject();
-                      QString sandbox = data[lit("sandbox")].toObject()[lit("type")].toString();
-                      QString approval = data[lit("approvalPolicy")].toString();
-                      if(sandbox != lit("readOnly") || approval != lit("never"))
+                      if(!m_Client->AcceptedToolPolicy(data))
                       {
                         SessionFailed(SessionState::Error,
-                                      tr("Codex did not accept the read-only sandbox (sandbox=%1, "
-                                         "approvalPolicy=%2); refusing to chat.")
-                                          .arg(sandbox.isEmpty() ? lit("?") : sandbox,
-                                               approval.isEmpty() ? lit("?") : approval));
+                                      tr("%1 did not confirm the required tool restrictions; refusing to chat.")
+                                          .arg(m_Client->DisplayName()));
                         return;
                       }
                       QString threadId = data[lit("thread")].toObject()[lit("id")].toString();
                       if(threadId.isEmpty() || (resume && threadId != resumeId))
                       {
-                        const QString message = tr("Codex returned a different or empty thread identity; refusing to continue.");
+                        const QString message = tr("The backend returned a different or empty session identity; refusing to continue.");
                         SessionFailed(SessionState::Error, message);
                         if(resume)
                           MakeHistoryReadOnly(message);
@@ -1351,7 +1429,7 @@ void AgentChatPanel::PollMcpStatus(int generation, int attempt, const QString &c
   if(!cursor.isEmpty())
     params[lit("cursor")] = cursor;
   m_Client->Request(
-      lit("mcpServerStatus/list"), params, ConfigTimeoutMs,
+      AgentBackend::Operation::ListToolServers, params, ConfigTimeoutMs,
       [this, generation, attempt, entries, seenCursors, cursor](const QJsonValue &result,
                                                                const QJsonObject &error) {
         if(generation != m_Generation)
@@ -1478,7 +1556,7 @@ void AgentChatPanel::StartTurn()
     params[lit("effort")] = m_Launch.reasoningEffort;
 
   m_Client->Request(
-      lit("turn/start"), params, m_Autotest.active ? m_Autotest.turnTimeoutMs : TurnTimeoutMs,
+      AgentBackend::Operation::SendTurn, params, m_Autotest.active ? m_Autotest.turnTimeoutMs : TurnTimeoutMs,
       [this, generation, turnRequest](const QJsonValue &result, const QJsonObject &error) {
         if(generation != m_Generation || turnRequest != m_TurnRequest ||
            !m_Conversation.TurnRunning())
@@ -1542,8 +1620,8 @@ void AgentChatPanel::Stop()
   QJsonObject params;
   params[lit("threadId")] = m_Conversation.ThreadId();
   params[lit("turnId")] = m_Conversation.TurnId();
-  m_Client->Request(lit("turn/interrupt"), params, StopGraceMs,
-                    CodexAppServerClient::ResponseCallback());
+  m_Client->Request(AgentBackend::Operation::InterruptTurn, params, StopGraceMs,
+                    AgentBackend::ResponseCallback());
   m_StopTimer->start();
   UpdateControls();
 }
@@ -1595,6 +1673,12 @@ void AgentChatPanel::NewChat()
 
 void AgentChatPanel::OnNotification(const QString &method, const QJsonObject &params)
 {
+  if(method == lit("backend/disconnected"))
+  {
+    SessionFailed(params[lit("requiresAuth")].toBool() ? SessionState::NotLoggedIn : SessionState::Error,
+                  params[lit("message")].toString(tr("The backend disconnected. Send again to reconnect.")));
+    return;
+  }
   if(method == lit("account/login/completed"))
   {
     if(m_LoginId.isEmpty() || params[lit("loginId")].toString() != m_LoginId)
@@ -1626,14 +1710,17 @@ void AgentChatPanel::OnNotification(const QString &method, const QJsonObject &pa
     const int generation = m_Generation;
     QJsonObject request;
     request[lit("refreshToken")] = false;
-    m_Client->Request(lit("account/read"), request, AccountTimeoutMs,
+    m_Client->Request(AgentBackend::Operation::ReadAccount, request, AccountTimeoutMs,
                       [this, generation](const QJsonValue &result, const QJsonObject &error) {
       if(generation != m_Generation || !error.isEmpty())
         return;
-      QJsonObject account = result.toObject()[lit("account")].toObject();
-      if(account.isEmpty() && result.toObject()[lit("requiresOpenaiAuth")].toBool(true))
+      const QJsonObject data = result.toObject();
+      QJsonObject account = data[lit("account")].toObject();
+      if(account.isEmpty() && data[lit("requiresAuth")].toBool(data[lit("requiresOpenaiAuth")].toBool(true)))
       {
-        const QString message = tr("Codex is no longer logged in. Log in before sending another question.");
+        const QString message = m_Client->SupportsBrowserLogin()
+            ? tr("Codex is no longer logged in. Log in before sending another question.")
+            : data[lit("loginMessage")].toString(tr("Claude authentication changed. Authenticate externally, then reconnect."));
         m_Account.clear();
         m_AccountType.clear();
         m_PendingText.clear();
@@ -1704,7 +1791,7 @@ void AgentChatPanel::OnProcessExited(int exitCode, bool killed, const QString &r
     return;
 
   QString message =
-      tr("The Codex app-server %1 (code %2).").arg(killed ? lit("was killed") : reason).arg(exitCode);
+      tr("The %1 backend %2 (code %3).").arg(m_Client->DisplayName(), killed ? lit("was killed") : reason).arg(exitCode);
   QString tail = LastLines(m_Client->StderrTail(), 8);
   if(!tail.isEmpty())
     message += lit("\n") + tail;
@@ -1717,7 +1804,7 @@ void AgentChatPanel::OnProcessExited(int exitCode, bool killed, const QString &r
   m_StopTimer->stop();
   m_Conversation.SetThread(QString(), m_Conversation.Model());
   m_PendingText.clear();
-  SetState(SessionState::Error, tr("Codex app-server stopped"));
+  SetState(SessionState::Error, tr("%1 backend stopped").arg(m_Client->DisplayName()));
   if(m_Conversation.TurnRunning())
     m_Conversation.EndTurn(lit("failed"), message);
   else
@@ -1777,8 +1864,8 @@ void AgentChatPanel::UpdateControls()
                         : tr("Saved conversation opened. Send a message to resume; old capture links remain inactive.");
   m_HistoryNotice->setText(historyNotice);
   m_HistoryNotice->setVisible(!historyNotice.isEmpty());
-  m_Login->setVisible(m_State == SessionState::NotLoggedIn);
-  m_Login->setEnabled(m_Client->IsRunning() && !m_LoginStarting);
+  m_Login->setVisible(m_State == SessionState::NotLoggedIn && m_Client->SupportsBrowserLogin());
+  m_Login->setEnabled(m_Client->SupportsBrowserLogin() && m_Client->IsRunning() && !m_LoginStarting);
   m_Login->setText(m_LoginId.isEmpty() ? tr("Log in") : tr("Cancel login"));
 
   QString color = lit("gray");
@@ -1809,6 +1896,7 @@ void AgentChatPanel::UpdateControls()
   const QString dot = lit(" %1 ").arg(Glyph(0x00B7));
   QStringList parts;
   parts << lit("<span style=\"color:%1\">%2</span> %3").arg(color, Glyph(0x25CF), state.toHtmlEscaped());
+  parts << (ConfiguredBackend() == lit("claude") ? tr("Claude") : tr("Codex"));
   if(!m_Conversation.Model().isEmpty())
     parts << m_Conversation.Model().toHtmlEscaped();
   if(!m_Account.isEmpty())
@@ -1975,7 +2063,8 @@ void AgentChatPanel::AutotestNext()
 
   if(m_LoginStarting || !m_LoginId.isEmpty() || m_State == SessionState::Starting || m_IdentityPending)
     return;
-  if(m_Autotest.autoLogin && !m_Autotest.loginAttempted && m_State == SessionState::NotLoggedIn)
+  if(m_Autotest.autoLogin && m_Client->SupportsBrowserLogin() && !m_Autotest.loginAttempted &&
+     m_State == SessionState::NotLoggedIn)
   {
     m_Autotest.loginAttempted = true;
     Login();
@@ -2319,6 +2408,8 @@ void AgentChatPanel::WriteTranscript()
   session[lit("captureTools")] = m_Launch.captureTools;
   session[lit("referenceToken")] = m_ReferenceToken;
   session[lit("historyId")] = m_HistoryRecord.metadata.id;
+  session[lit("backend")] = ConfiguredBackend();
+  session[lit("historyBackend")] = m_HistoryRecord.backend;
   session[lit("historyReadOnly")] = m_HistoryReadOnly;
   session[lit("historyLoaded")] = m_HistoryLoaded;
   session[lit("historyError")] = m_HistoryError;
@@ -2330,6 +2421,7 @@ void AgentChatPanel::WriteTranscript()
   {
     QJsonObject item;
     item[lit("id")] = entry.id;
+    item[lit("backend")] = entry.backend;
     item[lit("threadId")] = entry.threadId;
     item[lit("title")] = entry.title;
     item[lit("mode")] = entry.mode;

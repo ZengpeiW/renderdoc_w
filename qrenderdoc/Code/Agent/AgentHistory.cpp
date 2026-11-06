@@ -86,7 +86,8 @@ bool Decode(const QJsonObject &json, const QString &id, AgentHistoryRecord &reco
   const QJsonObject metadata = json[QStringLiteral("metadata")].toObject();
   AgentHistoryRecord parsed;
   AgentHistoryEntry &entry = parsed.metadata;
-  if(json[QStringLiteral("version")].toInt(-1) != 1 ||
+  const int version = json[QStringLiteral("version")].toInt(-1);
+  if((version != 1 && version != 2) ||
      !json[QStringLiteral("metadata")].isObject() ||
      !ReadString(metadata, QStringLiteral("id"), 36, entry.id) || entry.id != id ||
      !ReadString(metadata, QStringLiteral("title"), 1024, entry.title) ||
@@ -103,6 +104,25 @@ bool Decode(const QJsonObject &json, const QString &id, AgentHistoryRecord &reco
     error = Tr("The saved conversation has invalid metadata or an unsupported format.");
     return false;
   }
+  if(json.contains(QStringLiteral("backend")))
+  {
+    if(!ReadString(json, QStringLiteral("backend"), 32, parsed.backend))
+    {
+      error = Tr("The saved conversation has an invalid backend.");
+      return false;
+    }
+  }
+  else if(version != 1)
+  {
+    error = Tr("The saved conversation does not identify its backend.");
+    return false;
+  }
+  if(parsed.backend != QStringLiteral("codex") && parsed.backend != QStringLiteral("claude"))
+  {
+    error = Tr("The saved conversation uses an unsupported backend.");
+    return false;
+  }
+  entry.backend = parsed.backend;
   entry.captureIdentity = metadata[QStringLiteral("captureIdentity")].toObject();
   if(QJsonDocument(entry.captureIdentity).toJson(QJsonDocument::Compact).size() > 16384)
   {
@@ -300,17 +320,31 @@ bool AgentHistory::Save(AgentHistoryRecord &record, QString &error)
     return false;
   }
   AgentHistoryRecord updated = record;
+  updated.metadata.backend = updated.backend;
   const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
   if(updated.metadata.createdAt.isEmpty())
     updated.metadata.createdAt = now;
   updated.metadata.updatedAt = now;
   QJsonObject json;
-  json[QStringLiteral("version")] = 1;
+  // Version 2 prevents older binaries from treating a Claude session ID as a Codex thread.
+  json[QStringLiteral("version")] = 2;
+  json[QStringLiteral("backend")] = updated.backend;
   json[QStringLiteral("metadata")] = MetadataJson(updated.metadata);
   json[QStringLiteral("conversation")] = updated.conversation;
   AgentHistoryRecord validated;
   if(!Decode(json, updated.metadata.id, validated, error))
     return false;
+  if(QFileInfo::exists(path))
+  {
+    AgentHistoryRecord existing;
+    if(!Load(updated.metadata.id, existing, error))
+      return false;    // Never overwrite a record whose backend cannot be established safely.
+    if(existing.backend != updated.backend)
+    {
+      error = Tr("A saved conversation cannot change backend. Start a new chat instead.");
+      return false;
+    }
+  }
   const QByteArray bytes = QJsonDocument(json).toJson(QJsonDocument::Compact);
   if(bytes.size() > MaxRecordBytes)
   {
@@ -396,7 +430,7 @@ QList<AgentHistoryEntry> AgentHistory::List(QString &warning) const
   });
   QStringList warnings;
   if(skipped > 0)
-    warnings << Tr("Skipped %1 invalid or oversized conversation file(s).").arg(skipped);
+    warnings << Tr("Skipped %1 invalid, oversized, or unsupported conversation file(s).").arg(skipped);
   if(limited)
     warnings << Tr("Only recent conversations are shown (512 records / 64 MiB read limit).");
   warning = warnings.join(QLatin1Char('\n'));
@@ -412,13 +446,13 @@ QString AgentHistory::Select(const QList<AgentHistoryEntry> &entries, QWidget *p
   QVBoxLayout *layout = new QVBoxLayout(&dialog);
   QLineEdit *search = new QLineEdit(&dialog);
   search->setObjectName(QStringLiteral("agentHistorySearch"));
-  search->setPlaceholderText(Tr("Search conversations, captures, or models"));
+  search->setPlaceholderText(Tr("Search conversations, captures, models, or backends"));
   layout->addWidget(search);
   QTreeWidget *list = new QTreeWidget(&dialog);
   list->setObjectName(QStringLiteral("agentHistoryList"));
-  list->setColumnCount(5);
+  list->setColumnCount(6);
   list->setHeaderLabels(QStringList() << Tr("Conversation") << Tr("Updated") << Tr("Capture")
-                                     << Tr("Model") << Tr("Access"));
+                                     << Tr("Model") << Tr("Backend") << Tr("Access"));
   list->setRootIsDecorated(false);
   list->setSelectionMode(QAbstractItemView::SingleSelection);
   list->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
@@ -433,7 +467,8 @@ QString AgentHistory::Select(const QList<AgentHistoryEntry> &entries, QWidget *p
         list, QStringList() << (entry.title.isEmpty() ? Tr("Untitled conversation") : entry.title)
                             << updated.toString(QStringLiteral("yyyy-MM-dd HH:mm"))
                             << (capture.isEmpty() ? Tr("No capture") : QFileInfo(capture).fileName())
-                            << entry.model << (entry.locked ? Tr("In use; view only") : QString()));
+                            << entry.model << entry.backend
+                            << (entry.locked ? Tr("In use; view only") : QString()));
     item->setData(0, Qt::UserRole, entry.id);
     item->setToolTip(0, entry.title);
     item->setToolTip(2, capture);

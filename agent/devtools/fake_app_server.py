@@ -26,6 +26,7 @@ import json
 import os
 import re
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -40,7 +41,10 @@ SCENARIOS = ("stream", "tool", "approvals", "interrupt", "hang", "crash-once", "
              "login-success", "login-failure", "login-cancel", "model-pages", "model-error", "model-delayed",
              "model-empty", "model-loop",
              "login-not-found", "auth-recovered", "account-updated", "tool-artifacts", "tool-artifacts-rejected",
-             "persistent", "resume-failure", "resume-config-error", "resume-foreign", "resume-unsafe", "resume-replay")
+             "persistent", "resume-failure", "resume-config-error", "resume-foreign", "resume-unsafe", "resume-replay",
+             "claude-policy-missing", "claude-policy-tools", "claude-policy-builtin", "claude-policy-external",
+             "claude-policy-approvals", "claude-policy-type", "claude-resume-policy-missing", "claude-resume-policy-bad",
+             "claude-disconnect-completed", "claude-disconnect-failed", "claude-disconnect-auth")
 ANSWER = "Hello from the **fake** app-server.\n\n- EID 1513 draws the scene\n- uses `ResourceId::116618`"
 SERVER_REQUESTS = (
     "item/commandExecution/requestApproval",
@@ -52,8 +56,10 @@ SERVER_REQUESTS = (
 
 
 class FakeAppServer:
-    def __init__(self, scenario: str, log: Path | None, state_dir: Path | None, argv: list[str]):
+    def __init__(self, scenario: str, log: Path | None, state_dir: Path | None, argv: list[str],
+                 backend: str = "codex"):
         self.scenario = scenario
+        self.backend = backend
         self.log_path = log
         self.state_dir = state_dir
         self.lock = threading.Lock()
@@ -72,7 +78,7 @@ class FakeAppServer:
         login_marker = self.state_dir / "logged-in" if self.state_dir else None
         self.logged_in = (not scenario.startswith("login-") and scenario != "auth-recovered") or bool(login_marker and login_marker.exists())
         self.login_id: str | None = None
-        self.log({"event": "start", "pid": os.getpid(), "scenario": scenario, "argv": argv})
+        self.log({"event": "start", "pid": os.getpid(), "scenario": scenario, "argv": argv, "backend": backend})
 
     def log(self, entry: dict[str, Any]) -> None:
         if not self.log_path:
@@ -114,6 +120,16 @@ class FakeAppServer:
     def crash_marker(self) -> Path | None:
         return self.state_dir / "crashed-once" if self.state_dir else None
 
+    def spawn_cleanup_child(self) -> None:
+        if os.name != "nt":
+            return
+        # Inherit the UI client's Windows job, but no stdio pipes. This child deliberately
+        # outlives its fake parent unless process-tree cleanup closes the job immediately.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.log({"event": "cleanup-child", "pid": child.pid})
+
     def thread_path(self, thread_id: str) -> Path | None:
         if not self.state_dir or not re.fullmatch(r"thr_[0-9]+_[0-9]+", thread_id):
             return None
@@ -132,6 +148,23 @@ class FakeAppServer:
         public = dict(thread)
         if exclude_turns:
             public["turns"] = []
+        if self.backend == "claude":
+            result = {"thread": public, "model": thread["model"]}
+            policy = {"toolPolicy": "rendertest-only", "builtinTools": False,
+                      "externalMcp": False, "approvals": "deny"}
+            if self.scenario in ("claude-policy-missing", "claude-resume-policy-missing"):
+                # A Codex-looking sandbox is deliberately not a substitute for Claude's tool policy.
+                return dict(result, sandbox={"type": "readOnly"}, approvalPolicy="never")
+            bad_policy = {"claude-policy-tools": ("toolPolicy", "all"),
+                          "claude-policy-builtin": ("builtinTools", True),
+                          "claude-policy-external": ("externalMcp", True),
+                          "claude-policy-approvals": ("approvals", "allow"),
+                          "claude-policy-type": ("builtinTools", "false"),
+                          "claude-resume-policy-bad": ("externalMcp", True)}
+            if self.scenario in bad_policy:
+                key, value = bad_policy[self.scenario]
+                policy[key] = value
+            return dict(result, policy=policy)
         return {"thread": public, "model": thread["model"],
                 "sandbox": {"type": "readOnly", "networkAccess": False}, "approvalPolicy": "never"}
 
@@ -160,6 +193,12 @@ class FakeAppServer:
             self.account_reads += 1
             if self.scenario == "auth-recovered" and self.account_reads >= 2:
                 self.logged_in = True
+            if self.backend == "claude":
+                self.respond(request_id, {
+                    "account": None if self.scenario == "logged-out" or not self.logged_in else {"type": "external"},
+                    "requiresAuth": True,
+                    "loginMessage": "Claude authentication unavailable. Run claude auth login externally, then reconnect."})
+                return
             if self.scenario == "logged-out" or not self.logged_in:
                 self.respond(request_id, {"account": None, "requiresOpenaiAuth": True})
             else:
@@ -167,6 +206,9 @@ class FakeAppServer:
                                                       "planType": "plus"},
                                           "requiresOpenaiAuth": True})
         elif method == "account/login/start":
+            if self.backend == "claude":
+                self.send({"id": request_id, "error": {"code": -32601, "message": "Claude uses external login"}})
+                return
             if params.get("type") != "chatgpt":
                 self.send({"id": request_id, "error": {"code": -32602, "message": "expected ChatGPT login"}})
                 return
@@ -238,8 +280,10 @@ class FakeAppServer:
             if self.scenario == "config-malformed":
                 self.respond(request_id, {})
                 return
-            self.respond(request_id, {"config": {"mcp_servers": {
-                "rendertest": {"command": "python"}, "blender": {"command": "blender-mcp"}}}})
+            servers = {"rendertest": {"command": "python"}}
+            if self.backend == "codex":
+                servers["blender"] = {"command": "blender-mcp"}
+            self.respond(request_id, {"config": {"mcp_servers": servers}})
         elif method == "thread/start":
             self.capture_tools_enabled = params.get("config", {}).get("mcp_servers.rendertest.enabled", True)
             self.thread_counter += 1
@@ -283,7 +327,8 @@ class FakeAppServer:
                 cursor = "page2" if not params.get("cursor") or self.scenario == "status-loop" else None
                 self.respond(request_id, {"data": page, "nextCursor": cursor})
             else:
-                self.respond(request_id, {"data": [primary, other], "nextCursor": None})
+                self.respond(request_id, {"data": [primary] if self.backend == "claude" else [primary, other],
+                                          "nextCursor": None})
         elif method == "turn/start":
             self.turn_counter += 1
             turn_id = f"turn_{self.prefix}_{self.turn_counter}"
@@ -443,6 +488,7 @@ class FakeAppServer:
             if marker and not marker.exists():
                 marker.write_text("1", encoding="utf-8")
                 self.log({"event": "crash"})
+                self.spawn_cleanup_child()
                 sys.stderr.write("fake app-server: simulated crash\n")
                 sys.stderr.flush()
                 os._exit(3)
@@ -479,6 +525,8 @@ class FakeAppServer:
         if self.scenario in ("interrupt", "hang") and not (stall_marker and stall_marker.exists()):
             if stall_marker:
                 stall_marker.write_text("1", encoding="utf-8")
+            if self.scenario == "hang":
+                self.spawn_cleanup_child()
             tool_id = self.item_id(turn_id, "tool")
             item = {"type": "mcpToolCall", "id": tool_id, "server": "rendertest", "tool": "pixel_history",
                     "status": "inProgress", "arguments": {"x": 256, "y": 256}}
@@ -491,15 +539,30 @@ class FakeAppServer:
             self.complete(thread_id, turn_id, "failed", "fake: nobody stopped the turn")
             return
 
+        disconnect_marker = self.state_dir / "disconnected-once" if self.state_dir else None
+        disconnect = self.scenario.startswith("claude-disconnect-") and not (
+            disconnect_marker and disconnect_marker.exists())
+        if disconnect and disconnect_marker:
+            disconnect_marker.write_text("1", encoding="utf-8")
+        failed_disconnect = disconnect and self.scenario != "claude-disconnect-completed"
+        if failed_disconnect:
+            self.complete(thread_id, turn_id, "failed", "fake Claude connection failed")
         text = ANSWER
         if self.scenario == "explicit-links":
             text += "\n[direct](rt://event/1513?source=forged) [EID 1513](rt://resource/116618)"
-        self.stream_message(thread_id, turn_id, text)
-        self.notify("thread/tokenUsage/updated", {"threadId": thread_id, "turnId": turn_id,
-                                                  "tokenUsage": {"total": {"totalTokens": 4242},
-                                                                 "last": {"totalTokens": 42},
-                                                                 "modelContextWindow": 200000}})
-        self.complete(thread_id, turn_id, "completed")
+        if not failed_disconnect:
+            self.stream_message(thread_id, turn_id, text)
+            self.notify("thread/tokenUsage/updated", {"threadId": thread_id, "turnId": turn_id,
+                                                      "tokenUsage": {"total": {"totalTokens": 4242},
+                                                                     "last": {"totalTokens": 42},
+                                                                     "modelContextWindow": 200000}})
+            self.complete(thread_id, turn_id, "completed")
+        if disconnect:
+            requires_auth = self.scenario == "claude-disconnect-auth"
+            self.log({"event": "backend-disconnected", "requiresAuth": requires_auth})
+            self.notify("backend/disconnected", {"requiresAuth": requires_auth,
+                "message": "Claude authentication expired. Run claude auth login externally."
+                           if requires_auth else "Claude transport disconnected. Send again to reconnect."})
         if self.scenario == "account-updated":
             self.logged_in = False
             self.notify("account/updated", {"authMode": None, "planType": None})
@@ -511,11 +574,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", choices=SCENARIOS, default="stream")
     parser.add_argument("--log", type=Path)
     parser.add_argument("--state-dir", type=Path)
+    parser.add_argument("--backend", choices=("codex", "claude"), default="codex")
     args, rest = parser.parse_known_args(argv)
 
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8", newline="\n")
-    server = FakeAppServer(args.scenario, args.log, args.state_dir, rest)
+    server = FakeAppServer(args.scenario, args.log, args.state_dir, rest, args.backend)
     for line in sys.stdin:
         line = line.strip()
         if not line:

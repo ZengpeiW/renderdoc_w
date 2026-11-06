@@ -6,12 +6,13 @@
 
 class PersistentConfig;
 
-// Everything needed to launch `codex app-server` for the AI panel of this qrendertest instance.
+// Everything needed to launch an agent backend for this qrendertest instance.
 struct AgentLaunchConfig
 {
   Q_DECLARE_TR_FUNCTIONS(AgentLaunchConfig);
 
 public:
+  QString backend;
   QString program;
   QStringList arguments;
   QString workingDir;
@@ -29,6 +30,8 @@ public:
 
   static AgentLaunchConfig Resolve(const QString &instanceId, const QString &captureSessionId,
                                    const QString &agentRoot, const PersistentConfig &settings);
+  // Environment overrides the saved choice. Invalid choices return empty and optionally an error.
+  static QString EffectiveBackend(const PersistentConfig &settings, QString *error = NULL);
 
   // splits a command line on whitespace, honouring double quotes
   static QStringList SplitCommand(const QString &command);

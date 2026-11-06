@@ -275,6 +275,7 @@ HEADERS += Code/CaptureContext.h \
     Code/Agent/AgentConversation.h \
     Code/Agent/AgentCaptureIdentity.h \
     Code/Agent/AgentHistory.h \
+    Code/Agent/AgentBackend.h \
     Code/Agent/AgentLaunchConfig.h \
     Code/Agent/AgentAsk.h \
     Code/Agent/AgentMarkdown.h \

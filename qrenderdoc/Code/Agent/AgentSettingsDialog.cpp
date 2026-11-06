@@ -10,15 +10,17 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMap>
 #include <QProcessEnvironment>
 #include <QPushButton>
 #include <QStandardPaths>
 #include <QTimer>
 #include <QVBoxLayout>
 #include "AgentLaunchConfig.h"
-#include "CodexAppServerClient.h"
+#include "RenderTestAgentIntegration.h"
 #include "Code/Interface/PersistentConfig.h"
 #include "Code/QRDUtils.h"
+#include "AgentBackend.h"
 
 namespace
 {
@@ -44,18 +46,19 @@ bool ExecutableExists(const QString &path)
 }
 
 // Model discovery is independent of a capture or chat. In particular, opening Settings must not
-// require sending a question, starting a thread, or finding the MCP Python environment first.
+// require sending a question or starting a thread. Claude's bridge requires its Python runtime;
+// Codex discovery does not require MCP Python.
 class ModelCatalog : public QObject
 {
 public:
   typedef std::function<void(const QString &, const QJsonArray &, const QString &)> Update;
   ModelCatalog(QObject *parent, Update update) : QObject(parent), m_Update(update)
   {
-    m_Client = new CodexAppServerClient(this);
-    connect(m_Client, &CodexAppServerClient::processExited, this,
+    m_Client = new AgentBackend(this);
+    connect(m_Client, &AgentBackend::processExited, this,
             [this](int, bool, const QString &reason) {
       if(m_Loading)
-        Fail(Translate("Codex stopped while loading models: %1").arg(reason));
+        Fail(Translate("%1 stopped while loading models: %2").arg(m_BackendName, reason));
     });
   }
   ~ModelCatalog() { Cancel(); }
@@ -67,24 +70,24 @@ public:
     m_Client->Kill();
   }
 
-  void Start(const QString &codexPath)
+  void Start(const PersistentConfig &draft)
   {
     Cancel();
     const int generation = m_Generation;
-    PersistentConfig draft;
-    draft.Agent_CodexPath = codexPath.trimmed();
-    draft.Agent_IsolateMcpServers = true;
-    AgentLaunchConfig launch = AgentLaunchConfig::Resolve(QString(), QString(), QString(), draft);
+    AgentLaunchConfig launch = AgentLaunchConfig::Resolve(
+        QString(), QString(), RenderTestAgentIntegration::AgentRoot(), draft);
     if(!launch.error.isEmpty())
     {
       Fail(launch.error);
       return;
     }
-    launch.arguments << lit("-c") << lit("mcp_servers={}");
+    m_BackendName = launch.backend == lit("claude") ? lit("Claude Code") : lit("Codex");
+    if(launch.backend == lit("codex"))
+      launch.arguments << lit("-c") << lit("mcp_servers={}");
     m_Loading = true;
-    m_Update(lit("starting"), QJsonArray(), Translate("Loading models from Codex..."));
+    m_Update(lit("starting"), QJsonArray(), LoadingMessage());
     QString error;
-    if(!m_Client->Start(launch.program, launch.arguments, launch.workingDir, error))
+    if(!m_Client->Start(launch, error))
     {
       if(generation == m_Generation)
         Fail(error);
@@ -94,7 +97,7 @@ public:
     params[lit("clientInfo")] = QJsonObject({{lit("name"), lit("qrendertest_settings")},
                                              {lit("version"), QCoreApplication::applicationVersion()}});
     params[lit("capabilities")] = QJsonObject({{lit("experimentalApi"), true}});
-    m_Client->Request(lit("initialize"), params, 15000,
+    m_Client->Request(AgentBackend::Operation::Initialize, params, 15000,
                       [this, generation](const QJsonValue &, const QJsonObject &error) {
       if(generation != m_Generation)
         return;
@@ -103,12 +106,17 @@ public:
         Fail(error[lit("message")].toString());
         return;
       }
-      m_Client->Notify(lit("initialized"), QJsonObject());
+      m_Client->Initialized();
       Read(generation, QString(), QJsonArray(), QStringList());
     });
   }
 
 private:
+  QString LoadingMessage() const
+  {
+    return Translate("Loading models from %1...").arg(m_BackendName);
+  }
+
   void Fail(const QString &error)
   {
     Cancel();
@@ -120,12 +128,12 @@ private:
   void Read(int generation, const QString &cursor, const QJsonArray &models,
              const QStringList &seen)
   {
-    m_Update(lit("loading"), QJsonArray(), Translate("Loading models from Codex..."));
+    m_Update(lit("loading"), QJsonArray(), LoadingMessage());
     QJsonObject params;
     params[lit("limit")] = 100;
     if(!cursor.isEmpty())
       params[lit("cursor")] = cursor;
-    m_Client->Request(lit("model/list"), params, 15000,
+    m_Client->Request(AgentBackend::Operation::ListModels, params, 15000,
                       [this, generation, models, seen](const QJsonValue &result,
                                                        const QJsonObject &error) {
       if(generation != m_Generation)
@@ -157,13 +165,14 @@ private:
       }
       Cancel();
       m_Update(lit("ready"), all, all.isEmpty()
-                   ? Translate("No models were returned. Enter a model name or follow Codex configuration.")
+                   ? Translate("No models were returned. Enter a model name or follow the backend configuration.")
                    : Translate("Models loaded. You can also enter a custom model name."));
     });
   }
 
-  CodexAppServerClient *m_Client = NULL;
+  AgentBackend *m_Client = NULL;
   Update m_Update;
+  QString m_BackendName;
   int m_Generation = 0;
   bool m_Loading = false;
 };
@@ -174,6 +183,17 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
 {
   QDialog dialog(parent);
   QJsonArray catalog = models;
+  QString displayedBackend = AgentLaunchConfig::EffectiveBackend(settings);
+  if(displayedBackend.isEmpty())
+    displayedBackend = lit("codex");
+  QMap<QString, QString> modelDrafts, effortDrafts;
+  QMap<QString, QJsonArray> catalogs;
+  modelDrafts[lit("codex")] = QString(settings.Agent_Model).trimmed();
+  modelDrafts[lit("claude")] = QString(settings.Agent_ClaudeModel).trimmed();
+  effortDrafts[lit("codex")] = QString(settings.Agent_ReasoningEffort).trimmed();
+  effortDrafts[lit("claude")] = QString(settings.Agent_ClaudeReasoningEffort).trimmed();
+  catalogs[displayedBackend] = models;
+  bool codexIsolate = settings.Agent_IsolateMcpServers;
   dialog.setObjectName(lit("agentSettings"));
   dialog.setWindowTitle(Translate("AI Assistant Settings"));
   dialog.setWindowFlags(dialog.windowFlags() & ~Qt::WindowContextHelpButtonHint);
@@ -182,6 +202,18 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
   QVBoxLayout *layout = new QVBoxLayout(&dialog);
   QFormLayout *form = new QFormLayout();
   layout->addLayout(form);
+
+  QComboBox *backend = new QComboBox(&dialog);
+  backend->setObjectName(lit("agentBackend"));
+  backend->addItem(lit("Codex"), lit("codex"));
+  backend->addItem(lit("Claude Code"), lit("claude"));
+  backend->setCurrentIndex(backend->findData(displayedBackend));
+  const bool backendOverridden = !QProcessEnvironment::systemEnvironment()
+                                     .value(lit("RENDERTEST_AGENT_BACKEND")).trimmed().isEmpty();
+  backend->setEnabled(!backendOverridden);
+  if(backendOverridden)
+    backend->setToolTip(Translate("RENDERTEST_AGENT_BACKEND overrides the saved backend."));
+  form->addRow(Translate("Backend"), backend);
 
   auto addPath = [&](const QString &label, const QString &name, const QString &value) {
     QWidget *row = new QWidget(&dialog);
@@ -205,15 +237,22 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
   QLineEdit *codex = addPath(Translate("Codex executable"), lit("agentCodexPath"),
                             QString(settings.Agent_CodexPath));
   codex->setToolTip(Translate("Choose codex.exe itself, not codex.cmd or codex.ps1."));
+  QLineEdit *claude = addPath(Translate("Claude Code executable"), lit("agentClaudePath"),
+                             QString(settings.Agent_ClaudePath));
+  claude->setToolTip(Translate("Choose the native Claude Code executable. Leave empty to use the Claude Agent SDK default."));
   QLineEdit *python = addPath(Translate("MCP Python executable"), lit("agentMcpPython"),
                              QString(settings.Agent_McpPython));
-  python->setToolTip(Translate("Choose a Python environment with rendertest_mcp installed."));
+  python->setToolTip(Translate("Choose Python with rendertest_mcp installed; the Claude backend also requires claude-agent-sdk."));
 
   QComboBox *model = new QComboBox(&dialog);
   model->setObjectName(lit("agentModel"));
   model->setEditable(true);
   model->setInsertPolicy(QComboBox::NoInsert);
-  model->addItem(Translate("Follow Codex configuration"), QString());
+  auto defaultModelLabel = [&]() {
+    return displayedBackend == lit("claude") ? Translate("Follow Claude configuration")
+                                             : Translate("Follow Codex configuration");
+  };
+  model->addItem(defaultModelLabel(), QString());
   for(const QJsonValue &value : models)
   {
     QJsonObject descriptor = value.toObject();
@@ -226,7 +265,7 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
       description += lit("\n") + descriptor[lit("description")].toString();
     model->setItemData(model->count() - 1, description.trimmed(), Qt::ToolTipRole);
   }
-  const QString currentModel = QString(settings.Agent_Model).trimmed();
+  const QString currentModel = modelDrafts[displayedBackend];
   int modelIndex = model->findData(currentModel);
   if(modelIndex >= 0)
     model->setCurrentIndex(modelIndex);
@@ -237,7 +276,11 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
   QWidget *catalogRow = new QWidget(&dialog);
   QHBoxLayout *catalogLayout = new QHBoxLayout(catalogRow);
   catalogLayout->setContentsMargins(0, 0, 0, 0);
-  QLabel *catalogStatus = new QLabel(Translate("Loading models from Codex..."), catalogRow);
+  auto loadingMessage = [&]() {
+    return Translate("Loading models from %1...")
+        .arg(displayedBackend == lit("claude") ? lit("Claude Code") : lit("Codex"));
+  };
+  QLabel *catalogStatus = new QLabel(loadingMessage(), catalogRow);
   catalogStatus->setObjectName(lit("agentModelsStatus"));
   catalogStatus->setProperty("catalogState", lit("starting"));
   catalogStatus->setWordWrap(true);
@@ -252,8 +295,8 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
   effort->setObjectName(lit("agentReasoningEffort"));
   effort->setEditable(true);
   effort->setInsertPolicy(QComboBox::NoInsert);
-  effort->setEditText(QString(settings.Agent_ReasoningEffort).trimmed());
-  auto updateEfforts = [model, effort, &catalog](bool preserveCurrent) {
+  effort->setEditText(effortDrafts[displayedBackend]);
+  auto updateEfforts = [model, effort, &catalog, &displayedBackend](bool preserveCurrent) {
     QString selected = ComboValue(effort);
     QJsonArray supported;
     for(const QJsonValue &value : catalog)
@@ -281,8 +324,10 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
     effort->setEditable(custom);
     if(custom)
     {
-      const QStringList common = {lit("none"), lit("minimal"), lit("low"), lit("medium"),
-                                  lit("high"), lit("xhigh")};
+      const QStringList common = displayedBackend == lit("claude")
+          ? QStringList({lit("low"), lit("medium"), lit("high"), lit("xhigh"), lit("max")})
+          : QStringList({lit("none"), lit("minimal"), lit("low"), lit("medium"),
+                         lit("high"), lit("xhigh")});
       for(const QString &name : common)
         effort->addItem(name, name);
     }
@@ -316,9 +361,31 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
   QLabel *description = new QLabel(Translate("Changes apply when the assistant reconnects."), &dialog);
   description->setWordWrap(true);
   layout->addWidget(description);
+  auto updateBackendUi = [&]() {
+    const bool isClaude = displayedBackend == lit("claude");
+    codex->parentWidget()->setEnabled(!isClaude);
+    claude->parentWidget()->setEnabled(isClaude);
+    isolate->setEnabled(!isClaude);
+    isolate->setChecked(isClaude || codexIsolate);
+    isolate->setToolTip(isClaude
+        ? Translate("Claude Code always allows only the rendertest MCP tools; built-in tools and other MCP servers are disabled.")
+        : Translate("Shell commands stay disabled in both modes."));
+    description->setText(isClaude
+        ? Translate("Changes apply when the assistant reconnects. Claude Code uses external authentication: run claude auth login, or provide Claude API credentials through its environment variables. Credentials are not saved here. Only rendertest MCP tools are enabled.")
+        : Translate("Changes apply when the assistant reconnects."));
+  };
+  updateBackendUi();
+  auto fillDraft = [&](PersistentConfig &draft) {
+    draft.Agent_Backend = displayedBackend;
+    draft.Agent_CodexPath = codex->text().trimmed();
+    draft.Agent_ClaudePath = claude->text().trimmed();
+    draft.Agent_McpPython = python->text().trimmed();
+    draft.Agent_IsolateMcpServers = true;
+  };
   QStringList overridden;
   QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  const QStringList names = {lit("RENDERTEST_AGENT_CODEX_COMMAND"), lit("RENDERTEST_MCP_PYTHON"),
+  const QStringList names = {lit("RENDERTEST_AGENT_BACKEND"), lit("RENDERTEST_AGENT_CODEX_COMMAND"),
+                             lit("RENDERTEST_AGENT_CLAUDE_COMMAND"), lit("RENDERTEST_MCP_PYTHON"),
                              lit("RENDERTEST_AGENT_MODEL"), lit("RENDERTEST_AGENT_REASONING_EFFORT"),
                              lit("RENDERTEST_AGENT_ISOLATE")};
   for(const QString &name : names)
@@ -346,15 +413,25 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
   QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
   QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, [&]() {
     QString codexPath = codex->text().trimmed();
+    QString claudePath = claude->text().trimmed();
     QString pythonPath = python->text().trimmed();
-    QString suffix = QFileInfo(codexPath).suffix().toLower();
+    const bool isClaude = displayedBackend == lit("claude");
+    const QString path = isClaude ? claudePath : codexPath;
+    const QString name = isClaude ? lit("Claude Code") : lit("Codex");
+    QString suffix = QFileInfo(path).suffix().toLower();
     QString message;
-    if(suffix == lit("cmd") || suffix == lit("bat") || suffix == lit("ps1"))
-      message = Translate("Choose the native Codex executable, not a command or PowerShell shim.");
-    else if(!ExecutableExists(codexPath))
-      message = Translate("The Codex executable was not found: %1").arg(codexPath);
-    else if(!ExecutableExists(pythonPath))
-      message = Translate("The MCP Python executable was not found: %1").arg(pythonPath);
+    PersistentConfig draft;
+    fillDraft(draft);
+    AgentLaunchConfig::EffectiveBackend(draft, &message);
+    if(message.isEmpty())
+    {
+      if(suffix == lit("cmd") || suffix == lit("bat") || suffix == lit("ps1"))
+        message = Translate("Choose the native %1 executable, not a command or PowerShell shim.").arg(name);
+      else if(!ExecutableExists(path))
+        message = Translate("The %1 executable was not found: %2").arg(name, path);
+      else if(!ExecutableExists(pythonPath))
+        message = Translate("The MCP Python executable was not found: %1").arg(pythonPath);
+    }
     if(message.isEmpty() && !ComboValue(effort).isEmpty())
     {
       for(const QJsonValue &value : catalog)
@@ -381,18 +458,34 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
 
     const rdcstr oldCodex = settings.Agent_CodexPath, oldPython = settings.Agent_McpPython;
     const rdcstr oldModel = settings.Agent_Model, oldEffort = settings.Agent_ReasoningEffort;
+    const rdcstr oldBackend = settings.Agent_Backend, oldClaude = settings.Agent_ClaudePath;
+    const rdcstr oldClaudeModel = settings.Agent_ClaudeModel;
+    const rdcstr oldClaudeEffort = settings.Agent_ClaudeReasoningEffort;
     const bool oldIsolate = settings.Agent_IsolateMcpServers;
+    modelDrafts[displayedBackend] = ComboValue(model);
+    effortDrafts[displayedBackend] = ComboValue(effort);
+    if(!isClaude)
+      codexIsolate = isolate->isChecked();
+    if(!backendOverridden)
+      settings.Agent_Backend = displayedBackend;
     settings.Agent_CodexPath = codexPath;
+    settings.Agent_ClaudePath = claudePath;
     settings.Agent_McpPython = pythonPath;
-    settings.Agent_Model = ComboValue(model);
-    settings.Agent_ReasoningEffort = ComboValue(effort);
-    settings.Agent_IsolateMcpServers = isolate->isChecked();
+    settings.Agent_Model = modelDrafts[lit("codex")];
+    settings.Agent_ReasoningEffort = effortDrafts[lit("codex")];
+    settings.Agent_ClaudeModel = modelDrafts[lit("claude")];
+    settings.Agent_ClaudeReasoningEffort = effortDrafts[lit("claude")];
+    settings.Agent_IsolateMcpServers = codexIsolate;
     if(persist && !settings.Save())
     {
       settings.Agent_CodexPath = oldCodex;
       settings.Agent_McpPython = oldPython;
       settings.Agent_Model = oldModel;
       settings.Agent_ReasoningEffort = oldEffort;
+      settings.Agent_Backend = oldBackend;
+      settings.Agent_ClaudePath = oldClaude;
+      settings.Agent_ClaudeModel = oldClaudeModel;
+      settings.Agent_ClaudeReasoningEffort = oldClaudeEffort;
       settings.Agent_IsolateMcpServers = oldIsolate;
       error->setText(Translate("Could not save the settings. Check access to the RenderTest configuration file."));
       error->show();
@@ -400,12 +493,12 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
     }
     dialog.accept();
   });
-  auto replaceCatalog = [model, &catalog, updateEfforts](const QJsonArray &models) {
+  auto replaceCatalog = [model, &catalog, updateEfforts, defaultModelLabel](const QJsonArray &models) {
     const QString selected = ComboValue(model);
     catalog = models;
     model->blockSignals(true);
     model->clear();
-    model->addItem(Translate("Follow Codex configuration"), QString());
+    model->addItem(defaultModelLabel(), QString());
     for(const QJsonValue &value : catalog)
     {
       const QJsonObject descriptor = value.toObject();
@@ -423,29 +516,70 @@ bool AgentSettingsDialog::Edit(PersistentConfig &settings, const QJsonArray &mod
     model->blockSignals(false);
     updateEfforts(true);
   };
-  ModelCatalog discovery(&dialog, [catalogStatus, replaceCatalog](const QString &state,
+  ModelCatalog discovery(&dialog, [catalogStatus, replaceCatalog, &catalogs, &displayedBackend](const QString &state,
                                                                  const QJsonArray &models,
                                                                  const QString &message) {
     if(state == lit("ready"))
+    {
+      catalogs[displayedBackend] = models;
       replaceCatalog(models);
+    }
     catalogStatus->setProperty("catalogState", state);
     catalogStatus->setText(message);
   });
   QTimer refreshTimer(&dialog);
   refreshTimer.setSingleShot(true);
   refreshTimer.setInterval(300);
+  auto startDiscovery = [&]() {
+    PersistentConfig draft;
+    fillDraft(draft);
+    discovery.Start(draft);
+  };
   QObject::connect(&refreshTimer, &QTimer::timeout, &dialog,
-                   [&]() { discovery.Start(codex->text()); });
+                   startDiscovery);
   QObject::connect(refresh, &QPushButton::clicked, &dialog, [&]() {
     refreshTimer.stop();
-    discovery.Start(codex->text());
+    startDiscovery();
   });
-  QObject::connect(codex, &QLineEdit::textChanged, &dialog, [&]() {
+  auto queueDiscovery = [&]() {
     discovery.Cancel();
+    catalogs[displayedBackend] = QJsonArray();
     replaceCatalog(QJsonArray());
     catalogStatus->setProperty("catalogState", lit("starting"));
-    catalogStatus->setText(Translate("Loading models from Codex..."));
+    catalogStatus->setText(loadingMessage());
     refreshTimer.start(300);
+  };
+  QObject::connect(codex, &QLineEdit::textChanged, &dialog, [&]() {
+    if(displayedBackend == lit("codex"))
+      queueDiscovery();
+  });
+  QObject::connect(claude, &QLineEdit::textChanged, &dialog, [&]() {
+    if(displayedBackend == lit("claude"))
+      queueDiscovery();
+  });
+  QObject::connect(python, &QLineEdit::textChanged, &dialog, [&]() {
+    if(displayedBackend == lit("claude"))
+      queueDiscovery();
+  });
+  QObject::connect(backend, OverloadedSlot<int>::of(&QComboBox::currentIndexChanged), &dialog, [&](int) {
+    discovery.Cancel();
+    refreshTimer.stop();
+    modelDrafts[displayedBackend] = ComboValue(model);
+    effortDrafts[displayedBackend] = ComboValue(effort);
+    if(displayedBackend == lit("codex"))
+      codexIsolate = isolate->isChecked();
+    displayedBackend = backend->currentData().toString();
+    model->blockSignals(true);
+    model->setEditText(modelDrafts[displayedBackend]);
+    model->blockSignals(false);
+    effort->setEditable(true);
+    effort->setEditText(effortDrafts[displayedBackend]);
+    replaceCatalog(catalogs.value(displayedBackend));
+    updateBackendUi();
+    error->hide();
+    catalogStatus->setProperty("catalogState", lit("starting"));
+    catalogStatus->setText(loadingMessage());
+    refreshTimer.start(0);
   });
   // Let the dialog paint before starting the discovery process.
   refreshTimer.start(0);
