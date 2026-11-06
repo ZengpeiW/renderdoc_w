@@ -15,10 +15,17 @@ sdk_types = pytest.importorskip("claude_agent_sdk")
 
 from mcp.types import CallToolRequest, CallToolRequestParams, TextContent, Tool
 from rendertest_mcp.claude_backend import (BackendConfig, BackendError, CancelableBridgeClient,
-                                          ClaudeBackend, EFFORTS, POLICY, SKILLS)
+                                          ClaudeBackend, EFFORTS, POLICY, SKILLS,
+                                          MAX_USER_SETTINGS_BYTES, user_connection_env)
 from rendertest_mcp.instances import read_instance
 from rendertest_mcp.paths import instances_root
 from rendertest_mcp.protocol import INSTANCE_SCHEMA, PROTOCOL, RESULT_SCHEMA, TOOL_NAMES
+
+
+@pytest.fixture(autouse=True)
+def isolated_user_settings(tmp_path, monkeypatch):
+    # Unit-test options must never load the developer's actual connection credentials.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "isolated-claude-settings"))
 
 
 class FakeSDK:
@@ -479,5 +486,67 @@ def test_only_startup_skills_are_accepted_and_injected(tmp_path):
         await bridge.handle("thread/start", {"sandbox": "read-only", "approvalPolicy": "never"})
         assert all("Trusted body for " + name in sdk.clients[-1].options.system_prompt for name in SKILLS)
         assert sdk.clients[-1].options.skills == []
+        await bridge.close()
+    asyncio.run(check())
+
+
+def test_connection_env_falls_back_to_user_file_with_process_values_taking_priority(tmp_path, monkeypatch):
+    directory = tmp_path / ".claude"
+    directory.mkdir()
+    (directory / "settings.json").write_text(json.dumps({"env": {
+        "ANTHROPIC_AUTH_TOKEN": "test-only-token", "ANTHROPIC_BASE_URL": "https://example.invalid",
+        "ANTHROPIC_MODEL": "test-model", "ANTHROPIC_DEFAULT_SONNET_MODEL": "routed-sonnet",
+    }}), encoding="utf-8-sig")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert user_connection_env({}) == {
+        "ANTHROPIC_AUTH_TOKEN": "test-only-token", "ANTHROPIC_BASE_URL": "https://example.invalid",
+        "ANTHROPIC_MODEL": "test-model", "ANTHROPIC_DEFAULT_SONNET_MODEL": "routed-sonnet",
+    }
+    defaults = user_connection_env({"ANTHROPIC_AUTH_TOKEN": "process-token", "ANTHROPIC_BASE_URL": ""})
+    assert "ANTHROPIC_AUTH_TOKEN" not in defaults and "ANTHROPIC_BASE_URL" not in defaults
+    assert defaults["ANTHROPIC_MODEL"] == "test-model"
+
+
+def test_connection_env_respects_custom_config_dir_and_excludes_executable_configuration(tmp_path):
+    directory = tmp_path / "custom-user-config"
+    directory.mkdir()
+    (directory / "settings.json").write_text(json.dumps({
+        "apiKeyHelper": "must-never-execute", "hooks": {"SessionStart": "must-never-execute"},
+        "enabledPlugins": {"untrusted": True}, "permissions": {"defaultMode": "bypassPermissions"},
+        "env": {"ANTHROPIC_API_KEY": "test-key", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+                "CLAUDE_CODE_AUTO_MODE_SERVER": "https://untrusted.invalid", "BASH_ENV": "untrusted.sh",
+                "CLAUDE_CONFIG_DIR": "different-config", "CLAUDE_CODE_SETTINGS_PATH": "untrusted.json",
+                "RENDERTEST_AGENT_ROOT": "other-root", "PATH": "untrusted-bin", "MCP_SERVER": "foreign"},
+    }))
+    (directory / "settings.local.json").write_text(json.dumps({"env": {"ANTHROPIC_MODEL": "local-must-not-load"}}))
+    assert user_connection_env({"CLAUDE_CONFIG_DIR": str(directory)}) == {
+        "ANTHROPIC_API_KEY": "test-key", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}
+
+
+@pytest.mark.parametrize("contents", [b'{"env": {"ANTHROPIC_API_KEY": "DO_NOT_EXPOSE"',
+                                    b"DO_NOT_EXPOSE" * (MAX_USER_SETTINGS_BYTES // 8), b"\xff\xfeDO_NOT_EXPOSE"])
+def test_bad_or_oversized_connection_settings_are_ignored_without_disclosing_values(tmp_path, capsys, contents):
+    (tmp_path / "settings.json").write_bytes(contents)
+    assert user_connection_env({"CLAUDE_CONFIG_DIR": str(tmp_path)}) == {}
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err
+
+
+def test_connection_defaults_reach_sdk_without_enabling_user_settings(tmp_path, monkeypatch):
+    async def check():
+        directory = tmp_path / "user-connection"
+        directory.mkdir()
+        (directory / "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "test-only-token"},
+                                                            "apiKeyHelper": "must-never-execute"}))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(directory))
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        bridge, sdk, _ = backend(tmp_path / "agent")
+        await start(bridge)
+        options = sdk.clients[-1].options
+        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "test-only-token"
+        assert options.setting_sources == [] and options.hooks == {} and options.plugins == []
+        assert "apiKeyHelper" not in options.env and json.loads(options.settings)["disableAllHooks"] is True
+        bridge.auth_failed = True
+        assert (await bridge.handle("account/read", {}))["requiresAuth"] is True
         await bridge.close()
     asyncio.run(check())

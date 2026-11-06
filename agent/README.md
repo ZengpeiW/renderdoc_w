@@ -139,7 +139,7 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\codex_e2e.py --launch "
 菜单 `Window → AI Assistant` 打开可停靠面板。在 `Settings → Backend` 选择 Codex 或 Claude；第一次发送消息时启动所选 harness，并把 rendertest MCP 固定绑定到当前窗口的 Bridge 实例。
 
 - Codex 前提：安装 Codex CLI（`npm install -g @openai/codex`）并创建 `agent/mcp_server/.venv`。可沿用已有 Codex 登录，或在未登录提示出现后点面板的 `Log in`；浏览器完成登录后重新发送问题，等待时可点 `Cancel login`。
-- Claude 前提：用面板所选的 Python 安装可选依赖，在仓库根目录运行 `agent\mcp_server\.venv\Scripts\python.exe -m pip install -e "agent/mcp_server[claude]"`。`Claude executable` 留空使用 SDK 默认 runtime，也可指定原生 `claude.exe`。认证由 Claude 管理：可使用其支持的 API 环境配置，或在原生 CLI 中执行 `claude auth login`；RenderTest 不保存 API key，也不提供 Claude 的浏览器登录按钮。环境变量凭据改变后需重启 RenderTest。
+- Claude 前提：用面板所选的 Python 安装可选依赖，在仓库根目录运行 `agent\mcp_server\.venv\Scripts\python.exe -m pip install -e "agent/mcp_server[claude]"`。`Claude executable` 留空使用 SDK 默认 runtime，也可指定原生 `claude.exe`。认证由 Claude 管理：可使用其支持的 API 环境配置，或在原生 CLI 中执行 `claude auth login`。适配器也读取用户级 Claude `settings.json` 的连接环境白名单（认证、API 地址和模型路由/发现），尊重 `CLAUDE_CONFIG_DIR`，已有进程环境优先；不会加载项目配置、hooks、插件或执行 `apiKeyHelper`。RenderTest 不保存 API key，也不提供 Claude 的浏览器登录按钮。进程环境凭据改变后需重启 RenderTest；用户设置中的连接字段在下次建立连接时重新读取。
 - 设置：Codex 和 Claude 分别保存模型、推理强度和可执行文件路径；切换后端会保存旧对话并开始新对话。打开设置即可独立加载所选后端的模型目录，显示加载、失败和空目录状态，支持 `Refresh` 和手填模型。Codex 目录查询不依赖 MCP Python；Claude 目录查询使用已安装 SDK 的 Python。加载完成会保留输入，已列出的模型会校验支持的推理强度。
 - 工具权限：Codex 使用 `read-only` 沙箱和 `never` 审批，shell/web search 关闭，其它 MCP 默认隔离。Claude 使用 SDK 的空内置工具集、严格 MCP 配置及工具白名单，只开放绑定的 rendertest 工具；关闭用户/项目配置、插件、hook、shell、文件和 web 工具，不能关闭隔离。Claude 的这套工具限制不等同于 Codex 的操作系统沙箱。两种后端均需确认权限和 MCP 状态后才发送问题。
 - 交互：Enter 发送，Shift+Enter 换行。“Stop”先发 interrupt，2 秒内没有结束就结束进程树，下一条消息重新连接并恢复 thread。“New Chat”保存当前对话后清空面板，下一问创建独立 thread。
@@ -182,6 +182,8 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\appserver_history_check
 # Claude GUI fake 回归；真实 Claude SDK/CLI + localhost Messages fixture + fake Bridge
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --scenario claude
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\claude_backend_check.py
+# 在线 Claude + 当前真实 RenderTest 实例：两轮工具读取、退出后恢复原生会话；沿用已有认证，产生真实模型用量
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\claude_live_check.py --agent-root <agent-root> --instance <instance-id> --capture-session <session-id> --event <EID> --model "opus[1m]"
 # M5d fake 回归；真实 capture + fake server，不调用模型
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --scenario M5d
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\chat_panel_e2e.py --history-capture --capture "E:\Captures\some.rdc"

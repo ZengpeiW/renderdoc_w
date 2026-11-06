@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import hashlib
 import importlib
@@ -38,6 +39,12 @@ BUILTINS = ("Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "Noteb
             "WebFetch", "WebSearch", "Agent", "Task", "Skill", "ToolSearch", "TodoWrite",
             "AskUserQuestion", "EnterPlanMode", "ExitPlanMode")
 MAX_RPC_BYTES = 4 * 1024 * 1024
+MAX_USER_SETTINGS_BYTES = 1024 * 1024
+CONNECTION_ENV_KEYS = frozenset({
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+})
 LOGIN_MESSAGE = ("Claude authentication is managed outside RenderTest. Run the native Claude "
                  "CLI and log in, or configure an API credential supported by Claude Code; "
                  "then send your question again.")
@@ -47,6 +54,33 @@ class BackendError(Exception):
     def __init__(self, message: str, code: int = -32000):
         super().__init__(message)
         self.code = code
+
+
+def user_connection_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Import only connection defaults from the user file, without enabling its settings.
+
+    Claude's ``setting_sources=[]`` also suppresses the authentication/provider variables in
+    user settings. Reading this small allowlist preserves the external CLI setup while keeping
+    hooks, plugins, permissions, helpers, and project/local settings outside the harness.
+    Values must never appear in logs or errors. Explicit process variables, including empty
+    values, win exactly as they do when launching the CLI from a configured terminal.
+    """
+    environment = os.environ if environ is None else environ
+    configured = environment.get("CLAUDE_CONFIG_DIR", "")
+    directory = Path(configured).expanduser() if configured else Path.home() / ".claude"
+    try:
+        with (directory / "settings.json").open("rb") as handle:
+            raw = handle.read(MAX_USER_SETTINGS_BYTES + 1)
+        if len(raw) > MAX_USER_SETTINGS_BYTES:
+            return {}
+        settings = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    if not isinstance(settings, dict) or not isinstance(settings.get("env"), dict):
+        return {}
+    return {key: value for key, value in settings["env"].items()
+            if key in CONNECTION_ENV_KEYS and key not in environment and isinstance(value, str)
+            and "\x00" not in value}
 
 
 class CancelableBridgeClient(BridgeClient):
@@ -379,7 +413,8 @@ class ClaudeBackend:
             permission_mode="dontAsk", can_use_tool=permit, include_partial_messages=True,
             system_prompt=system, session_id=session if not resume else None,
             resume=session if resume else None, model=self.model, effort=self.effort,
-            env={"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1",
+            env={**user_connection_env(),
+                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1",
                  "ENABLE_TOOL_SEARCH": "false", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
             stderr=lambda _line: None)
 
