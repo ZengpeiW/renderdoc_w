@@ -79,6 +79,7 @@ class FakeRenderTestBridge:
         self._actions = self._build_actions()
         self._resources = self._build_resources()
         self._usage = self._build_usage()
+        self._gpu_duration_sample: dict[str, Any] | None = None
         self._poll_stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
         self.server = MailboxServer(
@@ -488,6 +489,83 @@ class FakeRenderTestBridge:
                          "topDraws": ranking(draws, "indexOrVertexInvocations", "numIndices * numInstances"),
                          "topDispatches": ranking(dispatches, "groupCount", "x * y * z")},
                         next_cursor=cursor)
+
+    def _method_list_gpu_counters(self, params: dict[str, Any]) -> dict[str, Any]:
+        counters = [
+            {"id": 1, "name": "GPU Duration", "category": "D3D12 Built-in",
+             "description": "Time taken for this event during GPU replay.",
+             "resultType": "Float", "resultByteWidth": 8, "unit": "Seconds",
+             "uuid": [1, 2, 3, 4], "durationSamplingSupported": True},
+            {"id": 13, "name": "CS Invocations", "category": "D3D12 Built-in",
+             "description": "Number of compute shader invocations.",
+             "resultType": "UInt", "resultByteWidth": 8, "unit": "Absolute",
+             "uuid": [1, 2, 3, 13], "durationSamplingSupported": False},
+        ]
+        prefix = "gpu-catalog:" + self.capture_session_id + ":"
+        cursor = params.get("cursor")
+        if cursor is not None and (not cursor.startswith(prefix) or not cursor[len(prefix):].isdigit()):
+            raise AgentBridgeError("INVALID_REQUEST", "The counter directory cursor is invalid or expired.")
+        page, offset = self._page(counters, dict(params, cursor=cursor[len(prefix):] if cursor else None))
+        return _payload({"counters": page, "total": len(counters), "duplicateCounterIds": 0,
+                         "samplingPolicy": "Only EventGPUDuration with Float/8-byte/Seconds metadata is sampled."},
+                        next_cursor=prefix + offset if offset else None, truncated=offset is not None)
+
+    def _method_get_gpu_duration(self, params: dict[str, Any]) -> BridgeResult:
+        refresh, cursor = params.get("refresh", False), params.get("cursor")
+        if type(refresh) is not bool or (refresh and cursor is not None):
+            raise AgentBridgeError("INVALID_REQUEST", "refresh cannot be combined with a cursor.")
+        parent, sort_by = params.get("parent_event_id"), params.get("sort_by", "duration")
+        if sort_by not in ("duration", "event_id"):
+            raise AgentBridgeError("INVALID_REQUEST", "Unknown duration sort order.")
+        if parent is not None:
+            self._event_id({"event_id": parent}, required=True)
+        sample = self._gpu_duration_sample
+        if sample is not None and sample["session"] != self.capture_session_id:
+            sample = None
+        cached = sample is not None and not refresh
+        if sample is None or refresh:
+            if cursor is not None:
+                raise AgentBridgeError("INVALID_REQUEST", "The duration sample cursor expired.")
+            sample = {"session": self.capture_session_id, "id": uuid.uuid4().hex,
+                      "sampledAtUtc": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+            self._gpu_duration_sample = sample
+        prefix = "gpu-duration:%s:%s:%s:" % (sample["id"], parent, sort_by)
+        if cursor is not None and (not cursor.startswith(prefix) or not cursor[len(prefix):].isdigit()):
+            raise AgentBridgeError("INVALID_REQUEST", "The duration sample, scope or sort cursor does not match.")
+        scope = list(self._actions) if parent is None else [parent]
+        if parent is not None:
+            for event_id in scope:
+                scope.extend(self._actions[event_id]["children"])
+        rows = []
+        for event_id in scope:
+            action = self._actions[event_id]
+            seconds = {10: 0.001, 20: 0.0}.get(event_id)
+            status = "valid" if seconds is not None else "invalid" if event_id == 30 else "missing"
+            row = {"eventId": event_id, "name": action["name"], "flags": action["flags"],
+                   "status": status, "durationSeconds": seconds,
+                   "durationMs": seconds * 1000 if seconds is not None else None}
+            if status != "valid":
+                row["reason"] = "negative native duration" if status == "invalid" else "no native sample"
+            if status == "invalid":
+                row["rawDuration"] = -1.0
+            rows.append(row)
+        rows.sort(key=(lambda row: (row["status"] != "valid", -(row["durationSeconds"] or 0.0),
+                                    row["eventId"])) if sort_by == "duration" else
+                         (lambda row: row["eventId"]))
+        page, offset = self._page(rows, dict(params, cursor=cursor[len(prefix):] if cursor else None))
+        data = {"counterId": 1, "counterName": "EventGPUDuration", "sampleId": sample["id"],
+                "sampledAtUtc": sample["sampledAtUtc"], "cached": cached,
+                "samplingScope": "capture", "parentEventId": parent, "sortBy": sort_by,
+                "scopeActionCount": len(rows), "validDurationCount": sum(r["status"] == "valid" for r in rows),
+                "invalidDurationCount": sum(r["status"] == "invalid" for r in rows),
+                "missingDurationCount": sum(r["status"] == "missing" for r in rows),
+                "duplicateDurationCount": 0, "events": page,
+                "diagnostics": {"rawResultCount": 3, "unknownEventResults": 0, "unknownEventIds": [],
+                                "counterMismatchResults": 0, "malformedResults": 0, "duplicateResultCount": 0}}
+        return BridgeResult(_payload(data, next_cursor=prefix + offset if offset else None,
+                                     truncated=offset is not None,
+                                     warnings=["Synthetic replay timing fixture; not application frame time."]),
+                            self._read_meta(None if cached else self.current_event_id))
 
     def _method_set_event(self, params: dict[str, Any]) -> BridgeResult:
         event_id = self._event_id(params, required=True)

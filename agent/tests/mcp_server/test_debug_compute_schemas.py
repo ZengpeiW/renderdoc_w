@@ -104,7 +104,7 @@ def test_catalog_effect_limits_and_dynamic_claude_allowlist(recording):
 
     server, _ = recording
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-    assert len(tools) == 31
+    assert len(tools) == 33
     assert set(tools) == set(TOOL_NAMES) == set(CLAUDE_TOOLS) == set(CLAUDE_EVENT_TOOLS)
     assert "debug_compute" in P1_METHODS
     assert METHOD_SPECS["debug_compute"] == BRIDGE_SPECS["debug_compute"] == {

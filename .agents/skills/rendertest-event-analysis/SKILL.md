@@ -1,6 +1,6 @@
 ---
 name: rendertest-event-analysis
-description: Explain a RenderDoc event, draw, dispatch or pass in RenderTest, or summarize frame/pass operations and texture/buffer footprint. Use for EID/pass purpose, inputs and outputs, raw API parameters, differences between events, event counts, workload rankings or resource-size questions.
+description: Explain a RenderDoc event, draw, dispatch or pass in RenderTest, or summarize frame/pass operations and texture/buffer footprint. Use for EID/pass purpose, inputs and outputs, raw API parameters, differences between events, event counts, GPU duration and counter availability, workload rankings or resource-size questions.
 ---
 
 # Explain an event
@@ -35,6 +35,15 @@ Follow `rendertest-core`.
 - `counts` separates operational leaves, markers and containers. Parent/container operation flags are excluded to avoid double counting; mention `excludedParentOperationCount` and warnings if present. Mesh and ray dispatches are separate categories. A single draw can be the scope even when it has no groups.
 - `topDraws` ranks recorded `numIndices * numInstances` as index/vertex invocations; this is not a triangle count or unique vertex shader executions. `topDispatches` ranks ordinary compute dispatch group counts. Neither ranking measures GPU cost, and invalid metadata is reported as unrankable. Follow a candidate with `inspect_event` before explaining it.
 - For texture/buffer size totals or largest resources, use `get_resource_stats(kind="all", top_n=20)` (`kind="texture"` or `kind="buffer"` narrows it). `all` covers textures and buffers only. Check `byKind`, `byTextureFormat`, `byTextureType` and `largestResources`; use exact ResourceIds to inspect candidates. Report known description bytes and unknown sizes, never call this resident/peak VRAM or a sum of unique allocations.
+
+## GPU counters and replay timing
+
+- For available counters, use `list_gpu_counters(limit=200)` and page `nextCursor`. Descriptions include counter ID, category, result type/width, unit and UUID. Enumeration does not sample the GPU. This version measures only `EventGPUDuration`; another counter being listed does not mean an embedded sampling tool exists for it. Availability depends on the replay API, GPU and driver.
+- For measured event cost, call `get_gpu_duration(limit=20)` for the largest durations, or pass `parent_event_id` for an exact action/marker and its descendants. Omission selects the whole capture; it does not default to the current event. To inspect the current draw, pass its actual action EID. Non-action setup EIDs are not parent scopes. `sort_by="event_id"` lists by EID instead of descending duration.
+- The first measurement samples the entire capture using native GPU timestamps. Scope and page size only filter the returned results; even a single draw request may replay the full capture. Request timing when it answers the question, not as a default step for explaining an event. Sampling restores replay without changing the UI, but native FetchCounters cannot be immediately cancelled; the MCP timeout is not a hard native deadline.
+- Keep `sampleId` and `sampledAtUtc` with conclusions. The last successful sample is reused by default (`cached=true`); use `refresh=true` without a cursor for a fresh measurement, including after in-session shader/resource edits. Continue pages with the same scope/sort and `refresh=false`. A successful refresh invalidates old sample cursors; do not combine pages from different samples.
+- Each scope action has a row. Only `status="valid"` has a duration: `durationSeconds` is the native value and `durationMs` is milliseconds. `invalid`, `duplicate` and `missing` are unknown, never zero. Markers/containers often have no counter row; missing does not mean failure or no GPU work. A measured zero can reflect timestamp resolution or backend behavior. Read status counts and diagnostics; unknown/native non-action EIDs are not silently attributed to their owner draw.
+- These are replay measurements on the current device, not captured application frame times. Repeated samples may vary with GPU clocks and concurrent load, and native alias events can share a measurement. D3D12 duration sampling does not enable stable power state by default; do not suggest changing Windows developer mode as a prerequisite for ordinary timing. Do not sum event durations into frame/pass wall time or infer FPS; report per-event values and the sampled scope. Use `inspect_event` and pipeline/resource tools to investigate an expensive event. Workload counts, texture bytes and overdraw colors are not timing measurements.
 
 ## Evidence
 

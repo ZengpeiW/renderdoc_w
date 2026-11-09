@@ -100,7 +100,7 @@ class ComparisonCBuffer(BaseModel):
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "export_overlay", "get_buffer_data", "pixel_history",
                                    "debug_pixel", "debug_vertex", "debug_compute", "get_mesh_data",
-                                   "decompile_shader"})
+                                   "decompile_shader", "get_gpu_duration"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -127,6 +127,7 @@ class _LiteralFieldMetadata(FuncMetadata):
         # FastMCP 1.x JSON-decodes some string inputs before Pydantic validation.
         # Preserve path strings such as [1], ["name"] and null, and prevent strict
         # compute coordinate arrays from accepting a JSON-encoded string instead.
+        # Counter selectors/cursors must not turn the string null into a fresh full sample.
         other = {key: value for key, value in data.items() if key not in self.literal_fields}
         parsed = super().pre_parse_json(other)
         for key in self.literal_fields:
@@ -198,7 +199,9 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             registered = server.tool(annotations=annotations, **options)(function)
             literal_fields = {"get_cbuffer": ("member_path",),
                               "get_api_calls": ("parameter_path",),
-                              "debug_compute": ("group", "thread")}.get(function.__name__)
+                              "debug_compute": ("group", "thread"),
+                              "list_gpu_counters": ("cursor",),
+                              "get_gpu_duration": ("parent_event_id", "cursor")}.get(function.__name__)
             if literal_fields:
                 # FastMCP exposes no per-argument pre-parser option. Keep this adapter
                 # local to these fields, retaining generated input/output schemas.
@@ -420,6 +423,55 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         return await invoke(
             "get_action_stats",
             _clean_params(parent_event_id=parent_event_id, cursor=cursor, limit=limit, top_n=top_n),
+            instance_id=instance_id,
+        )
+
+    @tool()
+    async def list_gpu_counters(
+        cursor: Cursor = None,
+        limit: StrictLimit = 200,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """List the GPU counters available for this capture and replay implementation.
+
+        Returns native descriptions, value types, byte widths, units and stable UUIDs.
+        This only discovers capabilities; it does not sample counters or guarantee that a
+        later sample succeeds. Only the built-in EventGPUDuration can currently be sampled,
+        through get_gpu_duration; vendor counters are described but cannot be requested.
+        Follow nextCursor to inspect the rest of the bounded directory.
+        """
+        return await invoke("list_gpu_counters", _clean_params(cursor=cursor, limit=limit),
+                            instance_id=instance_id)
+
+    @tool()
+    async def get_gpu_duration(
+        parent_event_id: StrictNullableEventId = None,
+        cursor: Cursor = None,
+        limit: StrictLimit = 200,
+        sort_by: Literal["duration", "event_id"] = "duration",
+        refresh: Annotated[bool, Field(strict=True)] = False,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Read replay GPU durations for the whole capture or one action subtree.
+
+        Samples only native EventGPUDuration, in seconds. The first request and refresh=true
+        replay the whole capture; parent_event_id, sorting and paging only filter results,
+        not native sampling cost. The cached sampleId is reused across scopes and pages.
+        Duration sorting ranks valid measured events first, greatest duration first; missing
+        or invalid measurements remain unavailable, never zero. A native zero does not prove
+        no GPU work. These measurements are replay timings, not original application frame
+        time; summing events is not a reliable frame time or elapsed pass time.
+        Check valid, invalid and missing counts and warnings. refresh cannot accompany cursor; successful refresh
+        invalidates old cursors. Native fetch is not immediately cancellable; the 120-second
+        MCP wait is not a hard native timeout. UI selection is preserved and replay restored.
+        """
+        if refresh and cursor is not None:
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "refresh cannot be combined with a continuation cursor."))
+        return await invoke(
+            "get_gpu_duration",
+            _clean_params(parent_event_id=parent_event_id, cursor=cursor, limit=limit,
+                          sort_by=sort_by, refresh=refresh),
             instance_id=instance_id,
         )
 

@@ -48,6 +48,14 @@ class ReplayRunner(object):
         value, _ = self._invoke(context, function, None)
         return value
 
+    def call_restoring(self, context, function):
+        """Run work that may alter native replay state without changing its reported EID.
+
+        FetchCounters is one such operation. It needs a forced replay of the latest UI event even
+        if its numeric EID has not changed. Never invoke this work without a restorable UI event.
+        """
+        return self._invoke(context, function, None, force_restore=True)
+
     def at_event(self, context, event_id, function):
         """Run ``function(controller)`` with the replay moved to ``event_id``.
 
@@ -56,7 +64,7 @@ class ReplayRunner(object):
         """
         return self._invoke(context, function, event_id)
 
-    def _invoke(self, context, function, event_id):
+    def _invoke(self, context, function, event_id, force_restore=False):
         manager = self.manager
         if manager is None:
             raise AgentBridgeError("UNSUPPORTED", "Replay access is not available.")
@@ -76,11 +84,22 @@ class ReplayRunner(object):
                 if time.time() > context.deadline_at:
                     raise AgentBridgeError("TIMEOUT", "The request expired in the replay queue.")
                 box["before"] = snapshot.get("currentEventId")
+                if force_restore:
+                    if box["before"] is None:
+                        raise AgentBridgeError("INVALID_EVENT", "The UI has no event to restore "
+                                               "after replay counter sampling.")
+                    moved = True
                 if event_id is not None:
                     moved = True
                     controller.SetFrameEvent(event_id, False)
                 _check_replay_health(controller)
                 box["value"] = function(controller)
+                if force_restore:
+                    _check_replay_health(controller)
+                    context.check_cancelled()
+                    if (self.state.snapshot().get("captureSessionId") or "") != session:
+                        raise AgentBridgeError("CAPTURE_CHANGED", "The capture changed during "
+                                               "replay counter sampling.")
             except BaseException as error:
                 box["error"] = error
                 box["trace"] = traceback.format_exc()
@@ -91,7 +110,9 @@ class ReplayRunner(object):
                         target = box["before"]
                     try:
                         if target is not None:
-                            controller.SetFrameEvent(target, False)
+                            controller.SetFrameEvent(target, force_restore)
+                            if force_restore:
+                                _check_replay_health(controller)
                         box["restored"] = target
                     except BaseException as error:
                         box["restoreError"] = "%s: %s" % (type(error).__name__, error)
@@ -101,8 +122,11 @@ class ReplayRunner(object):
             raise AgentBridgeError("CAPTURE_CHANGED",
                                    "The replay stopped before the request could run.")
 
-        if event_id is not None and box["restoreError"] is None:
-            self._reconcile(manager, box["restored"])
+        if (event_id is not None or (force_restore and box["restored"] is not None)) and box["restoreError"] is None:
+            if force_restore:
+                box["restored"] = self._reconcile(manager, box["restored"], force_restore=True)
+            else:
+                self._reconcile(manager, box["restored"])
 
         error = box["error"]
         if box["restoreError"] is not None:
@@ -116,30 +140,42 @@ class ReplayRunner(object):
             raise _wrap_error(error, context.method, box["trace"], self.log)
 
         meta = {}
-        if event_id is not None:
+        if event_id is not None or force_restore:
             meta = {
                 "replayEventId": event_id,
                 "eventIdBefore": box["before"],
                 "eventIdAfter": box["restored"],
                 "replayEventRestored": box["restoreError"] is None,
             }
+            if force_restore:
+                meta["replayRestoreForced"] = True
         return box["value"], meta
 
-    def _reconcile(self, manager, restored):
+    def _reconcile(self, manager, restored, force_restore=False):
         # qrenderdoc updates its current EID, queues SetFrameEvent and only notifies viewers once
         # that replay work finished. If this request ran inside that window it restored a stale
         # EID, so follow the UI to its newest event.
         latest = self.state.current_event_id()
         if latest is None or latest == restored:
-            return
+            return restored
+
+        status = {"ran": False, "error": None}
 
         def follow(controller):
+            status["ran"] = True
             try:
-                controller.SetFrameEvent(latest, False)
+                controller.SetFrameEvent(latest, force_restore)
+                if force_restore:
+                    _check_replay_health(controller)
             except BaseException as error:
+                status["error"] = str(error)
                 self.log("Following the UI event %s failed: %s" % (latest, error))
 
         manager.BlockInvoke(follow)
+        if force_restore and (not status["ran"] or status["error"] is not None):
+            raise AgentBridgeError("REPLAY_ERROR", "Could not force replay back to the latest "
+                                   "UI event after counter sampling.")
+        return latest
 
 
 class UiInvoker(object):

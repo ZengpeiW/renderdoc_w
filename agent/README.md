@@ -9,7 +9,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
 - M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
-- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数、事件差异和 Compute 线程调试；当前共 31 个 MCP 工具，Codex 和 Claude 共用。
+- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数、事件差异、Compute 线程调试和 GPU duration；当前共 33 个 MCP 工具，Codex 和 Claude 共用。
 
 ## P0 工具
 
@@ -17,6 +17,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 | --- | --- |
 | 实例/上下文 | `list_instances`、`get_status`、`get_context`（含当前 EID 的 Pipeline 摘要） |
 | Action | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`get_api_calls`、`compare_events`、`set_event`（唯一会改变 UI 的工具） |
+| GPU 计数器 | `list_gpu_counters`（能力查询）、`get_gpu_duration`（回放耗时） |
 | Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`decompile_shader`（生成 HLSL/GLSL）、`get_cbuffer`（支持成员路径和子成员分页） |
 | 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
@@ -40,6 +41,30 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - Overlay 是 `artifact` 操作，不移动 UI 选中事件，也不修改 Texture Viewer 设置；输出始终在 `finally` 释放，并强制恢复共享诊断资源。图像是 8-bit RGB 可视化，默认最长边 1024，`max_dimension` 上限 4096，并受 2M 输出像素预算约束。源纹理及关联深度纹理限制为 16M 存储 texel（包括 mip/slice/sample），超限或 API 不支持时明确报错。结果提供 `legend`、原始/输出尺寸及 `displayTransform`；不要把缩放后的坐标、诊断色或 Overdraw 热图当作原始像素值、精确写入次数或 GPU 耗时。需要实际看图时指定 `include_image=true`。
 
 例如：“读取当前 Pixel Shader 的 Lights 数组第 123 项 Color”、“分页查看这个常量缓冲后面的成员”、“导出当前 Draw 的深度测试和背面剔除 Overlay，解释哪些区域被挡住”。
+
+## GPU 计数器与回放耗时
+
+`list_gpu_counters(cursor=None, limit=200)` 查询当前 capture/replay 支持的计数器，返回 ID、名称、类别、描述、结果类型/字节宽度、单位和 UUID。按 `nextCursor` 翻页；此查询不会采样。当前只开放 `get_gpu_duration` 采样原生 `EventGPUDuration`，目录里其他计数器仍仅供能力查询；`durationSamplingSupported` 不保证驱动实际采样成功。
+
+`get_gpu_duration(parent_event_id=None, cursor=None, limit=200, sort_by="duration", refresh=false)` 返回逐 action 的 GPU 回放耗时：
+
+- 默认范围为整帧；`parent_event_id` 必须是实际 action EID，范围包含该 action 及所有后代。`sort_by="duration"` 按有效耗时降序、相同值按 EID 排序；`"event_id"` 按 EID 排序。`limit` 为 1–1000，每页最多 256 KiB。
+- 首次查询和显式 `refresh=true` 都会原生重放**整帧**。筛选子树、排序和少量返回均不会减少采样工作。缓存当前 capture session 最近一次成功样本，检查 `sampleId`、`sampledAtUtc` 和 `cached`；翻页和换范围复用同一份结果。`refresh` 不能与游标一起使用；成功刷新后旧游标失效，失败刷新不覆盖旧样本。手动替换 Shader 等未更换 session 的操作后需要显式刷新。
+- 每个 action 都有 `status`：`valid`、`invalid`、`missing` 或 `duplicate`。仅有效值提供 `durationSeconds` / `durationMs`；其余为 null 并附原因，负数、NaN/Inf、重复 EID 不当作 0。marker/容器没有测量很常见；原生报告 0 也不证明没有 GPU 工作。检查状态计数、`diagnostics` 与 warnings；未知 EID 不归并到其他 action。
+- 计时来自当前设备的 RenderDoc 回放，受回放方式、GPU 频率和其他负载影响，不能当作应用原始帧时间。不同事件可能重叠或复用 alias 测量，**不要相加推导帧/Pass 墙钟耗时或 FPS**。
+- 这是 `read` 操作，保持 UI 选择；采样结束后强制回放到当前 UI EID。原生采样不可立即抢占，120 秒 MCP 等待不是 native 硬超时。失败或恢复失败不会发布新样本。
+
+本版本 D3D12 不再默认调用 `SetStablePowerState`，基础采样无需开启 Windows 开发者模式。需要固定频率时可显式启用 RenderDoc 配置 `D3D12_Replay_StablePowerState`，但必须先满足开发者模式要求；默认测量允许动态频率变化。原因见 [Microsoft API 说明](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-setstablepowerstate) 和 [时间戳频率规范](https://microsoft.github.io/DirectX-Specs/d3d/CountersAndQueries.html)。
+
+例如：“查询当前可用的 GPU 计数器”、“测量这一帧 GPU duration，列出最慢的 20 个事件”、“用同一份样本检查 EID 123 这个 pass 下的事件”、“重新测量一遍”。EID 需要从当前 capture 中选择。
+
+真实 capture 验证命令（独立隐藏 GUI，不调用在线模型）：
+
+```powershell
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\gpu_counters_live.py --launch E:/Captures/pragmata1.rdc --event 3820 --guard-resource 390195
+```
+
+脚本记录生产调用同一次 `FetchCounters` 的原始结果，逐项核对数值、单位、范围、排序、分页和刷新；同时在回调结束时直接读取资源像素，检查强制恢复的真实回放状态。两次独立测量不要求数值相同。上述 D3D12 样本的部分 GBuffer 在不采样 counters 时重复回放也会变化，所以验收明确选择经无采样稳定性检查的资源 390195；并不保证该 capture 所有资源逐位可重复。
 
 ## API 参数与事件比较
 
@@ -148,7 +173,7 @@ agent/
 仓库根目录的 `.agents/skills/` 下有 4 个 Skill，在本仓库里运行 Codex 时会被发现。Skill 正文用英文（模型仍按用户语言回答）：Codex 在 Windows PowerShell 下读无 BOM 的中文 UTF-8 文件会乱码。
 
 - `rendertest-core`：目标选择、capture/session 身份、工具效果、实测与推断的区分。
-- `rendertest-event-analysis`：解释 EID/pass 的输入、计算和输出，统计 frame/pass 事件及纹理/缓冲大小。
+- `rendertest-event-analysis`：解释 EID/pass 的输入、计算和输出，统计事件及资源大小，查询计数器和测量 GPU duration。
 - `rendertest-shader-debug`：Shader 内嵌源码、生成 HLSL/GLSL、反射、绑定、CBuffer 和反汇编，`debug_pixel` / `debug_vertex` / `debug_compute` 单线程调试。
 - `rendertest-pixel-investigation`：像素取值、用 `pixel_history` 找最后改变它的事件和失败原因，必要时 `debug_pixel` 看 Shader 计算；不支持时退回资源用途比较。
 

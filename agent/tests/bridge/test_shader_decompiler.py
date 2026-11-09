@@ -196,57 +196,101 @@ def test_process_cancel_and_log_limit(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows release process job")
-def test_timeout_terminates_descendant_process(tmp_path):
+def test_timeout_terminates_descendant_process(tmp_path, monkeypatch):
     pid_file = tmp_path / "child.pid"
+    assert_child_stopped = observe_windows_child(monkeypatch, pid_file)
+    original_resume = sd._ProcessJob.resume
+
+    def resume_until_child_exists(job, process):
+        original_resume(job, process)
+        # This case verifies descendant cleanup on timeout. Establish that a descendant exists
+        # before the runner checks its original deadline; Python startup can exceed 600 ms on
+        # Windows. The separate deadline test checks timeout without a readiness barrier.
+        ready_deadline = time.monotonic() + 5
+        while not pid_file.exists() or pid_file.stat().st_size == 0:
+            assert time.monotonic() < ready_deadline, "test child did not start"
+            assert process.poll() is None, "test parent exited before starting its child"
+            time.sleep(.01)
+
+    monkeypatch.setattr(sd._ProcessJob, "resume", resume_until_child_exists)
     code = ("import subprocess,sys,time; "
             "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
             "open(%r,'w').write(str(p.pid)); time.sleep(30)" % str(pid_file))
-    with pytest.raises(AgentBridgeError) as error:
-        run_python(tmp_path, code, seconds=.6)
-    assert error.value.code == "TIMEOUT" and pid_file.exists()
+    try:
+        with pytest.raises(AgentBridgeError) as error:
+            run_python(tmp_path, code, seconds=.6)
+        assert error.value.code == "TIMEOUT" and pid_file.exists()
+    finally:
+        if pid_file.exists() and pid_file.stat().st_size:
+            assert_child_stopped()
+
+
+def observe_windows_child(monkeypatch, pid_file):
+    """Retain the verified descendant handle before job closure; never kill by a reused PID."""
     import ctypes
     from ctypes import wintypes
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
-    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel.OpenProcess(0x100000, False, int(pid_file.read_text()))
-    if handle:
-        try:
-            assert kernel.WaitForSingleObject(handle, 2000) == 0
-        finally:
-            kernel.CloseHandle(handle)
-
-
-def assert_windows_child_stopped(pid):
-    import ctypes
-    from ctypes import wintypes
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    kernel.IsProcessInJob.restype = wintypes.BOOL
     kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel.WaitForSingleObject.restype = wintypes.DWORD
     kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateProcess.restype = wintypes.BOOL
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel.OpenProcess(0x100001, False, pid)  # synchronize + terminate (failure cleanup)
-    if not handle:
-        assert ctypes.get_last_error() == 87  # no such process
-        return
-    try:
-        ended = kernel.WaitForSingleObject(handle, 2000) == 0
-        if not ended:
-            # Keep a failed regression from leaving our own test child alive.
-            kernel.TerminateProcess(handle, 1)
-            kernel.WaitForSingleObject(handle, 2000)
-        assert ended, "decompiler descendant survived process-job cleanup"
-    finally:
-        kernel.CloseHandle(handle)
+    kernel.CloseHandle.restype = wintypes.BOOL
+    state = {"handle": None, "pid": None, "observed": False, "error": None}
+    original_close = sd._ProcessJob.close
+
+    def observe_then_close(job):
+        try:
+            if job.handle and pid_file.exists() and pid_file.stat().st_size:
+                state["pid"] = int(pid_file.read_text())
+                # Query membership before close, while a live descendant is expected. Holding
+                # this handle prevents PID reuse until the cleanup assertion has completed.
+                handle = kernel.OpenProcess(0x101001, False, state["pid"])
+                if not handle:
+                    state["observed"] = ctypes.get_last_error() == 87
+                    if not state["observed"]:
+                        state["error"] = "Cannot observe the test descendant"
+                else:
+                    member = wintypes.BOOL()
+                    if kernel.IsProcessInJob(handle, job.handle, ctypes.byref(member)) and member.value:
+                        state["handle"], state["observed"] = handle, True
+                    else:
+                        # Never terminate a process whose identity/ownership is not established.
+                        kernel.CloseHandle(handle)
+                        state["error"] = "Recorded descendant is not in this test's job"
+        finally:
+            original_close(job)
+
+    monkeypatch.setattr(sd._ProcessJob, "close", observe_then_close)
+
+    def assert_stopped():
+        handle = state["handle"]
+        try:
+            assert state["error"] is None, state["error"]
+            assert state["observed"], "The test descendant was not observed before job closure"
+            if handle:
+                ended = kernel.WaitForSingleObject(handle, 2000) == 0
+                if not ended:
+                    # Keep a failed regression from leaking the exact verified test process.
+                    kernel.TerminateProcess(handle, 1)
+                    kernel.WaitForSingleObject(handle, 2000)
+                assert ended, "decompiler descendant %s survived process-job cleanup" % state["pid"]
+        finally:
+            if handle:
+                kernel.CloseHandle(handle)
+                state["handle"] = None
+
+    return assert_stopped
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows suspended process/job ordering")
 def test_fast_parent_cannot_spawn_before_job_assignment_and_descendant_is_reaped(tmp_path, monkeypatch):
     pid_file = tmp_path / "fast-child.pid"
+    assert_child_stopped = observe_windows_child(monkeypatch, pid_file)
     original_assign = sd._ProcessJob.assign
 
     def delayed_assign(job, process):
@@ -265,7 +309,7 @@ def test_fast_parent_cannot_spawn_before_job_assignment_and_descendant_is_reaped
         assert pid_file.exists()
     finally:
         if pid_file.exists():
-            assert_windows_child_stopped(int(pid_file.read_text()))
+            assert_child_stopped()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows suspended process cleanup")

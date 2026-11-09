@@ -65,6 +65,8 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "list_actions": {"parent_event_id": 1, "limit": 2},
             "find_actions": {"query": "draw", "flags": ["draw"]},
             "get_action_stats": {"parent_event_id": 1, "limit": 2, "top_n": 1},
+            "list_gpu_counters": {"limit": 1},
+            "get_gpu_duration": {"parent_event_id": 1, "limit": 2},
             "inspect_event": {"event_id": 30},
             "get_api_calls": {"event_id": 30, "limit": 1},
             "compare_events": {"before_event_id": 10, "after_event_id": 30},
@@ -140,6 +142,16 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["get_action_stats"]["data"]["counts"]["draw"] == 2
     assert results["get_action_stats"]["data"]["groups"][0]["action"]["eventId"] == 10
     assert results["get_action_stats"]["data"]["topDraws"]["actions"][0]["indexOrVertexInvocations"] == 36
+    assert results["list_gpu_counters"]["data"]["counters"][0]["id"] == 1
+    assert results["list_gpu_counters"]["nextCursor"]
+    assert results["get_gpu_duration"]["effect"] == "read"
+    assert results["get_gpu_duration"]["data"]["samplingScope"] == "capture"
+    assert [row["eventId"] for row in results["get_gpu_duration"]["data"]["events"]] == [10, 20]
+    assert results["get_gpu_duration"]["data"]["validDurationCount"] == 2
+    assert results["get_gpu_duration"]["data"]["invalidDurationCount"] == 1
+    assert results["get_gpu_duration"]["data"]["missingDurationCount"] == 1
+    assert results["get_gpu_duration"]["meta"]["eventIdBefore"] == 10
+    assert results["get_gpu_duration"]["meta"]["eventIdAfter"] == 10
     assert results["get_resource_stats"]["data"]["resourceCount"] == 4
     assert results["get_resource_stats"]["data"]["knownTotalBytes"] == 448
     assert results["get_resource_stats"]["data"]["hasMoreLargest"]

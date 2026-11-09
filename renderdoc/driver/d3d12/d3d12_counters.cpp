@@ -35,6 +35,11 @@
 
 RDOC_EXTERN_CONFIG(bool, D3D12_Debug_SingleSubmitFlushing);
 
+RDOC_CONFIG(bool, D3D12_Replay_StablePowerState, false,
+            "Enable a stable GPU power state while collecting D3D12 counters. Requires Windows "
+            "Developer Mode; enabling this without it can remove the device. This affects GPU "
+            "clocks system-wide and is not required for timestamp duration queries.");
+
 rdcarray<GPUCounter> D3D12Replay::EnumerateCounters()
 {
   rdcarray<GPUCounter> ret;
@@ -651,17 +656,26 @@ rdcarray<CounterResult> D3D12Replay::FetchCounters(const rdcarray<GPUCounter> &c
     return ret;
   }
 
-  // Only supported with developer mode drivers!!!
-  hr = m_pDevice->SetStablePowerState(TRUE);
-  if(FAILED(hr))
+  // This profiling aid requires Developer Mode and can remove the device if it is unavailable.
+  // Timestamp queries work at the queue's timestamp frequency without fixing GPU core clocks.
+  const bool stablePowerState = D3D12_Replay_StablePowerState();
+  if(stablePowerState)
   {
-    RDResult err;
-    SET_ERROR_RESULT(
-        err, ResultCode::DeviceLost,
-        "D3D12 counters require Win10 developer mode enabled: Settings > Update & Security "
-        "> For Developers > Developer Mode");
-    m_pDevice->ReportFatalError(err);
-    return ret;
+    hr = m_pDevice->SetStablePowerState(TRUE);
+    if(FAILED(hr))
+    {
+      SAFE_RELEASE(readbackBuf);
+      SAFE_RELEASE(timerQueryHeap);
+      SAFE_RELEASE(pipestatsQueryHeap);
+      SAFE_RELEASE(occlusionQueryHeap);
+      RDResult err;
+      SET_ERROR_RESULT(err, ResultCode::DeviceLost,
+                       "D3D12 stable power state could not be enabled. It requires Windows "
+                       "Developer Mode; disable D3D12_Replay_StablePowerState to collect counters "
+                       "without changing GPU power state.");
+      m_pDevice->ReportFatalError(err);
+      return ret;
+    }
   }
 
   D3D12GPUTimerCallback cb(m_pDevice, this, pipeQueryType, timerQueryHeap, pipestatsQueryHeap,
@@ -676,8 +690,8 @@ rdcarray<CounterResult> D3D12Replay::FetchCounters(const rdcarray<GPUCounter> &c
     m_pDevice->FlushLists(true);
   }
 
-  // Only supported with developer mode drivers!!!
-  m_pDevice->SetStablePowerState(FALSE);
+  if(stablePowerState)
+    m_pDevice->SetStablePowerState(FALSE);
 
   ID3D12GraphicsCommandList *list = m_pDevice->GetNewList();
 
