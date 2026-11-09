@@ -2,6 +2,8 @@
 
 RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打开的 capture。设计见 [docs/MVP_DESIGN.md](docs/MVP_DESIGN.md)。
 
+面向试用者的安装、登录、模型设置、提问示例和完整工具清单见 [AI Assistant 使用指南](docs/AI_ASSISTANT_USER_GUIDE.md)。Windows x64 试用压缩包包含独立 Python/MCP 环境，可完整解压后运行 `Start-RenderTest.cmd`；Codex/Claude CLI 及账号由使用者自行安装和登录。
+
 当前进度：**M4 和 M5a–M5d 已实现**，支持 Codex/Claude 双 harness、本地历史保存与跨进程恢复。Claude 在线调用与续聊已验证；Codex 浏览器 OAuth 完整流程仍需人工验收。当前交接快照、验证记录和后续候选见 [CURRENT_STATUS.md](docs/CURRENT_STATUS.md)，设计过程见 [M5 设计](docs/M5_DESIGN.md)。
 
 - M0：MCP Server、文件 mailbox IPC、fake Bridge 和协议测试。

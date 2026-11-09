@@ -6,12 +6,13 @@
 
 - 工作目录：`E:\PersonalWorkSpace\git_repo\renderdoc`。
 - 当前分支：`local_test`。
-- 本轮基于 `9a4a88089`，新增 `get_pass_resources`，同步 Skill、文档与真实 capture 验证脚本。
+- 本轮基于 `2439ca6b5`，补齐面向试用者的使用文档、Windows x64 打包脚本及迁移验证脚本；分析工具功能保持该提交的版本。
 - MVP/M0–M4、M5a–M5d 已实现，已有可使用的内嵌 AI 助手；目前有 **35 个 MCP 工具、4 个 Skill、Codex 和 Claude 两种 harness**。
-- DeepSeek harness 未接入。本轮增加 Pass/事件范围的资源用途与前后使用查询，读取原生 GetUsage 元数据，不移动回放；结果不代表像素/字节级依赖或引擎原生 RDG。
-- 本轮开始时，唯一未跟踪文件是 `renderdoc/data/renderdoc.rc.bak`，属于已有文件，未修改、删除或纳入提交。
+- DeepSeek harness 未接入。最近完成的 `get_pass_resources` 提供 Pass/事件范围的资源用途与前后使用查询，读取原生 GetUsage 元数据，不移动回放；结果不代表像素/字节级依赖或引擎原生 RDG。
+- 已生成约 80 MB 的试用 ZIP，包含独立 Python/MCP、Bridge、Skill 和 release 反编译器；Codex/Claude CLI 及账号由试用者自行安装和登录。ZIP、运行库和验证产物不提交 Git。
+- 原有未跟踪文件 `renderdoc/data/renderdoc.rc.bak` 未修改、删除或纳入提交。
 
-详细使用说明见 [agent/README.md](../README.md)。[MVP_DESIGN.md](MVP_DESIGN.md) 和 [M5_DESIGN.md](M5_DESIGN.md) 保留设计过程，部分早期范围和界面示例不代表当前实现，例如最初 M5 不包含 Claude、示例工具数量少于现在。
+面向试用者的使用说明见 [AI Assistant 使用指南](AI_ASSISTANT_USER_GUIDE.md)，构包与复验说明见 [试用包维护](../distribution/README.md)，开发接口说明见 [agent/README.md](../README.md)。[MVP_DESIGN.md](MVP_DESIGN.md) 和 [M5_DESIGN.md](M5_DESIGN.md) 保留设计过程，部分早期范围和界面示例不代表当前实现，例如最初 M5 不包含 Claude、示例工具数量少于现在。
 
 最近的功能提交：
 
@@ -28,7 +29,8 @@
 | `9e97ed3de` | GPU 计数器目录、逐事件回放耗时、采样缓存/刷新和强制恢复；D3D12 固定频率改为显式开启 |
 | `2348074f8` / `794c88579` | Claude Windows 启动修复，长系统提示通过文件传递，短提示保留内联 |
 | `9a4a88089` | Shader 引用搜索、候选扫描预算、跨查询绑定缓存和覆盖状态 |
-| 本次（2026-11-09） | Pass 资源用途、真实事件边界、前后相邻使用及共享用途缓存 |
+| `2439ca6b5` | Pass 资源用途、真实事件边界、前后相邻使用及共享用途缓存 |
+| 本次（2026-11-09） | 使用指南、Windows x64 试用包构建/环境检查/迁移验证脚本；二进制产物不入库 |
 
 ## 2. 架构、面板与历史
 
@@ -83,7 +85,7 @@
 
 ## 4. 分析扩展的实际边界
 
-### Pass 资源用途（本轮）
+### Pass 资源用途
 
 - `get_pass_resources(parent_event_id=None, start_event_id=None, end_event_id=None, kind="all", cursor=None, limit=200, scan_budget=200, refresh=false)` 默认整帧；parent 查精确 action/marker 子树，或同时传两个真实 API/执行 EID 查闭区间。parent 与 range 互斥，不从当前 UI 猜 pass。kind 为 all/texture/buffer，all 只含后两类。
 - 子树按真实 action anchors 裁剪成员集合，不只判断 owner 或数值区间。`NoChunk` 合成 marker 不作边界或成员；首个真实 action 前的 setup API 排除，孔洞不补齐。无真实 anchors 返回 UNSUPPORTED。保留 raw usage EID，actionEventId 只作标签；范围内未映射记录使 coverage 不完整，不凭邻近 action 猜归属。
@@ -186,18 +188,30 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 | 反编译 release | `<exe目录>/integrations/rendertest_agent/tools/shader_decompiler/` |
 | 默认 IPC/日志/历史根 | `%LOCALAPPDATA%/RenderTest/agent`，可用 `RENDERTEST_AGENT_ROOT` 覆盖 |
 
-最新 Bridge、Skill 和反编译 release 部署在上述原路径。使用新版本需重启 RenderTest，并新建 AI 对话刷新工具/指令。GPU 扩展已重新构建并部署原生 DLL/PDB，包含 D3D12 默认不锁频的逻辑；本轮 Pass 资源用途只涉及 Python/Skill，无需再编译原生程序。
+最新 Bridge、Skill 和反编译 release 部署在上述原路径。使用新版本需重启 RenderTest，并新建 AI 对话刷新工具/指令。GPU 扩展已重新构建并部署原生 DLL/PDB，包含 D3D12 默认不锁频的逻辑；后续 Shader 引用和 Pass 资源用途扩展只涉及 Python/Skill。本轮文档与分发脚本未重新编译原生程序。
 
 正常构建 `qrenderdoc/qrenderdoc_local.vcxproj` 会部署 Bridge 和 Skill；反编译 release 单独安装。非空安装目录只校验、不覆盖；损坏时先改名保留，再重新安装。其他安装位置用 `--output`，运行时配 `RENDERTEST_SHADER_DECOMPILER_DIR`，仍执行固定哈希检查。
 
+### Windows x64 试用交付
+
+- 使用指南源码：`agent/docs/AI_ASSISTANT_USER_GUIDE.md`，包含安装/登录、模型设置、Ask AI、历史续聊、35 个工具速查、4 个 Skill、提问示例及排障。打包时生成离线 `README.html`，无需访问网站即可阅读。
+- 构包入口：`agent/devtools/package_trial.py`；启动与检查模板在 `agent/distribution/`，具体命令见其 README。使用已验证的 Release 白名单和官方 Python 3.14.7 x64 embeddable 包，不复制开发 venv。依赖从项目约束解析，包括传递 extras；当前 MCP 1.30.0、Claude SDK 0.2.152，共 32 个第三方 Python distribution。保留 pywin32 的相对路径初始化，排除 editable、缓存、符号和 SDK 内置 Claude CLI。
+- 随包包括 app-local MSVC CRT、原生 Python 3.6、独立 MCP Python、两份 Skill 目录、6 个反编译组件及对应许可。`PACKAGE_MANIFEST.json` 记录基准源码提交、依赖版本、文件大小和 SHA-256；ZIP 总哈希单独提供。不含用户配置、认证、历史、日志或 capture，也没有 Android/32 位捕获配套文件。
+- 当前交付：`package/RenderTest-AI-Assistant-2026.11.09-win64.zip`，**79,960,014 字节**，ZIP 内顶层为短目录 `RenderTest`，共 1762 个文件。SHA-256：`2c3bac52965e03579db0cb9f7fc730321ef56cf72648b2b31e3c5b2bc2ae7d94`。同名展开目录、`.zip.sha256` 和下载输入均为本地产物；`/package/` 已被 Git 忽略，不纳入本次提交。该包清单的基准功能提交为 `2439ca6b5`，本次提交保存其构包脚本与文档，不更改已交付 ZIP。
+- 试用者完整解压到 `D:\Tools\RenderTest` 等短目录，双击 `Start-RenderTest.cmd`；它指定随包 MCP Python 和运行库路径。`Check-Environment.cmd` 做离线导入/目录检查，`tools/check_environment.py --verify-files` 可再验证全量哈希。直接运行 EXE 时需在 Settings 指定随包 MCP Python。历史仍默认写入当前用户 `%LOCALAPPDATA%/RenderTest/agent`。
+- 首次启动可能出现原生统计选项提示，按用户偏好完成后继续。每人自行安装并认证 Codex 或 Claude 原生 CLI；包内没有账号。文档明确模型会收到问题、上下文和返回的 capture 数据。
+- 已确认旧 GUI 内嵌 Python 的 Windows 长路径限制：迁移测试中 266 字符的 `cbuffer_members.py` 路径加载失败，而 259 字符的相邻模块仍可读取；短路径通过。最终 ZIP 缩短顶层名称，并在指南中建议短解压目录，未修改底层长路径实现。
+
 ## 6. 已有验证记录与复现
 
-本轮验证 Pass 资源用途与真实 capture，未重新调用在线模型。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 中的证据不跟踪到 Git，换机器后可能不存在。
+本轮验证试用包文件完整性、独立依赖和迁移后的真实 capture 工具调用，未调用在线模型，也未重新运行无改动的分析工具全套测试；其最新全套结果来自 `2439ca6b5`。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 和下列 `E:/Captures/TrialValidation/` 证据不跟踪到 Git，换机器后可能不存在。
 
 | 范围 | 已有结果与边界 |
 | --- | --- |
-| 最新 Python 全套 | `1586 passed`（68.85 秒）；在宿主环境运行，测试临时文件限定在工作区。不是对所有 GPU/API 的保证 |
-| Skill | 四份 Skill 均通过 validator；本轮更新 core/event-analysis，部署两份 Skill 副本并逐字节核对 |
+| 试用包完整性 | 最终 ZIP 的 CRC、1761 个清单文件（清单自身除外）的大小/SHA-256、ZIP 总哈希均通过；原生程序和运行库与此前独立审计包逐字节相同。无开发 venv、editable/个人路径安装信息、用户数据、capture 或构建符号 |
+| 试用包迁移与实际 capture | 最终 ZIP 解压到新的含空格路径，使用包内 Python `-I`/`_pth`；依赖与所有导入来源、Claude SDK/backend 导入、离线全文件检查、4 个 Skill 和真实 stdio MCP 的 35 工具目录通过。独立隐藏 GUI 加载 `pragmata1.rdc`，parent 7726 的一次有界 get_pass_resources 查询访问 28 个候选并返回 3 行和 nextCursor，UI EID 7708 不变；临时 Qt 配置路径已确认，真实用户 UI/layout 哈希保持，自建进程退出。未启动 harness 或调用模型，不等于验证所有干净 Windows/GPU 环境 |
+| 最新 Python 全套 | `2439ca6b5` 时 `1586 passed`（68.85 秒）；在宿主环境运行，测试临时文件限定在工作区。不是对所有 GPU/API 的保证 |
+| Skill | 四份 Skill 均通过 validator；Pass 资源扩展更新 core/event-analysis，部署两份 Skill 副本并逐字节核对；试用包保持相同正文 |
 | Pass 资源 D3D12 | `pragmata1.rdc` 子树 7726，真实边界 3820..3901：25 个资源（11 texture / 14 buffer）。全部用途分类/计数/示例/邻接 EID 组与独立原生 GetUsage 相同；2540 候选资源每代各读取一次，首次+refresh 共 5080 次。资源 9131 的 Barrier@3819 不进入 parent，但在显式 3819..3820 区间保留 raw EID，owner 3820 只作标签。跨范围/kind 缓存零新增读取、空页续扫和旧游标失效通过；零 SetFrameEvent，UI EID 7708、资源 244 的 `(128,64)` 及管线保持不变，配置保留、自建进程退出 |
 | Pass 资源 Vulkan | `恋与深空尝试截帧.rdc` 子树 2712，真实边界 1696..1722：45 个资源（17 texture / 28 buffer），每代 18 页。711 候选资源首次+refresh 共 1422 次 GetUsage，逐资源原始记录哈希、分类/计数/示例/邻接组与独立原生记录一致；跨范围/kind/空区间只读缓存，旧游标刷新后失效。零 SetFrameEvent，UI EID 2701、资源 4543 的 `(2,2)` 及管线保持不变，配置保留、自建进程退出。这两份样本的成功不等于所有 API/驱动均已实测 |
 | Shader 引用 D3D12 | `pragmata1.rdc` 子树 3738：14 action / 12 draw，PS 297113 在 12 个 draw 绑定，VS 251109 同样可由缓存查询。所有引用 stage/入口/父 EID 与独立原生读取相同；首次+refresh 共 24 次候选扫描，每个 draw 的五个相关阶段（含未绑定阶段）恰读取两次，共 120 次 GetShader。UI EID 3820、资源 390180 的 `(340,576)` 在扫描后变化、force 后逐位恢复；fatal 为 Success，配置与 UI 选择保持，自建进程退出 |
@@ -215,6 +229,7 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 
 本地成功证据索引（相对仓库根目录）：
 
+- 最终试用 ZIP：`E:/Captures/TrialValidation/Trial Smoke 9ebad3609b90/report.json`（绝对路径），对应上述最终 ZIP SHA-256；其 `worker-report.json` 保留包内 Python/模块来源、原生 Bridge 路径、完整 stdio 工具目录、capture 返回结果、UI 状态与进程清理证据。旧长目录失败及脚本修正前报告仅用于诊断，不作为成功证据。
 - Claude GUI 与续聊：`agent/.agent-data/claude-gui-live-0880543f97a54e6aa3fb65ced7e1a938/summary.json`；其 `live-protocol/6cd95942-2898-4a61-9adb-a873380eb712/report.json` 为两轮在线验证成功报告。
 - 第一批：`agent/.agent-data/analysis-live-0275182cedf74d52bea35c08d754fa20/report.json`。
 - 第二批：`agent/.agent-data/second-batch-live-a48e9316f65143bbbcd942bc367c6905/report.json`。
@@ -227,7 +242,7 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 - 原生构建：`agent/.agent-data/gpu-counter-build/build.log`；部署 SHA-256 和旧 DLL/PDB 备份路径见该目录 `deployment.json`。这些二进制不提交 Git。
 - GPU 扩展的 Python 全套：`agent/.agent-data/gpu-counter-tests-final.xml`。该次同时改进既有 Windows 子进程测试的就绪等待及句柄观察，保留原超时/退出断言，产品反编译 runner 未改。之后 Claude 启动与校验改动已由独立提交完成。
 - Shader 引用搜索 Python 全套：`agent/.agent-data/shader-reference-tests-final.xml`，包含当时 34 工具目录、schema/IPC/fake、覆盖/缓存/取消/恢复与范围和字节预算回归。
-- 本轮 Pass 资源 Python 全套：`agent/.agent-data/pass-resource-tests-final.xml`，覆盖 35 工具目录、严格 schema/IPC/fake、合成 marker 与 API 范围、未知用途/归属、重复资源/记录、分页缓存/刷新原子性、取消/失败与预算；新增 Bridge 测试禁止任何 SetFrameEvent。
+- Pass 资源 Python 全套：`agent/.agent-data/pass-resource-tests-final.xml`，覆盖 35 工具目录、严格 schema/IPC/fake、合成 marker 与 API 范围、未知用途/归属、重复资源/记录、分页缓存/刷新原子性、取消/失败与预算；新增 Bridge 测试禁止任何 SetFrameEvent。
 - Pass 资源 D3D12：`agent/.agent-data/pass-resources-live-77023112b4404b82a8b378f77bdb201a/report.json`；同目录 native reference/observations 保留全量用途、同源哈希、每代读取次数、零回放移动与像素/管线证据。早期 probe 和验收脚本断言修正前的失败记录不作为最终证据。
 - Pass 资源 Vulkan：`agent/.agent-data/pass-resources-live-23a34053bd59494b8178378668de9220/report.json`；同目录保留相同结构的原生参考与观察记录。两次最终验收均使用 README 的最简命令，guard 由当前输出或首个有效 2D 纹理自动选择，不额外切换事件。
 - Shader 引用 D3D12：`agent/.agent-data/shader-references-live-2d78df52758f4edf9ec3500885bc9aeb/report.json`；Vulkan：`agent/.agent-data/shader-references-live-ad46b262eafa49cea6c498676d2117bb/report.json`。各目录的 `native-reference.json` / `native-observations.json` 保留独立绑定、逐阶段读取次数、采样点及恢复证据。
@@ -262,15 +277,19 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\gpu_counters_live.py --
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\shader_references_live.py --launch E:/Captures/pragmata1.rdc --parent-event 3738 --event 3820 --guard-resource 390180 --guard-point 340 576
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\shader_references_live.py --launch "E:/Captures/恋与深空尝试截帧.rdc" --parent-event 2712 --event 27 --guard-resource 72716
 
-# 本轮 Pass 资源用途：原始记录逐项比较、边界/缓存/分页与零回放移动
+# Pass 资源用途：原始记录逐项比较、边界/缓存/分页与零回放移动
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\pass_resources_live.py --launch E:/Captures/pragmata1.rdc --parent-event 7726
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\pass_resources_live.py --launch "E:/Captures/恋与深空尝试截帧.rdc" --parent-event 2712
+
+# 试用包迁移：使用较短的临时根，脚本仍创建含空格的新目录
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\trial_package_smoke.py --package package/RenderTest-AI-Assistant-2026.11.09-win64.zip --capture E:/Captures/pragmata1.rdc --parent-event 7726 --work-dir E:/Captures/TrialValidation
 ```
 
 `decompile_live.py`、`event_inspection_live.py`、`compute_debug_live.py`、`gpu_counters_live.py`、`shader_references_live.py` 和 `pass_resources_live.py` 会创建独立隐藏 GUI 进程、关闭该进程的配置写入、固定实例/session、校验产物/结果及用户配置哈希，最后只关闭自己启动的进程。不要把用户正在使用的 GUI 当成测试进程关闭。在线 Claude/Codex 验证命令及环境配置见 README；已有通过记录不代表当前账号登录状态无需检查。
 
 ## 7. 已知问题及尚不支持的能力
 
+- 试用包请解压到短目录。旧 GUI 内嵌 Python 的 Windows 长路径限制可能使已存在的 Bridge 子模块无法导入；缩短路径可规避，底层支持未改。独立 MCP Python 3.14 不替代 GUI 内嵌 Python 3.6。
 - 在 `pragmata1.rdc` 的更广泛 `--all-p0` 检查中，曾出现 pixel_history 与 pick_pixel 结果不一致，以及 EID 3014 的 mesh/debug_vertex 对比不一致。已用扩展前的旧 Bridge 复现，未在这几批工具中修复。基线证据为 `agent/.agent-data/analysis-live-fef62ba077cd4171bc4bb05b5e580f7b/report.json`；不要把专项通过描述为这些旧问题已解决。
 - `pragmata1.rdc` EID 3820 的 GBuffer 资源 390180/390179/390177 各中心像素，在完全不调用 counters、仅重复 force replay 时也会变化。GPU 恢复验收改用经独立基线证明稳定、对采样敏感的资源 390195，保持逐位比较，未用容差掩盖差异。无采样控制证据：`agent/.agent-data/gpu-stability-control-38ec3e9a6d63463d9b4da1baf256806b/control.json`。这不意味着已修复 capture 重复回放的非确定性。
 - 当前没有任意 vendor GPU counter 采样。Pass 资源用途已加入，但没有实际字节/像素依赖或引擎 RDG 图；Shader 绑定引用搜索不支持 ray shader table；Compute 调试不支持非零 dispatch base、ray/mesh Shader 调试。
