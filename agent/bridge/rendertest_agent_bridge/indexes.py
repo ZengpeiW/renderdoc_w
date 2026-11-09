@@ -49,6 +49,9 @@ class ActionIndex(object):
         self.order = []
         self.roots = []
         self.owner = {}
+        # Keep only primitive API-event metadata here, never native structured-data objects.
+        self.api_events = {}
+        self.action_api_events = {}
         self.last_event_id = 0
 
     @classmethod
@@ -61,8 +64,16 @@ class ActionIndex(object):
             children = list(action.children)
             node = cls._describe(action, structured, parent, children)
             event_id = node["eventId"]
+            api_events = []
             for event in action.events:
-                index.owner[int(event.eventId)] = event_id
+                api_event_id = int(event.eventId)
+                chunk_index = getattr(event, "chunkIndex", None)
+                record = {"apiEventId": api_event_id, "actionEventId": event_id,
+                          "chunkIndex": None if chunk_index is None else int(chunk_index)}
+                api_events.append(record)
+                index.api_events[api_event_id] = record
+                index.owner[api_event_id] = event_id
+            index.action_api_events[event_id] = api_events
             index.owner[event_id] = event_id
             index.nodes[event_id] = node
             index.order.append(event_id)

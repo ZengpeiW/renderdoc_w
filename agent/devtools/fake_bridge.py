@@ -367,6 +367,84 @@ class FakeRenderTestBridge:
             self._read_meta(params.get("event_id")),
         )
 
+    def _method_get_api_calls(self, params: dict[str, Any]) -> BridgeResult:
+        # Each fixture action has one setup call followed by its action call. API EIDs
+        # intentionally differ from action EIDs so the transport tests cannot conflate them.
+        owners = {event: event for event in self._actions}
+        owners.update({event - 1: event for event in self._actions if event > 1})
+        api_event = params.get("api_event_id")
+        event = params.get("event_id", api_event if api_event is not None else self.current_event_id)
+        if event not in owners or (api_event is not None and api_event not in owners):
+            raise AgentBridgeError("INVALID_EVENT", "The API event does not exist.")
+        owner = owners[event]
+        if api_event is not None and owners[api_event] != owner:
+            raise AgentBridgeError("INVALID_REQUEST", "The API event has a different action owner.")
+        if api_event is None:
+            calls = [{"apiEventId": eid, "actionEventId": owner, "chunkIndex": eid,
+                      "name": "SetBindings" if eid != owner else self._actions[owner]["name"],
+                      "available": True, "parameterCount": 3}
+                     for eid in ([owner - 1, owner] if owner > 1 else [owner])]
+            page, cursor = self._page(calls, params)
+            return BridgeResult(_payload({"mode": "calls", "eventId": event,
+                                           "actionEventId": owner, "calls": page,
+                                           "total": len(calls)}, next_cursor=cursor), self._read_meta())
+        tree = {"name": "parameters", "type": "Chunk", "typeName": "API call", "members": [
+            {"name": "Resource", "type": "Resource", "typeName": "ResourceId", "value": "2001"},
+            {"name": "Count", "type": "UnsignedInteger", "typeName": "uint32_t", "value": 3},
+            {"name": "Region", "type": "Struct", "typeName": "Range", "members": [
+                {"name": "Min", "type": "Float", "typeName": "float", "value": 0.0},
+                {"name": "Max", "type": "Float", "typeName": "float", "value": 1.0},
+            ]},
+        ]}
+        path = params.get("parameter_path", "")
+        selected = tree
+        try:
+            indices = [] if not path else [int(index) for index in path[1:-1].split("][")]
+            for index in indices:
+                selected = selected.get("members", [])[index]
+        except (ValueError, IndexError):
+            raise AgentBridgeError("INVALID_REQUEST", "The parameter path does not exist.")
+
+        def project(node, node_path, depth):
+            members = node.get("members", [])
+            value = {key: value for key, value in node.items() if key != "members"}
+            value.update(canonicalPath=node_path, childCount=len(members),
+                         membersTruncated=bool(members) and depth <= 0)
+            if members and depth > 0:
+                value["members"] = [project(child, node_path + f"[{index}]", depth - 1)
+                                    for index, child in enumerate(members)]
+            return value
+
+        children = [project(child, path + f"[{index}]", params.get("max_depth", 0))
+                    for index, child in enumerate(selected.get("members", []))]
+        page, cursor = self._page(children, params)
+        data = {"mode": "parameters", "apiEventId": api_event, "actionEventId": owner,
+                "chunkIndex": api_event, "name": self._actions[owner]["name"], "available": True,
+                "parameterPath": path, "canonicalPath": path, "selected": project(selected, path, 0),
+                "parameters": page, "childCount": len(children)}
+        return BridgeResult(_payload(data, next_cursor=cursor), self._read_meta())
+
+    def _method_compare_events(self, params: dict[str, Any]) -> BridgeResult:
+        before = self._event_id({"event_id": params["before_event_id"]})
+        after = self._event_id({"event_id": params["after_event_id"]})
+        left = self._pipeline(before, params.get("stages"))
+        right = self._pipeline(after, params.get("stages"))
+        left.pop("eventId")
+        right.pop("eventId")
+        differences = []
+        for key in sorted(set(left) | set(right)):
+            if left.get(key) != right.get(key):
+                differences.append({"path": "/pipeline/" + key,
+                                    "before": {"present": key in left, "value": left.get(key)},
+                                    "after": {"present": key in right, "value": right.get(key)}})
+        page, cursor = self._page(differences, params)
+        data = {"beforeEventId": before, "afterEventId": after,
+                "comparison": "different" if differences else "equal-in-scope",
+                "differences": page, "totalDifferences": len(differences), "totalDifferencesExact": True,
+                "coverage": {"complete": True, "fixture": True,
+                             "cbufferSelections": params.get("cbuffers", [])}}
+        return BridgeResult(_payload(data, next_cursor=cursor), self._read_meta(after))
+
     def _method_get_action_stats(self, params: dict[str, Any]) -> dict[str, Any]:
         parent = params.get("parent_event_id")
         root = 1 if parent is None else self._event_id({"event_id": parent})

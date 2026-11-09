@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .artifacts import ArtifactReader, DEFAULT_PAGE_BYTES, MAX_PAGE_BYTES
 from .errors import RenderTestAgentError
@@ -67,9 +67,30 @@ StrictOptionalParentId = Annotated[
           description="Action or marker EID selecting a subtree. Omit to summarize the whole frame."),
 ]
 StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+StrictEventId = Annotated[int, Field(strict=True, ge=0, le=0xFFFFFFFF)]
+StrictNullableEventId = Annotated[int | None, Field(strict=True, ge=0, le=0xFFFFFFFF)]
 StrictLimit = Annotated[
     int, Field(strict=True, ge=1, le=1000, description="Maximum number of items to return.")
 ]
+StrictDepth = Annotated[int, Field(strict=True, ge=0, le=4)]
+
+
+class ComparisonCBuffer(BaseModel):
+    """One bounded constant-block selection for an event comparison."""
+
+    model_config = ConfigDict(extra="forbid")
+    stage: Stage
+    index: StrictNonNegativeInt | None = None
+    name: Annotated[str | None, Field(strict=True, min_length=1, max_length=256)] = None
+    member_path: Annotated[str, Field(strict=True, max_length=4096)] = ""
+    max_depth: StrictDepth = 1
+    member_limit: StrictLimit = 200
+
+    @model_validator(mode="after")
+    def require_one_selector(self) -> ComparisonCBuffer:
+        if (self.index is None) == (self.name is None):
+            raise ValueError("INVALID_REQUEST: Each CBuffer requires exactly one of index or name.")
+        return self
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "export_overlay", "get_buffer_data", "pixel_history",
                                    "debug_pixel", "debug_vertex", "get_mesh_data", "decompile_shader"})
@@ -92,15 +113,18 @@ def _clean_params(**params: Any) -> dict[str, Any]:
     return {key: value for key, value in params.items() if value is not None}
 
 
-class _CBufferMetadata(FuncMetadata):
+class _LiteralPathMetadata(FuncMetadata):
+    literal_fields: tuple[str, ...] = ()
+
     def pre_parse_json(self, data: dict[str, Any]) -> dict[str, Any]:
         # FastMCP 1.x JSON-decodes nullable strings before Pydantic validation. Member
         # paths such as [1], ["name"] and null must remain literal strings; actual
         # JSON arrays/objects still go through the unchanged string field validator.
-        other = {key: value for key, value in data.items() if key != "member_path"}
+        other = {key: value for key, value in data.items() if key not in self.literal_fields}
         parsed = super().pre_parse_json(other)
-        if "member_path" in data:
-            parsed["member_path"] = data["member_path"]
+        for key in self.literal_fields:
+            if key in data:
+                parsed[key] = data[key]
         return parsed
 
 
@@ -165,12 +189,14 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         def register(function: Any) -> Any:
             annotations = _ANNOTATIONS[tool_effect(function.__name__)]
             registered = server.tool(annotations=annotations, **options)(function)
-            if function.__name__ == "get_cbuffer":
+            literal_fields = {"get_cbuffer": ("member_path",),
+                              "get_api_calls": ("parameter_path",)}.get(function.__name__)
+            if literal_fields:
                 # FastMCP exposes no per-argument pre-parser option. Keep this adapter
-                # local to the one tool, retaining its generated input/output schemas.
+                # local to path-bearing tools, retaining generated input/output schemas.
                 entry = server._tool_manager.get_tool(function.__name__)
                 metadata = entry.fn_metadata
-                entry.fn_metadata = _CBufferMetadata(**{
+                entry.fn_metadata = _LiteralPathMetadata(literal_fields=literal_fields, **{
                     key: getattr(metadata, key) for key in type(metadata).model_fields
                 })
             return registered
@@ -297,6 +323,74 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
         """Summarize an action, its shaders, outputs and main bound resources."""
         return await invoke(
             "inspect_event", _clean_params(event_id=event_id), instance_id=instance_id
+        )
+
+    @tool()
+    async def get_api_calls(
+        event_id: StrictNullableEventId = None,
+        api_event_id: StrictNullableEventId = None,
+        parameter_path: Annotated[
+            str | None, Field(strict=True, max_length=4096, pattern=r"^(?:\[[0-9]+\]){0,64}$")
+        ] = None,
+        cursor: Cursor = None,
+        limit: StrictLimit = 100,
+        max_depth: StrictDepth = 0,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Page the captured API calls belonging to an action, or inspect one call's parameters.
+
+        Omit api_event_id to list calls owned by event_id (default: current UI event). Pass
+        an exact returned apiEventId to inspect that call; an explicit event_id must have
+        the same owner. parameter_path is an ordinal path such as [0][2]; an empty string
+        selects the parameter root. max_depth=0 returns direct leaf values and metadata for
+        nested structures, which can be expanded using their canonicalPath. NoChunk and
+        unavailable data are reported explicitly. These are RenderDoc serialized fields,
+        which may include internal/return fields, not a guaranteed verbatim API transcript.
+        Large raw buffer contents are unavailable. This does not change the UI event.
+        """
+        if api_event_id is None and parameter_path is not None:
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "parameter_path requires api_event_id."))
+        return await invoke(
+            "get_api_calls",
+            _clean_params(event_id=event_id, api_event_id=api_event_id,
+                          parameter_path=parameter_path, cursor=cursor, limit=limit,
+                          max_depth=max_depth),
+            instance_id=instance_id,
+        )
+
+    @tool()
+    async def compare_events(
+        before_event_id: StrictEventId,
+        after_event_id: StrictEventId,
+        stages: list[Stage] | None = None,
+        include_bindings: Annotated[bool, Field(strict=True)] = True,
+        binding_limit: Annotated[int, Field(strict=True, ge=1, le=256)] = 64,
+        cbuffers: Annotated[list[ComparisonCBuffer] | None, Field(max_length=8)] = None,
+        cursor: Cursor = None,
+        limit: StrictLimit = 200,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Compare two EIDs in the current capture and page their structured differences.
+
+        Compares shaders, selected pipeline state and optionally used bindings. Up to eight
+        CBuffer selections may name one stage and exactly one index/name, plus an optional
+        member_path, max_depth (default 1) and member_limit (default 200). Empty member_path
+        selects the block root. JSON Pointer difference paths distinguish missing from null.
+        Read coverage and warnings: viewport/scissor 0, used descriptors and bounded CBuffer
+        members are a limited scope. equal-in-scope does not mean identical rendered output;
+        unavailable/truncated input can make a zero-difference comparison indeterminate.
+        Both EIDs are read within one capture session and the UI event is restored.
+        """
+        selections = ([item.model_dump(exclude_none=True) for item in cbuffers]
+                      if cbuffers is not None else None)
+        return await invoke(
+            "compare_events",
+            _clean_params(before_event_id=before_event_id, after_event_id=after_event_id,
+                          stages=stages, include_bindings=include_bindings,
+                          binding_limit=binding_limit, cbuffers=selections,
+                          cursor=cursor, limit=limit),
+            instance_id=instance_id,
         )
 
     @tool()

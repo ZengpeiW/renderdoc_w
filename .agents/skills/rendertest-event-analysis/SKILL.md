@@ -1,6 +1,6 @@
 ---
 name: rendertest-event-analysis
-description: Explain a RenderDoc event, draw, dispatch or pass in RenderTest, or summarize frame/pass operations and texture/buffer footprint. Use for EID/pass purpose, inputs and outputs, event counts, workload rankings or resource-size questions.
+description: Explain a RenderDoc event, draw, dispatch or pass in RenderTest, or summarize frame/pass operations and texture/buffer footprint. Use for EID/pass purpose, inputs and outputs, raw API parameters, differences between events, event counts, workload rankings or resource-size questions.
 ---
 
 # Explain an event
@@ -13,6 +13,21 @@ Follow `rendertest-core`.
 - Find events by name or type with `find_actions(query=..., flags=[...])`, for example flags `["draw"]`, `["dispatch"]` or `["clear"]`. An empty query filters by type only.
 - For the surrounding pass, read the `path` returned by `find_actions` or `inspect_event`, or expand markers with `list_actions(parent_event_id=...)`.
 - The EID may be a marker or a non-action API event. `inspect_event` reports `isAction` and the owning `action`.
+
+## Recorded API calls and parameters
+
+- For exact clear/copy/barrier/draw parameters, call `get_api_calls(event_id=...)`. It lists the API calls belonging to that action; a non-action EID resolves to its owner. Page `calls` with `nextCursor`.
+- Choose a returned `apiEventId` and call `get_api_calls(api_event_id=...)` for its root `parameters`. This reads that exact API call, not its owner draw. If you also pass `event_id`, it must have the same owner.
+- Copy a returned `canonicalPath` such as `[2][0][1]` into `parameter_path` to select a field or array element. Paths are child ordinals, not names; hidden fields and duplicate names retain their positions. `selected.value` holds a scalar; `parameters` pages direct children. `max_depth=0` is shallow; 1-4 expand descendants within response limits. Keep the same target/path/depth when paging.
+- Read `available`/`reason` before explaining a chunk. RenderDoc serialized fields can contain internal/return data; `flags` and `displayValue` help interpret them. ResourceIds and large integers retain exact string representations. Raw Buffer payloads are omitted, and truncated strings are previews. `childCount`, `membersTruncated`, `nextCursor` and warnings identify missing data.
+
+## Compare two events
+
+- Call `compare_events(before_event_id=..., after_event_id=...)` for Shader identities, used bindings, input assembly, output targets and exposed raster/depth/stencil/blend state. Narrow `stages` or use `include_bindings=false` when appropriate. The tool compares exact replay EIDs, including non-action API events, and restores replay afterwards.
+- Read `coverage.scope`: only viewport/scissor 0 and constant-block array element 0 are represented; graphics sections depend on the owning action. Lists match by position. Resource contents, shader text and unselected constant values are excluded. Binding limits or unavailable reflection can leave coverage incomplete.
+- Add selected values with `cbuffers=[{"stage":"pixel","name":"SceneInfo","member_path":"viewProjMat","max_depth":0}]`. Each selection takes exactly one of `name` or `index`; use `get_shader`/`get_cbuffer` to find it. At most 8 selections; select a deep member instead of expanding an entire large block. Layout and binding changes are evidence too: equal child ordinals across different layouts do not establish the same meaning.
+- `differences` contains JSON Pointer `path`s and before/after values with explicit `present` flags. Missing and null differ. `comparison="different"` means an observed change; `equal-in-scope` requires complete coverage; `indeterminate` means no observed change but missing evidence. Report incomplete coverage even if some differences were found. `totalDifferencesExact=false` means a lower bound because input coverage is incomplete or the difference budget was reached; `coverage.differencesComplete=false` specifically identifies omitted diff rows.
+- Page differences using the same selection and `nextCursor`. Pages belong to a cached snapshot, with only the two most recent comparisons retained. A request without a cursor reads a fresh snapshot and invalidates older cursors for that query; if a snapshot expires, restart without a cursor. Never merge pages from different snapshots or captures. Use texture/pixel tools for changes to rendered contents.
 
 ## Frame and pass summaries
 

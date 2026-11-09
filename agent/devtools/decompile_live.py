@@ -78,7 +78,7 @@ class Check:
         self.server = create_server(client)
         self.timings: list[dict[str, Any]] = []
         names = {item.name for item in asyncio.run(self.server.list_tools())}
-        require(names == set(TOOL_NAMES) and len(names) == 28, "Expected the 28-tool MCP catalog.")
+        require(names == set(TOOL_NAMES), "Expected the current MCP catalog.")
 
     def call(self, name: str, **params: Any) -> dict[str, Any]:
         started = time.monotonic()
@@ -224,7 +224,7 @@ def main() -> int:
         report["instance"] = instance
         report["configWriterClosed"] = marker.read_text() == "closed"
         check = Check(root / "ipc", instance)
-        report["toolCount"] = 28
+        report["toolCount"] = len(TOOL_NAMES)
         before = check.ui_event()
         report["uiEventBefore"] = before
         report["sources"] = {}

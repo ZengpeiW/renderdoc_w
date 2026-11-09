@@ -66,6 +66,8 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "find_actions": {"query": "draw", "flags": ["draw"]},
             "get_action_stats": {"parent_event_id": 1, "limit": 2, "top_n": 1},
             "inspect_event": {"event_id": 30},
+            "get_api_calls": {"event_id": 30, "limit": 1},
+            "compare_events": {"before_event_id": 10, "after_event_id": 30},
             "set_event": {"event_id": 20},
             "get_pipeline_state": {"event_id": 20},
             "get_shader": {"event_id": 30, "stage": "pixel", "include_disassembly": True},
@@ -105,6 +107,15 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["list_actions"]["nextCursor"] == "2"
     assert results["set_event"]["effect"] == "ui"
     assert results["set_event"]["data"]["eventIdAfter"] == 20
+    assert results["get_api_calls"]["data"]["calls"][0]["apiEventId"] == 29
+    assert results["get_api_calls"]["data"]["actionEventId"] == 30
+    assert results["get_api_calls"]["nextCursor"]
+    assert results["get_api_calls"]["effect"] == "read"
+    assert results["compare_events"]["effect"] == "read"
+    assert results["compare_events"]["data"]["beforeEventId"] == 10
+    assert results["compare_events"]["data"]["afterEventId"] == 30
+    assert results["compare_events"]["meta"]["eventIdBefore"] == 10
+    assert results["compare_events"]["meta"]["eventIdAfter"] == 10
     assert results["get_buffer_data"]["data"]["hex"] == "04050607"
     assert results["pixel_history"]["data"]["summary"]["lastPassedEventId"] == 10
     assert results["debug_pixel"]["data"]["outputs"][0]["name"] == "SV_Target0"
@@ -169,3 +180,29 @@ def test_cbuffer_member_projection_paging_and_leaf_through_mailbox(tmp_path: Pat
         leaf = structured(call_tool(server, "get_cbuffer", dict(params, member_path=child["canonicalPath"])))
         assert leaf["data"]["selected"]["value"] == [1.0]
         assert leaf["data"]["variables"] == []
+
+
+def test_api_call_parameter_expansion_and_comparison_do_not_move_ui(tmp_path: Path) -> None:
+    with FakeRenderTestBridge(tmp_path) as bridge:
+        server = create_server(BridgeClient(root=tmp_path, environ={}, poll_interval=0.005))
+        original = bridge.current_event_id
+        first = structured(call_tool(server, "get_api_calls", {"event_id": 30, "limit": 1}))
+        second = structured(call_tool(server, "get_api_calls", {
+            "event_id": 30, "limit": 1, "cursor": first["nextCursor"]}))
+        assert [first["data"]["calls"][0]["apiEventId"],
+                second["data"]["calls"][0]["apiEventId"]] == [29, 30]
+        leaf = structured(call_tool(server, "get_api_calls", {
+            "api_event_id": 29, "parameter_path": "[1]"}))
+        assert leaf["data"]["selected"]["value"] == 3
+        assert leaf["data"]["selected"]["canonicalPath"] == "[1]"
+        assert leaf["data"]["parameters"] == []
+        nested = structured(call_tool(server, "get_api_calls", {
+            "api_event_id": 29, "parameter_path": "[2]", "limit": 1}))
+        assert nested["data"]["parameters"][0]["canonicalPath"] == "[2][0]"
+        assert nested["nextCursor"]
+        equal = structured(call_tool(server, "compare_events", {
+            "before_event_id": 30, "after_event_id": 30,
+            "cbuffers": [{"stage": "pixel", "index": 0, "member_path": "[1]"}]}))
+        assert equal["data"]["comparison"] == "equal-in-scope"
+        assert equal["data"]["coverage"]["cbufferSelections"][0]["member_path"] == "[1]"
+        assert bridge.current_event_id == original

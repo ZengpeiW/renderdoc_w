@@ -24,7 +24,7 @@ description: Shared rules for inspecting a RenderDoc capture open in RenderTest 
 ## Tool effects
 
 - Every result has an `effect`: `read`, `ui` (changes the RenderTest UI) or `artifact` (writes files, the capture is unchanged).
-- Read tools that take `event_id` replay that event temporarily and restore the previous one. They do not change the UI selection, so do not describe them as jumping to an EID.
+- Read tools preserve the UI selection. Tools that temporarily replay another EID restore it afterwards; `get_api_calls` reads recorded metadata without moving replay. Do not describe a read as jumping to an EID.
 - `set_event` is the only tool that moves the UI. Call it only when the user wants to navigate there.
 - Modifying the capture, editing or replacing shaders and editing constant buffers are not supported. Say so instead of pretending.
 
@@ -35,6 +35,8 @@ description: Shared rules for inspecting a RenderDoc capture open in RenderTest 
 - Carry `truncated=true` results and `warnings` into the conclusion.
 - Large data comes back as artifact files with path, size and SHA-256. Read returned text with `read_artifact(path=..., start_line=..., limit=..., search=...)`; it only accepts artifacts returned in this MCP process. To see a texture use `export_texture(include_image=true)` instead of guessing from its path.
 - For texture/buffer footprint, use `get_resource_stats(kind="all", top_n=20)`. `knownTotalBytes` sums resource-description sizes, not resident, peak or unique allocation memory; aliased resources may share memory. Report `unknownSizeCount` and `totalBytesComplete`, and do not treat top-N entries or capped distributions as a complete resource list. `get_texture_stats` measures texture pixel values, not resource footprint.
+- For recorded API arguments use `get_api_calls`: `apiEventId` is the actual API call and `actionEventId` is its owner. Do not replace one with the other or invent parameters for an unavailable chunk. Serialized internal fields and buffer metadata are not guaranteed original application arguments.
+- For two EIDs in this capture use `compare_events(before_event_id=..., after_event_id=...)`. Read `coverage`, `comparison`, `totalDifferencesExact`, warnings and all relevant pages. `equal-in-scope` covers only the requested, exposed state; zero observed differences with incomplete coverage is `indeterminate`. Binding equality does not imply identical resource contents.
 - For frame/pass composition use `get_action_stats`. Its operation counts and workload rankings are action-tree metadata, not triangles or GPU timings. Read `countingPolicy` and warnings before comparing scopes.
 - `export_overlay(resource_id=..., event_id=..., overlay=..., include_image=true)` produces an opaque diagnostic PNG using a temporary replay output. Read its `legend`, `warnings` and `displayTransform`. It may be downscaled; image coordinates are not automatically original texture coordinates. Overlay colors are visual diagnostics, not texture values, fragment counts or GPU timings. Use `pick_pixel` or `pixel_history` for measured values.
 - Render target alpha is often 0 or holds data, which makes an RGBA image look blank. Export with `channels="rgb"` (PNG without alpha) or a single channel to see the colour.

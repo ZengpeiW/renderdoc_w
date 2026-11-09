@@ -9,14 +9,14 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
 - M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
-- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、资源大小统计、事件统计、CBuffer 成员查询和单 EID Overlay；当前共 28 个 MCP 工具，Codex 和 Claude 共用。
+- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数和事件差异；当前共 30 个 MCP 工具，Codex 和 Claude 共用。
 
 ## P0 工具
 
 | 分类 | 工具 |
 | --- | --- |
 | 实例/上下文 | `list_instances`、`get_status`、`get_context`（含当前 EID 的 Pipeline 摘要） |
-| Action | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`set_event`（唯一会改变 UI 的工具） |
+| Action | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`get_api_calls`、`compare_events`、`set_event`（唯一会改变 UI 的工具） |
 | Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`decompile_shader`（生成 HLSL/GLSL）、`get_cbuffer`（支持成员路径和子成员分页） |
 | 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
@@ -40,6 +40,34 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - Overlay 是 `artifact` 操作，不移动 UI 选中事件，也不修改 Texture Viewer 设置；输出始终在 `finally` 释放，并强制恢复共享诊断资源。图像是 8-bit RGB 可视化，默认最长边 1024，`max_dimension` 上限 4096，并受 2M 输出像素预算约束。源纹理及关联深度纹理限制为 16M 存储 texel（包括 mip/slice/sample），超限或 API 不支持时明确报错。结果提供 `legend`、原始/输出尺寸及 `displayTransform`；不要把缩放后的坐标、诊断色或 Overdraw 热图当作原始像素值、精确写入次数或 GPU 耗时。需要实际看图时指定 `include_image=true`。
 
 例如：“读取当前 Pixel Shader 的 Lights 数组第 123 项 Color”、“分页查看这个常量缓冲后面的成员”、“导出当前 Draw 的深度测试和背面剔除 Overlay，解释哪些区域被挡住”。
+
+## API 参数与事件比较
+
+`get_api_calls(event_id=None, api_event_id=None, parameter_path=None, cursor=None, limit=100, max_depth=0)` 读取 capture 中的结构化 API 记录，不移动 replay 或 UI。省略 `api_event_id` 时，列出 `event_id` 所属 action 的调用；非 action EID 也可作为入口，`eventId` 与 `actionEventId` 分别保留查询 EID 和 owner。指定列表中的 `api_event_id` 时读取该真实 API 调用的参数；若同时指定 `event_id`，两者必须属于同一 action。
+
+- 根参数返回在 `parameters`；复制 `canonicalPath`（如 `[2][0][1]`）到 `parameter_path` 可读取深层成员。路径按子节点序号定位，保留隐藏字段和重复名称。`selected.value` 是选中的标量，`parameters` 分页浏览其直接子节点。
+- `limit` 为 1–1000，`max_depth` 为 0–4；每页最多 4096 节点、256 KiB，路径最多 64 层。继续同级用 `nextCursor`，深入成员用路径；游标绑定 session、调用和查询范围。超长字符串只返回预览。
+- 保留类型、flags、显示文本和精确 ResourceId；超过 JSON 安全整数范围的数值使用十进制字符串，GPUAddress 使用十六进制字符串。序列化 Buffer 只提供元数据，不读取其 payload。NoChunk、越界或缺失 chunk 明确 `available=false`。
+- 数据来自 RenderDoc 的序列化结构，可能包含返回值或内部字段，不能保证每项都是应用原始实参。不要把 owner draw 的参数当成指定 API EID 的参数。
+
+`compare_events(before_event_id, after_event_id, stages=None, include_bindings=true, binding_limit=64, cbuffers=None, cursor=None, limit=200)` 比较同一 capture 两个精确 EID 的归一化管线状态，包括 Shader、已使用的绑定、输入装配、目标及已暴露的光栅/深度/模板/混合状态。读取后恢复 replay，`effect=read`。
+
+- `differences` 按 JSON Pointer `path` 返回 before/after；`present=false` 与 `value=null` 不同。容器类型变化行标记 `kind="type-change"`，容器侧用 `valueType`，不内联整个大结构。
+- `comparison` 为 `different`、`equal-in-scope` 或 `indeterminate`。零条差异且覆盖不完整时不报告相等。始终检查 `coverage`、`warnings`、`totalDifferencesExact`；不完整时总数只是已观察到的差异下界。
+- 范围见 `coverage.scope`：只含 viewport/scissor 0、CBuffer 数组元素 0；使用的绑定按位置匹配，`binding_limit` 为 1–256。管线阶段按 owner action 的 graphics/compute 类别筛选。资源内容、Shader 文本、未选中的常量值不参与比较。
+- 需要常量值时传 `cbuffers=[{"stage":"pixel","name":"SceneInfo","member_path":"viewProjMat","max_depth":0}]`。每项恰选 `name` 或 `index`，最多 8 项；默认根路径、展开深度 1、成员上限 200，可用 `member_limit`（1–1000）调整。先用 `get_shader` / `get_cbuffer` 找到实际布局。布局和绑定变化也报告差异，跨布局的同序号成员不保证语义相同。原生解码整个 block，单块大小上限 1 MiB。
+- 单侧快照限 32768 节点、2 MiB；总差异限 8192 条、2 MiB，每页限 256 KiB。深度/成员/绑定等截断均使 coverage 不完整；差异总预算耗尽后，省略部分不能靠翻页恢复。缩小比较范围后重新查询。
+- 不带游标会读取新快照；续页沿用该快照。每个 session 只保留最近两组比较，重新开始相同查询或淘汰快照后，旧游标明确失效，需要从头查询。
+
+例如：“读取这个 Draw 前的 ResourceBarrier，列出资源状态变化”、“比较 EID 3803 与 3820 的 Shader、混合和深度状态”、“比较这两个事件的 SceneInfo.viewProjMat”。EID、block 和成员名必须来自当前 capture。
+
+本机真实 capture 验证脚本（独立隐藏 GUI，不调用在线模型）：
+
+```powershell
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\event_inspection_live.py --launch E:/Captures/pragmata1.rdc --before 3803 --after 3820 --cbuffer-stage pixel --cbuffer-name SceneInfo --member viewProjMat
+```
+
+脚本用独立原生 `APIEvent` / `SDObject` 回调核对调用列表、标量和数组，用 `get_pipeline_state` / `get_cbuffer` 核对差异，并验证 UI EID、配置文件和自建进程清理。
 
 ## Shader 反编译（现成 release）
 
