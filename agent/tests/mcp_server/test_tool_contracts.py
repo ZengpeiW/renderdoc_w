@@ -81,6 +81,7 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "get_resource_stats": {"kind": "all", "top_n": 1},
             "get_resource": {"resource_id": "1001"},
             "get_resource_usage": {"resource_id": "1001"},
+            "get_pass_resources": {"parent_event_id": 1, "limit": 2},
             "export_texture": {"resource_id": "1001", "event_id": 30},
             "export_overlay": {"resource_id": "1001", "event_id": 30, "overlay": "Depth"},
             "pick_pixel": {"resource_id": "1001", "x": 1, "y": 2},
@@ -159,6 +160,9 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["get_resource_stats"]["data"]["resourceCount"] == 4
     assert results["get_resource_stats"]["data"]["knownTotalBytes"] == 448
     assert results["get_resource_stats"]["data"]["hasMoreLargest"]
+    assert results["get_pass_resources"]["effect"] == "read"
+    assert [row["resourceId"] for row in results["get_pass_resources"]["data"]["resources"]] == ["1001", "1002"]
+    assert results["get_pass_resources"]["nextCursor"]
     assert results["get_shader_source"]["effect"] == "artifact"
     assert results["decompile_shader"]["effect"] == "artifact"
     assert results["decompile_shader"]["data"]["generated"] is True

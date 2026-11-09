@@ -105,7 +105,8 @@ class ComparisonCBuffer(BaseModel):
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "export_overlay", "get_buffer_data", "pixel_history",
                                    "debug_pixel", "debug_vertex", "debug_compute", "get_mesh_data",
-                                   "decompile_shader", "get_gpu_duration", "find_shader_references"})
+                                   "decompile_shader", "get_gpu_duration", "find_shader_references",
+                                   "get_pass_resources"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -207,7 +208,8 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                               "debug_compute": ("group", "thread"),
                               "list_gpu_counters": ("cursor",),
                               "get_gpu_duration": ("parent_event_id", "cursor"),
-                              "find_shader_references": ("resource_id", "parent_event_id", "stages", "cursor")}.get(function.__name__)
+                              "find_shader_references": ("resource_id", "parent_event_id", "stages", "cursor"),
+                              "get_pass_resources": ("parent_event_id", "start_event_id", "end_event_id", "cursor")}.get(function.__name__)
             if literal_fields:
                 # FastMCP exposes no per-argument pre-parser option. Keep this adapter
                 # local to these fields, retaining generated input/output schemas.
@@ -692,6 +694,59 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             _clean_params(resource_id=resource_id, cursor=cursor, limit=limit),
             instance_id=instance_id,
         )
+
+    @tool()
+    async def get_pass_resources(
+        parent_event_id: StrictNullableEventId = None,
+        start_event_id: StrictNullableEventId = None,
+        end_event_id: StrictNullableEventId = None,
+        kind: Literal["all", "texture", "buffer"] = "all",
+        cursor: Cursor = None,
+        limit: StrictLimit = 200,
+        scan_budget: Annotated[int, Field(strict=True, ge=1, le=2000)] = 200,
+        refresh: Annotated[bool, Field(strict=True)] = False,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Find texture/buffer resource usage within an action subtree or inclusive EID range.
+
+        Omit all EID selectors for the whole capture, independently of the current UI event.
+        parent_event_id must be an exact action EID and cannot accompany start/end; subtree
+        membership is bounded by real recorded API/executable-action anchors, excluding synthetic
+        marker EIDs and setup before the subtree starts. A range requires both endpoints, which
+        must be real API or executable-action EIDs. kind=all means textures and buffers only.
+
+        Reads native GetUsage records without SetFrameEvent. ResourceUsage describes potential
+        resource-level roles, not proof of actual shader access, pixel writes, subresource flow,
+        or an engine RDG. Original usage names/values and API EIDs are retained; readWrite is
+        potential read/write usage, discard and barrier remain separate, unknown is not read.
+        previousUsage/nextUsage group the nearest recorded EID, not proven producers/consumers.
+
+        limit bounds matching resource rows; scan_budget bounds candidate resource visits,
+        including cache hits. Follow nextCursor even after an empty resources page. Candidates
+        are ordered by numeric ResourceId. coverage diagnostics cover the consumed prefix;
+        scanComplete does not imply complete when unknown or unmapped usage records remain.
+        Each first resource query reads its full-capture usage list, regardless of selected scope.
+        The session cache is shared across scopes/kinds. Successful refresh replaces its scanId
+        and invalidates all prior cursors; refresh cannot accompany cursor. Failures preserve
+        the prior cache. Pagination may change limit/scan_budget, but must keep scope and kind.
+        The 120-second MCP wait does not make native calls immediately cancellable.
+        """
+        if parent_event_id is not None and (start_event_id is not None or end_event_id is not None):
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "parent_event_id cannot be combined with start/end_event_id."))
+        if (start_event_id is None) != (end_event_id is None):
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "Both start_event_id and end_event_id are required for an EID range."))
+        if start_event_id is not None and start_event_id > end_event_id:
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "start_event_id must not exceed end_event_id."))
+        if refresh and cursor is not None:
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "refresh cannot be combined with a continuation cursor."))
+        return await invoke("get_pass_resources", _clean_params(
+            parent_event_id=parent_event_id, start_event_id=start_event_id, end_event_id=end_event_id,
+            kind=kind, cursor=cursor, limit=limit, scan_budget=scan_budget, refresh=refresh),
+            instance_id=instance_id)
 
     @tool(structured_output=False)
     async def export_texture(

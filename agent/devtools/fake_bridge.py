@@ -81,6 +81,7 @@ class FakeRenderTestBridge:
         self._usage = self._build_usage()
         self._gpu_duration_sample: dict[str, Any] | None = None
         self._shader_reference_scan: dict[str, Any] | None = None
+        self._pass_resource_scan: dict[str, Any] | None = None
         self._poll_stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
         self.server = MailboxServer(
@@ -824,6 +825,183 @@ class FakeRenderTestBridge:
         resource = self._resource(params)
         page, next_cursor = self._page(self._usage.get(resource["resourceId"], []), params)
         return _payload({"resourceId": resource["resourceId"], "usage": page}, next_cursor=next_cursor)
+
+    def _method_get_pass_resources(self, params: dict[str, Any]) -> dict[str, Any]:
+        parent, start, end = (params.get(key) for key in
+                              ("parent_event_id", "start_event_id", "end_event_id"))
+        kind, cursor, refresh = params.get("kind", "all"), params.get("cursor"), params.get("refresh", False)
+        if ((parent is not None and (start is not None or end is not None)) or
+                (start is None) != (end is None) or (start is not None and start > end) or
+                (refresh and cursor is not None)):
+            raise AgentBridgeError("INVALID_REQUEST", "Invalid scope or refresh/cursor combination.")
+        # The fake's Frame marker is synthetic; each executable action owns a real setup API EID.
+        real = {event for event, action in self._actions.items() if "marker" not in action["flags"]}
+        owners = {event: event for event in real}
+        owners.update({event - 1: event for event in real if event > 1})
+        selected_actions = set(self._actions)
+        scope_kind = "capture"
+        if parent is not None:
+            self._event_id({"event_id": parent}, required=True)
+            selected_actions = {parent}
+            pending_actions = [parent]
+            for event in pending_actions:
+                pending_actions.extend(self._actions[event]["children"])
+            selected_actions.update(pending_actions)
+            anchors = sorted(selected_actions.intersection(real))
+            if not anchors:
+                raise AgentBridgeError("UNSUPPORTED", "The subtree has no real API/action anchors.")
+            start, end = anchors[0], anchors[-1]
+            selected = {event for event, owner in owners.items() if owner in selected_actions and
+                        start is not None and start <= event <= end}
+            scope_kind = "actionSubtree"
+        elif start is not None:
+            if start not in owners or end not in owners:
+                raise AgentBridgeError("INVALID_EVENT", "Range endpoints must be real API/action EIDs.")
+            selected = {event for event in owners if start <= event <= end}
+            selected_actions = {event for event in real if start <= event <= end}
+            scope_kind = "eventRange"
+        else:
+            selected = set(owners)
+        scope = {"kind": scope_kind, "parentEventId": parent, "startEventId": start,
+                 "endEventId": end, "actionCount": len(selected_actions),
+                 "selectedEventCount": len(selected),
+                 "membership": "All native usage EIDs, including usages without an indexed action."}
+        if parent is not None:
+            scope["syntheticParent"] = parent not in real
+            scope["membership"] = ("Exact subtree action/API EIDs, clipped to real action anchors; "
+                                   "synthetic marker EIDs and setup before the first anchor are excluded.")
+        elif scope_kind == "eventRange":
+            scope["membership"] = "Inclusive raw usage EID interval; action ownership is metadata only."
+        scan = self._pass_resource_scan
+        if scan is not None and scan["session"] != self.capture_session_id:
+            scan = None
+        if scan is None or refresh:
+            if cursor is not None:
+                raise AgentBridgeError("INVALID_REQUEST", "The resource-usage scan expired.")
+            scan = {"session": self.capture_session_id, "id": uuid.uuid4().hex, "usage": {},
+                    "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+        prefix = "pass-resources:%s:%s:%s:%s:%s:%s:" % (
+            self.capture_session_id, scan["id"], parent, start, end, kind)
+        if cursor is not None and (not cursor.startswith(prefix) or not cursor[len(prefix):].isdigit()):
+            raise AgentBridgeError("INVALID_REQUEST", "The resource-usage scan or scope cursor does not match.")
+        offset = int(cursor[len(prefix):]) if cursor else 0
+        candidates = sorted((key for key, resource in self._resources.items()
+                             if resource["kind"] in ("texture", "buffer") and
+                             (kind == "all" or resource["kind"] == kind)), key=int)
+        if offset > len(candidates):
+            raise AgentBridgeError("INVALID_REQUEST", "The resource cursor is beyond the candidate list.")
+        aliases = {"ReadWriteResource": "CS_RWResource", "PixelShaderResource": "PS_Resource",
+                   "ComputeShaderResource": "CS_Resource", "VertexConstantBuffer": "VS_Constants"}
+        usage_names = ["Unused", "VertexBuffer", "IndexBuffer"]
+        stages = ("VS", "HS", "DS", "GS", "PS", "CS", "TS", "MS", "All")
+        usage_names += [stage + "_Constants" for stage in stages] + ["StreamOut"]
+        usage_names += [stage + "_Resource" for stage in stages]
+        usage_names += [stage + "_RWResource" for stage in stages]
+        usage_names += ["InputTarget", "ColorTarget", "DepthStencilTarget", "Indirect", "Clear",
+                        "Discard", "GenMips", "Resolve", "ResolveSrc", "ResolveDst", "Copy",
+                        "CopySrc", "CopyDst", "Barrier", "CPUWrite"]
+
+        def access(name):
+            if name in ("Unused", "Discard", "Barrier"):
+                return name.lower()
+            if name.endswith("_RWResource") or name in ("DepthStencilTarget", "Copy", "Resolve", "GenMips"):
+                return "readWrite"
+            if name in ("ColorTarget", "StreamOut", "Clear", "ResolveDst", "CopyDst", "CPUWrite"):
+                return "write"
+            return "read" if name in usage_names else "unknown"
+
+        def records_for(key):
+            normalized = []
+            for item in self._usage.get(key, []):
+                event, name = item.get("eventId"), item.get("usage")
+                if type(event) is not int or not 0 <= event <= 0xFFFFFFFF or not isinstance(name, str):
+                    raise AgentBridgeError("REPLAY_ERROR", "Malformed native usage record.")
+                name = aliases.get(name, name)
+                row = {"eventId": event, "actionEventId": owners.get(event), "usage": name,
+                       "usageValue": item.get("usageValue", usage_names.index(name) if name in usage_names else 9999),
+                       "access": access(name)}
+                if "viewId" in item:
+                    row["viewId"] = item["viewId"]
+                normalized.append(row)
+            return sorted(normalized, key=lambda item: (item["eventId"], item["usageValue"]))
+
+        def projection(key, records):
+            sentinels = sum(row["eventId"] == 0 and row["usage"] == "Unused" for row in records)
+            valid = [row for row in records if not (row["eventId"] == 0 and row["usage"] == "Unused")]
+            bounded = [row for row in valid if start is None or start <= row["eventId"] <= end]
+            inside = bounded if scope_kind != "actionSubtree" else [row for row in bounded if row["eventId"] in selected]
+            diagnostics = {"unusedSentinelCount": sentinels, "malformedUsageRecordCount": 0,
+                           "unmappedUsageRecordCount": sum(row["actionEventId"] is None for row in bounded),
+                           "unknownUsageRecordCount": sum(row["access"] == "unknown" for row in inside)}
+            if not inside:
+                return None, diagnostics
+            aggregate = {}
+            for row in inside:
+                token = (row["usage"], row["usageValue"], row["access"])
+                entry = aggregate.setdefault(token, {"usage": row["usage"], "usageValue": row["usageValue"],
+                    "access": row["access"], "count": 0, "firstEventId": row["eventId"], "lastEventId": row["eventId"]})
+                entry["count"] += 1
+                entry["lastEventId"] = row["eventId"]
+            def neighbor(before):
+                boundary = start if before else end
+                if boundary is None:
+                    return None
+                outside = [row for row in valid if (row["eventId"] < boundary if before else row["eventId"] > boundary)]
+                if not outside:
+                    return None
+                event = (max if before else min)(row["eventId"] for row in outside)
+                group = [row for row in outside if row["eventId"] == event]
+                return {"eventId": event, "recordCount": len(group), "usages": group[:16], "truncated": len(group) > 16}
+            resource = self._resources[key]
+            return {"resourceId": key, "name": resource["name"], "kind": resource["kind"],
+                    "type": resource.get("type", resource["kind"].title()),
+                    "usageRecordCount": len(inside), "eventCount": len({row["eventId"] for row in inside}),
+                    "firstEventId": inside[0]["eventId"], "lastEventId": inside[-1]["eventId"],
+                    "hasReadUsage": any(row["access"] in ("read", "readWrite") for row in inside),
+                    "hasWriteUsage": any(row["access"] in ("write", "readWrite") for row in inside),
+                    "usageTypes": sorted(aggregate.values(), key=lambda item: (item["usageValue"], item["usage"])),
+                    "usageExamples": inside[:16],
+                    "usageExamplesTruncated": len(inside) > 16,
+                    "previousUsage": neighbor(True), "nextUsage": neighbor(False)}, diagnostics
+
+        rows, pending, examined, reads, hits = [], {}, 0, 0, 0
+        limit, budget = params.get("limit", 200), params.get("scan_budget", 200)
+        for key in candidates[offset:]:
+            if examined >= budget or len(rows) >= limit:
+                break
+            examined += 1
+            if key in scan["usage"]:
+                records = scan["usage"][key]
+                hits += 1
+            else:
+                records = records_for(key)
+                pending[key] = records
+                reads += 1
+            row, _ = projection(key, records)
+            if row is not None:
+                rows.append(row)
+        consumed = offset + examined
+        totals = {key: 0 for key in ("unknownUsageRecordCount", "unmappedUsageRecordCount",
+                                   "malformedUsageRecordCount", "unusedSentinelCount")}
+        merged = dict(scan["usage"], **pending)
+        for key in candidates[:consumed]:
+            if key not in merged:
+                raise AgentBridgeError("INVALID_REQUEST", "The resource cursor skips unobserved candidates.")
+            _, diagnostics = projection(key, merged[key])
+            for name, count in diagnostics.items():
+                totals[name] += count
+        scan["usage"].update(pending)
+        self._pass_resource_scan = scan
+        scan_complete = consumed == len(candidates)
+        complete = scan_complete and not totals["unknownUsageRecordCount"] and not totals["unmappedUsageRecordCount"]
+        coverage = dict(totals, candidateResourceCount=len(candidates), processedResourceCount=consumed,
+                        examinedThisPage=examined, nativeReadsThisPage=reads, cacheHitsThisPage=hits,
+                        scanComplete=scan_complete, complete=complete)
+        return _payload({"scope": scope, "kind": kind, "scanId": scan["id"],
+                         "scanStartedAtUtc": scan["startedAt"], "resources": rows, "coverage": coverage},
+                        next_cursor=prefix + str(consumed) if not scan_complete else None,
+                        truncated=not complete or any(row["usageExamplesTruncated"] for row in rows),
+                        warnings=["Synthetic resource usage describes potential roles, not proven producers or consumers."])
 
     def _texture_pixels(self, resource_id: str) -> list[tuple[int, int, int, int]]:
         seed = int(resource_id) % 255

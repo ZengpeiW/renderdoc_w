@@ -123,7 +123,7 @@ def test_catalog_registry_effect_and_dynamic_claude_allowlist(recording):
 
     server, _ = recording
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-    assert len(tools) == 34 and set(tools) == set(TOOL_NAMES) == set(CLAUDE_TOOLS) == set(CLAUDE_EVENT_TOOLS)
+    assert len(tools) == 35 and set(tools) == set(TOOL_NAMES) == set(CLAUDE_TOOLS) == set(CLAUDE_EVENT_TOOLS)
     assert METHOD in HANDLERS
     assert METHOD_SPECS[METHOD] == BRIDGE_SPECS[METHOD] == {"effect": "read", "requiresCapture": True}
     tool = tools[METHOD]

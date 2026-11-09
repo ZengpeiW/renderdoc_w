@@ -258,7 +258,7 @@ def test_overlay_image_uses_actual_fixed_capture_validation(tmp_path, wrong_sess
 def test_second_batch_does_not_create_extra_cbuffer_tool_and_declares_effects(recording):
     server, _ = recording
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-    assert set(tools) == set(TOOL_NAMES) and len(tools) == 34
+    assert set(tools) == set(TOOL_NAMES) and len(tools) == 35
     assert "get_cbuffer_member" not in tools
     cbuffer = tools["get_cbuffer"]
     assert cbuffer.annotations.readOnlyHint is True

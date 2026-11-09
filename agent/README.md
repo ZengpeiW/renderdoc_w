@@ -9,7 +9,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
 - M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
-- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、Shader 引用搜索、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数、事件差异、Compute 线程调试和 GPU duration；当前共 34 个 MCP 工具，Codex 和 Claude 共用。
+- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、Shader 引用搜索、Pass 资源用途、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数、事件差异、Compute 线程调试和 GPU duration；当前共 35 个 MCP 工具，Codex 和 Claude 共用。
 
 ## P0 工具
 
@@ -19,7 +19,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 | Action | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`get_api_calls`、`compare_events`、`set_event`（唯一会改变 UI 的工具） |
 | GPU 计数器 | `list_gpu_counters`（能力查询）、`get_gpu_duration`（回放耗时） |
 | Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`decompile_shader`（生成 HLSL/GLSL）、`find_shader_references`（查找绑定同一 Shader 的事件）、`get_cbuffer`（支持成员路径和子成员分页） |
-| 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
+| 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats`、`get_pass_resources` |
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
 | 诊断图 | `export_overlay`（单 EID 的离屏 Overlay PNG，不改变 UI） |
 | Buffer | `get_buffer_data`（64 KiB 内 base64，1 KiB 内附 hex，更大写 artifact；`format="float4, uint"` 可解码行） |
@@ -41,6 +41,26 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - Overlay 是 `artifact` 操作，不移动 UI 选中事件，也不修改 Texture Viewer 设置；输出始终在 `finally` 释放，并强制恢复共享诊断资源。图像是 8-bit RGB 可视化，默认最长边 1024，`max_dimension` 上限 4096，并受 2M 输出像素预算约束。源纹理及关联深度纹理限制为 16M 存储 texel（包括 mip/slice/sample），超限或 API 不支持时明确报错。结果提供 `legend`、原始/输出尺寸及 `displayTransform`；不要把缩放后的坐标、诊断色或 Overdraw 热图当作原始像素值、精确写入次数或 GPU 耗时。需要实际看图时指定 `include_image=true`。
 
 例如：“读取当前 Pixel Shader 的 Lights 数组第 123 项 Color”、“分页查看这个常量缓冲后面的成员”、“导出当前 Draw 的深度测试和背面剔除 Overlay，解释哪些区域被挡住”。
+
+## Pass 资源用途与前后使用
+
+`get_pass_resources(parent_event_id=None, start_event_id=None, end_event_id=None, kind="all", cursor=None, limit=200, scan_budget=200, refresh=false)` 汇总范围内 texture/buffer 的原生 `GetUsage` 记录，返回资源、读写角色、用途计数、有限示例和范围前后的相邻用途。
+
+- 默认整帧。指定 `parent_event_id` 查 action/marker 子树；或同时指定 `start_event_id`、`end_event_id` 查真实 API/操作 EID 的闭区间，两种范围不能混用。先用 `list_actions`/`inspect_event` 确定 pass，不自动猜测当前 pass。自动生成的 marker 可能使用帧末之外的 EID；子树以真实 action 为边界，只包含其成员，并排除第一个 action 前归属于它的 setup 调用。无真实边界时明确拒绝。
+- `kind` 支持 `all`、`texture`、`buffer`，资源按数值 ResourceId 排序。`resources[]` 保留原生 usage 名称/数值、记录数、不同 EID 数、首末 EID、`hasReadUsage`/`hasWriteUsage` 及最多 16 条示例。`read`/`write`/`readWrite` 表示记录的角色或潜在访问：DepthStencilTarget 归 readWrite，但可能只测试/读取；ColorTarget/UAV 绑定也不证明发生了实际写入。Barrier、Discard、Unused、unknown 单独分类，Discard 不视为有效输出。重复原生记录保留，计数不是 GPU 访问次数。
+- `previousUsage`/`nextUsage` 返回范围边界外最近 EID 的整组用途，提供完整记录数、最多 16 条示例及截断标记；整帧查询返回 null。这是相邻使用证据，不是 producer/consumer、最后写入者或依赖图。未覆盖子资源、像素、字节、资源别名及引擎原生 RDG。
+- `limit`（1–1000）限制匹配资源行，`scan_budget`（1–2000）限制本页访问候选数，缓存命中也计入。空页仍可能有 `nextCursor`，须翻完才能判断无匹配。`coverage` 的诊断数覆盖已处理前缀；`scanComplete` 表示候选扫完，`complete` 还要求没有未知用途或事件归属缺口，仍不保证原生跟踪捕获了每次实际访问。示例截断不影响聚合计数。
+- 每 session 共享已查询资源的完整用途缓存，可跨范围和 kind 复用。`scanId`/`scanStartedAtUtc` 标识逐批构建的代次；成功 `refresh=true` 换代并使所有旧 Pass 资源游标失效，失败保留原缓存，refresh 不可带 cursor。游标绑定 session、代次、范围、kind，可调整分页预算。
+- 工具为 `read`，直接查询已记录元数据，**不调用 SetFrameEvent、不移动回放或 UI**。单页 256 KiB、用途缓存 64 MiB、范围 100000 action/200000 EID、候选 100000 资源、单资源 100000 条记录，超限明确失败。MCP 等待 120 秒，原生 GetUsage 数组分配不受逐行检查抢占。
+
+例如：“列出这个 pass 使用的纹理和 Buffer，区分读取、写入和读写角色，并检查它们在 pass 前后最近的用途”。EID 须从当前 capture 获取。
+
+实际 capture 验收使用独立隐藏 GUI，逐项对照原始用途记录，同时观察零 SetFrameEvent 调用、缓存复用、分页及刷新：
+
+```powershell
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\pass_resources_live.py --launch E:/Captures/pragmata1.rdc --parent-event 7726
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\pass_resources_live.py --launch "E:/Captures/恋与深空尝试截帧.rdc" --parent-event 2712
+```
 
 ## Shader 引用搜索
 

@@ -182,7 +182,7 @@ def test_new_catalog_is_complete_read_only_and_shared_by_claude(recording):
 
     server, _ = recording
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-    assert len(tools) == 34
+    assert len(tools) == 35
     assert set(tools) == set(TOOL_NAMES) == set(CLAUDE_TOOLS) == set(CLAUDE_EVENT_TOOLS)
     for name in ("get_api_calls", "compare_events"):
         assert name in P0_METHODS

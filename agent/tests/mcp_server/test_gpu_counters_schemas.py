@@ -115,7 +115,7 @@ def test_catalog_permissions_registry_and_dynamic_claude_tools(recording):
 
     server, _ = recording
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
-    assert len(tools) == 34
+    assert len(tools) == 35
     assert set(tools) == set(TOOL_NAMES) == set(CLAUDE_TOOLS) == set(CLAUDE_EVENT_TOOLS)
     for method in METHODS:
         assert method in HANDLERS

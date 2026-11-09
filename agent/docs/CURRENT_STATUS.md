@@ -6,9 +6,9 @@
 
 - 工作目录：`E:\PersonalWorkSpace\git_repo\renderdoc`。
 - 当前分支：`local_test`。
-- 本轮基于 `794c88579`，新增 `find_shader_references`，同步 Skill、文档与真实 capture 验证脚本。
-- MVP/M0–M4、M5a–M5d 已实现，已有可使用的内嵌 AI 助手；目前有 **34 个 MCP 工具、4 个 Skill、Codex 和 Claude 两种 harness**。
-- DeepSeek harness 未接入。本轮只增加 Shader 绑定引用搜索，使用分批回放、阶段筛选和 session 缓存；不加入 Shader 编辑或 ray shader table 扫描。
+- 本轮基于 `9a4a88089`，新增 `get_pass_resources`，同步 Skill、文档与真实 capture 验证脚本。
+- MVP/M0–M4、M5a–M5d 已实现，已有可使用的内嵌 AI 助手；目前有 **35 个 MCP 工具、4 个 Skill、Codex 和 Claude 两种 harness**。
+- DeepSeek harness 未接入。本轮增加 Pass/事件范围的资源用途与前后使用查询，读取原生 GetUsage 元数据，不移动回放；结果不代表像素/字节级依赖或引擎原生 RDG。
 - 本轮开始时，唯一未跟踪文件是 `renderdoc/data/renderdoc.rc.bak`，属于已有文件，未修改、删除或纳入提交。
 
 详细使用说明见 [agent/README.md](../README.md)。[MVP_DESIGN.md](MVP_DESIGN.md) 和 [M5_DESIGN.md](M5_DESIGN.md) 保留设计过程，部分早期范围和界面示例不代表当前实现，例如最初 M5 不包含 Claude、示例工具数量少于现在。
@@ -27,7 +27,8 @@
 | `9851069ef` | Compute 单线程调试，工作组/组内坐标验证、JSONL 轨迹与异常清理 |
 | `9e97ed3de` | GPU 计数器目录、逐事件回放耗时、采样缓存/刷新和强制恢复；D3D12 固定频率改为显式开启 |
 | `2348074f8` / `794c88579` | Claude Windows 启动修复，长系统提示通过文件传递，短提示保留内联 |
-| 本次（2026-11-09） | Shader 引用搜索、候选扫描预算、跨查询绑定缓存和覆盖状态 |
+| `9a4a88089` | Shader 引用搜索、候选扫描预算、跨查询绑定缓存和覆盖状态 |
+| 本次（2026-11-09） | Pass 资源用途、真实事件边界、前后相邻使用及共享用途缓存 |
 
 ## 2. 架构、面板与历史
 
@@ -53,7 +54,7 @@
 - Claude 会从用户级 `settings.json` 补充连接环境白名单，尊重 `CLAUDE_CONFIG_DIR`，已有进程环境优先；不加载项目配置，不执行 `apiKeyHelper`。
 - Codex 浏览器 OAuth 完整流程仍缺人工验收；已有 fake 登录状态流和真实 app-server 的本地 fixture 验证。不要把这项待验收误读为“Claude 从未在线验证”。
 
-## 3. 已暴露的 34 个 MCP 工具
+## 3. 已暴露的 35 个 MCP 工具
 
 以 [protocol.py](../mcp_server/src/rendertest_mcp/protocol.py) 的 `TOOL_NAMES` 和 [server.py](../mcp_server/src/rendertest_mcp/server.py) 为准。
 
@@ -63,7 +64,7 @@
 | 事件 | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`get_api_calls`、`compare_events`、`set_event` |
 | GPU 计数器 | `list_gpu_counters`、`get_gpu_duration` |
 | 管线/Shader | `get_pipeline_state`、`get_shader`、`get_shader_source`、`decompile_shader`、`find_shader_references`、`get_cbuffer` |
-| 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
+| 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats`、`get_pass_resources` |
 | 纹理/诊断图 | `export_texture`、`export_overlay`、`pick_pixel`、`get_texture_stats` |
 | Buffer | `get_buffer_data` |
 | 历史/调试/几何 | `pixel_history`、`debug_pixel`、`debug_vertex`、`debug_compute`、`get_mesh_data` |
@@ -74,7 +75,7 @@
 
 需要保留的行为约定：
 
-- `set_event` 是唯一明确移动 UI 事件的工具。其他读取保持 UI 选择；临时回放后恢复，`get_api_calls` 则直接读取记录而不切换 replay。artifact 工具只产生文件，不替换 Shader 或修改 CBuffer。
+- `set_event` 是唯一明确移动 UI 事件的工具。其他读取保持 UI 选择；临时回放后恢复，`get_api_calls` 和 `get_pass_resources` 则直接读取记录而不切换 replay。artifact 工具只产生文件，不替换 Shader 或修改 CBuffer。
 - ResourceId 使用十进制字符串，EID/资源身份不能跨 capture session 混用。显式用户目标优先于 UI 当前选中项。
 - 列表按游标分页；`truncated`、`warnings` 和 `nextCursor` 不能忽略。大产物通过 `read_artifact` 读取，路径必须先由当前 MCP 进程中的工具返回，并通过实例/session、大小和 SHA-256 校验。
 - `get_resource_stats` 是资源描述大小的汇总，不是实际驻留/去重显存；`get_action_stats` 是操作及工作量统计，不是 GPU 计时。
@@ -82,7 +83,17 @@
 
 ## 4. 分析扩展的实际边界
 
-### Shader 引用搜索（本轮）
+### Pass 资源用途（本轮）
+
+- `get_pass_resources(parent_event_id=None, start_event_id=None, end_event_id=None, kind="all", cursor=None, limit=200, scan_budget=200, refresh=false)` 默认整帧；parent 查精确 action/marker 子树，或同时传两个真实 API/执行 EID 查闭区间。parent 与 range 互斥，不从当前 UI 猜 pass。kind 为 all/texture/buffer，all 只含后两类。
+- 子树按真实 action anchors 裁剪成员集合，不只判断 owner 或数值区间。`NoChunk` 合成 marker 不作边界或成员；首个真实 action 前的 setup API 排除，孔洞不补齐。无真实 anchors 返回 UNSUPPORTED。保留 raw usage EID，actionEventId 只作标签；范围内未映射记录使 coverage 不完整，不凭邻近 action 猜归属。
+- 资源按数值 ID 排序；每行提供 usageRecordCount/eventCount/首末 EID、原生 usage 名称和整数、分类、读写角色布尔值及最多 16 条示例。明确区分 read/write/readWrite/discard/barrier/unused/unknown；DepthStencilTarget 是潜在 readWrite，可能只测试/读取。ColorTarget/UAV 角色不证明实际写入。Discard 不算有效输出，重复原生记录保留，计数不是 invocation 或显存访问次数。`(0, Unused)` 原生哨兵单独计数，不算实际用途。
+- previousUsage/nextUsage 是边界外最近 raw EID 的整组记录；保留完整计数、最多 16 条用途及截断标记。整帧时为 null；不称为 producer/consumer、最后写入者或精确输入输出。子资源、像素/字节和别名依赖不在范围内。
+- limit（1–1000）限制匹配行，scan_budget（1–2000）限制本页候选访问，含 cache hits；空页也可能有 nextCursor。coverage 的 unknown/unmapped/sentinel 诊断累计覆盖已处理前缀；scanComplete 表示扫完，complete 还要求无解释/归属缺口，但不保证原生跟踪覆盖每次实际访问。示例截断保留全量聚合，不能只看单页判断无匹配。
+- 每 session 共享已读资源的完整 primitive GetUsage 历史，独立于旧 get_resource_usage 缓存，可跨范围/kind 复用。scanId/scanStartedAtUtc 表示逐批构建的代次；游标绑定 session、代次、scope、kind、候选位置，可调分页预算。refresh 不能带 cursor，成功后所有旧 Pass 资源游标失效，任何失败不发布部分缓存或覆盖旧代次。
+- 读取通过普通 replay.call，绝不 SetFrameEvent，也不做强制恢复。每页 256 KiB、cache 64 MiB、范围 100000 action/200000 EID、候选 100000 资源、单资源 100000 原生记录；明确预算/取消/session/健康检查，超限或 malformed 原生数据整页失败。MCP 等待 120 秒不保证即时中断原生 GetUsage。更新 core/event-analysis Skill，仍共四份。
+
+### Shader 引用搜索
 
 - `find_shader_references(resource_id, stages=None, parent_event_id=None, cursor=None, limit=200, scan_budget=200, refresh=false)` 接受当前 capture 的精确十进制 Shader ResourceId；资源不存在或不是 Shader 时拒绝。默认整帧，显式 parent 必须是实际 action EID，含自身与后代；stages 可省略或为非空八阶段子集，规范去重。
 - 候选按 EID 排序，只包含与阶段筛选相交的叶 draw/compute/mesh action。传统 draw 检查 VS/HS/DS/GS/PS，compute 只检查 CS，mesh 检查 amplification/mesh/pixel。容器、marker、copy/clear 不从遗留管线报引用；ray shader table 和缺失的原生阶段能力明确标为未覆盖，不误当 compute。
@@ -150,7 +161,7 @@
 | Skill | 职责 |
 | --- | --- |
 | `rendertest-core` | 实例/session、目标选择、工具效果和证据边界 |
-| `rendertest-event-analysis` | 事件/pass、输入输出、API 参数、事件比较、资源及事件统计、GPU duration 与计数器能力 |
+| `rendertest-event-analysis` | 事件/pass、资源用途与前后使用、输入输出、API 参数、事件比较、资源及事件统计、GPU duration 与计数器能力 |
 | `rendertest-pixel-investigation` | 像素取值、写入历史、失败原因与像素调试 |
 | `rendertest-shader-debug` | 内嵌源码、反编译、Shader 引用搜索、反射/绑定/CBuffer、Pixel/Vertex/Compute 单线程调试 |
 
@@ -175,18 +186,20 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 | 反编译 release | `<exe目录>/integrations/rendertest_agent/tools/shader_decompiler/` |
 | 默认 IPC/日志/历史根 | `%LOCALAPPDATA%/RenderTest/agent`，可用 `RENDERTEST_AGENT_ROOT` 覆盖 |
 
-最新 Bridge、Skill 和反编译 release 部署在上述原路径。使用新版本需重启 RenderTest，并新建 AI 对话刷新工具/指令。GPU 扩展已重新构建并部署原生 DLL/PDB，包含 D3D12 默认不锁频的逻辑；本轮 Shader 引用搜索只涉及 Python/Skill，无需再编译原生程序。
+最新 Bridge、Skill 和反编译 release 部署在上述原路径。使用新版本需重启 RenderTest，并新建 AI 对话刷新工具/指令。GPU 扩展已重新构建并部署原生 DLL/PDB，包含 D3D12 默认不锁频的逻辑；本轮 Pass 资源用途只涉及 Python/Skill，无需再编译原生程序。
 
 正常构建 `qrenderdoc/qrenderdoc_local.vcxproj` 会部署 Bridge 和 Skill；反编译 release 单独安装。非空安装目录只校验、不覆盖；损坏时先改名保留，再重新安装。其他安装位置用 `--output`，运行时配 `RENDERTEST_SHADER_DECOMPILER_DIR`，仍执行固定哈希检查。
 
 ## 6. 已有验证记录与复现
 
-本轮验证 Shader 引用搜索与真实 capture，未重新调用在线模型。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 中的证据不跟踪到 Git，换机器后可能不存在。
+本轮验证 Pass 资源用途与真实 capture，未重新调用在线模型。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 中的证据不跟踪到 Git，换机器后可能不存在。
 
 | 范围 | 已有结果与边界 |
 | --- | --- |
-| 最新 Python 全套 | `1392 passed`（74.17 秒）；在宿主环境运行，测试临时文件限定在工作区。不是对所有 GPU/API 的保证 |
-| Skill | 四份 Skill 均通过 validator；本轮更新 core/shader-debug/event-analysis，部署两份 Skill 副本并逐字节核对 |
+| 最新 Python 全套 | `1586 passed`（68.85 秒）；在宿主环境运行，测试临时文件限定在工作区。不是对所有 GPU/API 的保证 |
+| Skill | 四份 Skill 均通过 validator；本轮更新 core/event-analysis，部署两份 Skill 副本并逐字节核对 |
+| Pass 资源 D3D12 | `pragmata1.rdc` 子树 7726，真实边界 3820..3901：25 个资源（11 texture / 14 buffer）。全部用途分类/计数/示例/邻接 EID 组与独立原生 GetUsage 相同；2540 候选资源每代各读取一次，首次+refresh 共 5080 次。资源 9131 的 Barrier@3819 不进入 parent，但在显式 3819..3820 区间保留 raw EID，owner 3820 只作标签。跨范围/kind 缓存零新增读取、空页续扫和旧游标失效通过；零 SetFrameEvent，UI EID 7708、资源 244 的 `(128,64)` 及管线保持不变，配置保留、自建进程退出 |
+| Pass 资源 Vulkan | `恋与深空尝试截帧.rdc` 子树 2712，真实边界 1696..1722：45 个资源（17 texture / 28 buffer），每代 18 页。711 候选资源首次+refresh 共 1422 次 GetUsage，逐资源原始记录哈希、分类/计数/示例/邻接组与独立原生记录一致；跨范围/kind/空区间只读缓存，旧游标刷新后失效。零 SetFrameEvent，UI EID 2701、资源 4543 的 `(2,2)` 及管线保持不变，配置保留、自建进程退出。这两份样本的成功不等于所有 API/驱动均已实测 |
 | Shader 引用 D3D12 | `pragmata1.rdc` 子树 3738：14 action / 12 draw，PS 297113 在 12 个 draw 绑定，VS 251109 同样可由缓存查询。所有引用 stage/入口/父 EID 与独立原生读取相同；首次+refresh 共 24 次候选扫描，每个 draw 的五个相关阶段（含未绑定阶段）恰读取两次，共 120 次 GetShader。UI EID 3820、资源 390180 的 `(340,576)` 在扫描后变化、force 后逐位恢复；fatal 为 Success，配置与 UI 选择保持，自建进程退出 |
 | Shader 引用 Vulkan | `恋与深空尝试截帧.rdc` 子树 2712：8 action / 5 draw，PS 78421 有 3 个引用。首次+refresh 共 10 次候选扫描、50 次 GetShader，精确对上独立原生绑定。UI EID 27 / 资源 72716 的 9 个点在扫描后变化、force 后逐位恢复。两份 capture 均验证跨 Shader/阶段缓存零新增读取或移动、空页续扫、刷新使旧游标失效，以及无效参数拒绝；未将实际结果扩展为 mesh/ray 的实测保证 |
 | 原生构建 | `renderdoc/renderdoc.vcxproj` Release x64 构建 exit 0；明确使用 HostX64 工具链，避免旧工程 HostX86 链接器的 LTCG heap 限制。未改系统开发者模式或用户配置 |
@@ -213,7 +226,10 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 - GPU counters D3D12：`agent/.agent-data/gpu-counters-live-8d98872ec8b743f5bbc46cd15874b22a/report.json`；同目录 native reference/measurements 包含稳定 guard 基线和两次完整采样。早期失败报告记录的是修复前的 stable-power DeviceLost 或未筛选 guard 的非确定性，不作为最终成功证据。
 - 原生构建：`agent/.agent-data/gpu-counter-build/build.log`；部署 SHA-256 和旧 DLL/PDB 备份路径见该目录 `deployment.json`。这些二进制不提交 Git。
 - GPU 扩展的 Python 全套：`agent/.agent-data/gpu-counter-tests-final.xml`。该次同时改进既有 Windows 子进程测试的就绪等待及句柄观察，保留原超时/退出断言，产品反编译 runner 未改。之后 Claude 启动与校验改动已由独立提交完成。
-- 本轮 Shader 引用搜索 Python 全套：`agent/.agent-data/shader-reference-tests-final.xml`，包含 34 工具目录、schema/IPC/fake、覆盖/缓存/取消/恢复与范围和字节预算回归。
+- Shader 引用搜索 Python 全套：`agent/.agent-data/shader-reference-tests-final.xml`，包含当时 34 工具目录、schema/IPC/fake、覆盖/缓存/取消/恢复与范围和字节预算回归。
+- 本轮 Pass 资源 Python 全套：`agent/.agent-data/pass-resource-tests-final.xml`，覆盖 35 工具目录、严格 schema/IPC/fake、合成 marker 与 API 范围、未知用途/归属、重复资源/记录、分页缓存/刷新原子性、取消/失败与预算；新增 Bridge 测试禁止任何 SetFrameEvent。
+- Pass 资源 D3D12：`agent/.agent-data/pass-resources-live-77023112b4404b82a8b378f77bdb201a/report.json`；同目录 native reference/observations 保留全量用途、同源哈希、每代读取次数、零回放移动与像素/管线证据。早期 probe 和验收脚本断言修正前的失败记录不作为最终证据。
+- Pass 资源 Vulkan：`agent/.agent-data/pass-resources-live-23a34053bd59494b8178378668de9220/report.json`；同目录保留相同结构的原生参考与观察记录。两次最终验收均使用 README 的最简命令，guard 由当前输出或首个有效 2D 纹理自动选择，不额外切换事件。
 - Shader 引用 D3D12：`agent/.agent-data/shader-references-live-2d78df52758f4edf9ec3500885bc9aeb/report.json`；Vulkan：`agent/.agent-data/shader-references-live-ad46b262eafa49cea6c498676d2117bb/report.json`。各目录的 `native-reference.json` / `native-observations.json` 保留独立绑定、逐阶段读取次数、采样点及恢复证据。
 - D3D12 Shader 扫描恢复点的独立选择控制：`agent/.agent-data/shader-guard-discovery-763053345aab416fb9e451c91ba1f1c1/discovery.json`。该坐标经过三次无扫描重复回放和三次恢复逐位比较，另排除了会变化的坐标；未对数值采用容差。
 
@@ -242,30 +258,33 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\compute_debug_live.py -
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\gpu_counters_live.py --launch E:/Captures/pragmata1.rdc --event 3820 --guard-resource 390195
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\gpu_counters_live.py --launch "E:/Captures/恋与深空尝试截帧.rdc" --event 27
 
-# 本轮 Shader 引用搜索：独立原生绑定、候选预算、缓存与真实状态恢复
+# Shader 引用搜索：独立原生绑定、候选预算、缓存与真实状态恢复
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\shader_references_live.py --launch E:/Captures/pragmata1.rdc --parent-event 3738 --event 3820 --guard-resource 390180 --guard-point 340 576
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\shader_references_live.py --launch "E:/Captures/恋与深空尝试截帧.rdc" --parent-event 2712 --event 27 --guard-resource 72716
+
+# 本轮 Pass 资源用途：原始记录逐项比较、边界/缓存/分页与零回放移动
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\pass_resources_live.py --launch E:/Captures/pragmata1.rdc --parent-event 7726
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\pass_resources_live.py --launch "E:/Captures/恋与深空尝试截帧.rdc" --parent-event 2712
 ```
 
-`decompile_live.py`、`event_inspection_live.py`、`compute_debug_live.py`、`gpu_counters_live.py` 和 `shader_references_live.py` 会创建独立隐藏 GUI 进程、关闭该进程的配置写入、固定实例/session、校验产物/结果及用户配置哈希，最后只关闭自己启动的进程。不要把用户正在使用的 GUI 当成测试进程关闭。在线 Claude/Codex 验证命令及环境配置见 README；已有通过记录不代表当前账号登录状态无需检查。
+`decompile_live.py`、`event_inspection_live.py`、`compute_debug_live.py`、`gpu_counters_live.py`、`shader_references_live.py` 和 `pass_resources_live.py` 会创建独立隐藏 GUI 进程、关闭该进程的配置写入、固定实例/session、校验产物/结果及用户配置哈希，最后只关闭自己启动的进程。不要把用户正在使用的 GUI 当成测试进程关闭。在线 Claude/Codex 验证命令及环境配置见 README；已有通过记录不代表当前账号登录状态无需检查。
 
 ## 7. 已知问题及尚不支持的能力
 
 - 在 `pragmata1.rdc` 的更广泛 `--all-p0` 检查中，曾出现 pixel_history 与 pick_pixel 结果不一致，以及 EID 3014 的 mesh/debug_vertex 对比不一致。已用扩展前的旧 Bridge 复现，未在这几批工具中修复。基线证据为 `agent/.agent-data/analysis-live-fef62ba077cd4171bc4bb05b5e580f7b/report.json`；不要把专项通过描述为这些旧问题已解决。
 - `pragmata1.rdc` EID 3820 的 GBuffer 资源 390180/390179/390177 各中心像素，在完全不调用 counters、仅重复 force replay 时也会变化。GPU 恢复验收改用经独立基线证明稳定、对采样敏感的资源 390195，保持逐位比较，未用容差掩盖差异。无采样控制证据：`agent/.agent-data/gpu-stability-control-38ec3e9a6d63463d9b4da1baf256806b/control.json`。这不意味着已修复 capture 重复回放的非确定性。
-- 当前没有任意 vendor GPU counter 采样或 pass 资源流工具。Shader 绑定引用搜索已加入，但不支持 ray shader table；Compute 调试不支持非零 dispatch base、ray/mesh Shader 调试。
+- 当前没有任意 vendor GPU counter 采样。Pass 资源用途已加入，但没有实际字节/像素依赖或引擎 RDG 图；Shader 绑定引用搜索不支持 ray shader table；Compute 调试不支持非零 dispatch base、ray/mesh Shader 调试。
 - `find_actions` 仍按名称/EID 和操作 flags 搜索；Shader ResourceId 查询使用 `find_shader_references`，基于有界管线扫描，不是 `GetUsage(shaderId)`。
 - 尚无 Shader 编辑/替换、CBuffer 修改、任意 Python/shell 执行、自动 Android 抓帧或远程连接管理工具。外部 `renderdoc-mcp` 的这些能力不会自动出现在内嵌助手。
 - Shader 可调试性、Overlay 及 counter 支持都与具体 API/驱动/Shader 有关；反编译成功也不保证可重新编译或与原程序等价。
 
 ## 8. 下一批候选（未实现）
 
-`get_api_calls`、`compare_events`、`debug_compute`、计数器目录与 GPU duration、`find_shader_references` 已完成。以下仍是候选，并未开始开发，以用户下一轮确定的范围为准。
+`get_api_calls`、`compare_events`、`debug_compute`、计数器目录与 GPU duration、`find_shader_references`、`get_pass_resources` 已完成。以下仍是候选，并未开始开发，以用户下一轮确定的范围为准。
 
 | 候选 | 价值与已有基础 | 接手时注意 |
 | --- | --- | --- |
 | 更多 GPU counters | 已有计数器目录和 duration；可按实际问题选择原生/vendor 计数器 | 需按类型/宽度/单位解码，处理驱动/权限/采样兼容性，不能假设全部与 duration 同时可取 |
-| `get_pass_resources` | 指定 marker/EID 范围的资源读写及前后使用，复用 GetUsage 和 ActionIndex | 资源级用途是关联证据，不证明某个像素被写入；不能宣称还原了引擎原生 RDG |
 
 另一项小增强是批量局部纹理数值采样，可复用 PickPixel 并限制采样点数；无需重新实现已存在的 EXR/DDS 导出。完整 RDG 图、Shader 替换等更大改动暂不作为这一批默认范围。
 
