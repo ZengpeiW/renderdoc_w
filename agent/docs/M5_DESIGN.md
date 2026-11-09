@@ -1,6 +1,6 @@
 # M5 设计：qrendertest 内嵌 AI 对话面板
 
-> 本文保留原始 M5 设计及后续扩展。当前实现已包含 Claude harness 和 33 个 MCP 工具；早期非目标、图示与工具数量不代表当前状态。接手请先读 [当前现状与交接](CURRENT_STATUS.md)，Claude 的设计补充见本文后部“Claude harness 扩展”。
+> 本文保留原始 M5 设计及后续扩展。当前实现已包含 Claude harness 和 34 个 MCP 工具；早期非目标、图示与工具数量不代表当前状态。接手请先读 [当前现状与交接](CURRENT_STATUS.md)，Claude 的设计补充见本文后部“Claude harness 扩展”。
 
 ## 1. 目标
 

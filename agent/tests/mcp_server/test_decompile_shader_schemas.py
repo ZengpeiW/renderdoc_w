@@ -98,7 +98,7 @@ def test_invalid_decompile_selectors_are_rejected_before_bridge(recording, argum
 def test_decompile_registration_is_capture_scoped_artifact_with_no_tool_path_parameter(recording):
     server, _ = recording
     tools = {item.name: item for item in asyncio.run(server.list_tools())}
-    assert len(tools) == 33 and set(tools) == set(TOOL_NAMES)
+    assert len(tools) == 34 and set(tools) == set(TOOL_NAMES)
     assert METHOD_SPECS["decompile_shader"] == BRIDGE_SPECS["decompile_shader"] == {
         "effect": "artifact", "requiresCapture": True}
     tool = tools["decompile_shader"]

@@ -56,6 +56,7 @@ Start with `inspect_event(event_id=...)`: action parameters, shaders per stage, 
 - What this event changed: compare `get_texture_stats` or a few `pick_pixel` reads at this EID and at the previous write event of the same resource. For one pixel, `pixel_history` at this EID shows whether this event's fragments passed and what they wrote.
 - Where a resource comes from and where it goes: `get_resource_usage(resource_id=...)` lists writers and readers.
 - Compute invocation arithmetic: `debug_compute(event_id=..., group=[...], thread=[...])` traces one ordinary compute Dispatch thread. Check exact dispatch/group/local-thread dimensions first; see `rendertest-shader-debug` for coordinate semantics, trace limits and how to verify UAV contents. A trace is not a GPU timing measurement.
+- Shared shader uses: `find_shader_references(resource_id="...", stages=["pixel"], parent_event_id=...)` finds leaf actions binding that Shader ResourceId. Omit the parent for a frame-wide search. Continue even an empty page when `nextCursor` is present; partial/unsupported coverage is not evidence of no other uses. Check returned stage/entry point, then use `compare_events` to inspect state differences. See `rendertest-shader-debug` for cache/refresh and binding-versus-execution limits.
 - Shader arithmetic: see `rendertest-shader-debug`.
 
 ## Answer

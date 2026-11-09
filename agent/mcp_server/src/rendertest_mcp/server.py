@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
 import anyio
 from mcp.server.fastmcp import FastMCP, Image
@@ -43,6 +43,11 @@ OptionalEventId = Annotated[
 ResourceId = Annotated[
     str, Field(pattern=r"^[0-9]{1,20}$", description="Exact decimal RenderDoc ResourceId.")
 ]
+ShaderReferenceId = Annotated[
+    str, Field(strict=True, pattern=r"^[0-9]{1,20}$",
+               description="Exact decimal UInt64 ResourceId of a Shader resource in this capture.")
+]
+ShaderReferenceStages = Annotated[list[Stage] | None, Field(strict=True, min_length=1, max_length=8)]
 InstanceId = Annotated[
     str | None,
     Field(
@@ -100,7 +105,7 @@ class ComparisonCBuffer(BaseModel):
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "export_overlay", "get_buffer_data", "pixel_history",
                                    "debug_pixel", "debug_vertex", "debug_compute", "get_mesh_data",
-                                   "decompile_shader", "get_gpu_duration"})
+                                   "decompile_shader", "get_gpu_duration", "find_shader_references"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -127,7 +132,7 @@ class _LiteralFieldMetadata(FuncMetadata):
         # FastMCP 1.x JSON-decodes some string inputs before Pydantic validation.
         # Preserve path strings such as [1], ["name"] and null, and prevent strict
         # compute coordinate arrays from accepting a JSON-encoded string instead.
-        # Counter selectors/cursors must not turn the string null into a fresh full sample.
+        # Scan/sample selectors must not turn the string null into a fresh full query.
         other = {key: value for key, value in data.items() if key not in self.literal_fields}
         parsed = super().pre_parse_json(other)
         for key in self.literal_fields:
@@ -201,7 +206,8 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                               "get_api_calls": ("parameter_path",),
                               "debug_compute": ("group", "thread"),
                               "list_gpu_counters": ("cursor",),
-                              "get_gpu_duration": ("parent_event_id", "cursor")}.get(function.__name__)
+                              "get_gpu_duration": ("parent_event_id", "cursor"),
+                              "find_shader_references": ("resource_id", "parent_event_id", "stages", "cursor")}.get(function.__name__)
             if literal_fields:
                 # FastMCP exposes no per-argument pre-parser option. Keep this adapter
                 # local to these fields, retaining generated input/output schemas.
@@ -511,6 +517,48 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                 include_disassembly=include_disassembly,
                 target=target,
             ),
+            instance_id=instance_id,
+        )
+
+    @tool()
+    async def find_shader_references(
+        resource_id: ShaderReferenceId,
+        stages: ShaderReferenceStages = None,
+        parent_event_id: StrictNullableEventId = None,
+        cursor: Cursor = None,
+        limit: StrictLimit = 200,
+        scan_budget: Annotated[int, Field(strict=True, ge=1, le=2000)] = 200,
+        refresh: Annotated[bool, Field(strict=True)] = False,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Find action events whose relevant shader stages bind an exact Shader ResourceId.
+
+        stages selects one or more of the eight supported stages; omission selects all relevant
+        stages. parent_event_id scopes an exact action subtree, including itself; omission uses
+        the whole capture. Classic draw, compute and mesh actions use their relevant stages;
+        ray-tracing shader tables are excluded and make coverage incomplete. Marker/copy/clear
+        events do not count as references merely because an old pipeline remains bound.
+        limit bounds matching event rows; scan_budget bounds candidate events visited this page,
+        including cache hits. An empty references page may still have nextCursor: continue until
+        coverage.scanComplete and inspect coverage.complete for unsupported actions/stages.
+        Bound references do not prove actual shader execution.
+        Results include matching stages and entry points, with a shared capture-local binding
+        cache and scanId. Requests without cursor may reuse that cache; refresh starts a new
+        generation and invalidates all old reference cursors after success. refresh cannot be
+        combined with cursor. Scanning replays events and restores the UI event; native calls
+        are not immediately cancellable and the MCP wait is not a hard native timeout.
+        """
+        if int(resource_id) > 0xFFFFFFFFFFFFFFFF:
+            raise _tool_error(RenderTestAgentError("INVALID_REQUEST", "resource_id exceeds UInt64."))
+        if refresh and cursor is not None:
+            raise _tool_error(RenderTestAgentError(
+                "INVALID_REQUEST", "refresh cannot be combined with a continuation cursor."))
+        canonical_stages = ([stage for stage in get_args(Stage) if stage in stages]
+                            if stages is not None else None)
+        return await invoke(
+            "find_shader_references",
+            _clean_params(resource_id=resource_id, stages=canonical_stages, parent_event_id=parent_event_id,
+                          cursor=cursor, limit=limit, scan_budget=scan_budget, refresh=refresh),
             instance_id=instance_id,
         )
 

@@ -9,7 +9,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
 - M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
-- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数、事件差异、Compute 线程调试和 GPU duration；当前共 33 个 MCP 工具，Codex 和 Claude 共用。
+- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、Shader 引用搜索、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数、事件差异、Compute 线程调试和 GPU duration；当前共 34 个 MCP 工具，Codex 和 Claude 共用。
 
 ## P0 工具
 
@@ -18,7 +18,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 | 实例/上下文 | `list_instances`、`get_status`、`get_context`（含当前 EID 的 Pipeline 摘要） |
 | Action | `list_actions`、`find_actions`、`inspect_event`、`get_action_stats`、`get_api_calls`、`compare_events`、`set_event`（唯一会改变 UI 的工具） |
 | GPU 计数器 | `list_gpu_counters`（能力查询）、`get_gpu_duration`（回放耗时） |
-| Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`decompile_shader`（生成 HLSL/GLSL）、`get_cbuffer`（支持成员路径和子成员分页） |
+| Pipeline | `get_pipeline_state`、`get_shader`（反射、反汇编，超过 256 KiB 走 artifact）、`get_shader_source`（capture 内嵌源码目录与文件）、`decompile_shader`（生成 HLSL/GLSL）、`find_shader_references`（查找绑定同一 Shader 的事件）、`get_cbuffer`（支持成员路径和子成员分页） |
 | 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
 | 纹理 | `pick_pixel`、`get_texture_stats`、`export_texture`（png/exr/dds；depth PNG 自动按 min/max 拉伸；`channels="rgb"` 输出不透明 RGB PNG） |
 | 诊断图 | `export_overlay`（单 EID 的离屏 Overlay PNG，不改变 UI） |
@@ -41,6 +41,28 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - Overlay 是 `artifact` 操作，不移动 UI 选中事件，也不修改 Texture Viewer 设置；输出始终在 `finally` 释放，并强制恢复共享诊断资源。图像是 8-bit RGB 可视化，默认最长边 1024，`max_dimension` 上限 4096，并受 2M 输出像素预算约束。源纹理及关联深度纹理限制为 16M 存储 texel（包括 mip/slice/sample），超限或 API 不支持时明确报错。结果提供 `legend`、原始/输出尺寸及 `displayTransform`；不要把缩放后的坐标、诊断色或 Overdraw 热图当作原始像素值、精确写入次数或 GPU 耗时。需要实际看图时指定 `include_image=true`。
 
 例如：“读取当前 Pixel Shader 的 Lights 数组第 123 项 Color”、“分页查看这个常量缓冲后面的成员”、“导出当前 Draw 的深度测试和背面剔除 Overlay，解释哪些区域被挡住”。
+
+## Shader 引用搜索
+
+`find_shader_references(resource_id, stages=None, parent_event_id=None, cursor=None, limit=200, scan_budget=200, refresh=false)` 通过实际管线绑定查找使用指定 Shader ResourceId 的事件。先从 `get_shader`、`inspect_event` 或 `get_pipeline_state` 获得当前 capture 的 Shader ID，再作为精确十进制字符串传入。
+
+- 默认搜索整帧；`parent_event_id` 必须是实际 action EID，搜索包含自身和后代。`stages` 可省略或传非空阶段列表，如 `["pixel"]`、`["vertex", "pixel"]`；支持现有八种阶段，重复项规范化。
+- 只检查叶 draw、普通 compute dispatch 和 mesh dispatch 的相关阶段，跳过 marker/容器/copy/clear 的遗留绑定。传统 draw 不误报遗留 compute/mesh 阶段，mesh 不误报遗留 vertex 阶段；ray shader table 尚不支持，会标出覆盖缺口。返回 `references`，每个事件一行，`matches` 保留阶段、Shader ID 和入口。无反射时仍可确认绑定；入口为空时 `entryPointKnown=false`。
+- `limit`（1–1000）限制返回事件行；`scan_budget`（1–2000）限制本页访问的候选数，缓存命中也计入。**空页仍可能有 `nextCursor`**，必须继续才能查全。翻页保持 resource/stages/parent，可调整两个预算。`coverage.processedCandidateCount` 是已处理的候选前缀；`scanComplete` 表示候选已扫完，`complete` 还要求没有适用的不支持项。不要只凭第一页或不完整范围判断没有引用。
+- 同 capture session 缓存每个已读事件的全部相关阶段绑定，可复用到另一 Shader 或阶段的查询。`scanId`、`scanStartedAtUtc` 标识逐批建立的缓存代次，不代表整帧在同一时刻读取。`refresh=true` 成功后换代，所有旧 Shader 引用查询游标失效；不能同时传 cursor。手动替换 Shader 等未更换 capture session 的操作后需刷新，失败不覆盖旧缓存。
+- 每批扫描后强制恢复当前 UI 回放事件，工具为 `read`，不改变 UI 选择。单页 256 KiB、绑定缓存 32 MiB、范围最多 100000 个 action；超过预算明确报错。MCP 等待 120 秒，单次原生 replay 不保证即时取消。`GetUsage(shaderId)` 不作为此查询的替代。
+- 结果证明的是事件当时的绑定关系，不证明实际 invocation、非零工作量或源码/字节码等价。同一 Shader ResourceId 可能有不同阶段和入口；找到候选后用 `compare_events` 比较其他状态与指定 CBuffer。
+
+例如：“找到当前 Pixel Shader 在这一帧还被哪些 Draw 使用”、“只在这个 pass 查找 Shader 6150 的引用，并比较两个事件的管线状态”。Shader ID 和 EID 都须来自当前 capture。
+
+实际 capture 验收命令（独立隐藏 GUI；只扫描指定子树，保持用户配置）：
+
+```powershell
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\shader_references_live.py --launch E:/Captures/pragmata1.rdc --parent-event 3738 --event 3820 --guard-resource 390180 --guard-point 340 576
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\shader_references_live.py --launch "E:/Captures/恋与深空尝试截帧.rdc" --parent-event 2712 --event 27 --guard-resource 72716
+```
+
+脚本与独立原生 GetShader/GetShaderEntryPoint 结果逐项比对，并观察首次及刷新各事件/阶段恰读取一次、缓存页零新增回放。恢复检查使用事先确认重复回放稳定、扫描后确有变化的采样点；并不保证 capture 的其他资源都可逐位重复。
 
 ## GPU 计数器与回放耗时
 

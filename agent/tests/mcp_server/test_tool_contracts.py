@@ -73,6 +73,7 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "set_event": {"event_id": 20},
             "get_pipeline_state": {"event_id": 20},
             "get_shader": {"event_id": 30, "stage": "pixel", "include_disassembly": True},
+            "find_shader_references": {"resource_id": "3001", "stages": ["vertex"]},
             "get_shader_source": {"event_id": 30, "stage": "pixel", "file_index": 0},
             "decompile_shader": {"event_id": 30, "stage": "pixel"},
             "get_cbuffer": {"event_id": 30, "stage": "pixel", "index": 0},
@@ -117,6 +118,9 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert results["get_api_calls"]["data"]["actionEventId"] == 30
     assert results["get_api_calls"]["nextCursor"]
     assert results["get_api_calls"]["effect"] == "read"
+    assert results["find_shader_references"]["effect"] == "read"
+    assert [row["eventId"] for row in results["find_shader_references"]["data"]["references"]] == [10, 30]
+    assert results["find_shader_references"]["data"]["coverage"]["complete"]
     assert results["compare_events"]["effect"] == "read"
     assert results["compare_events"]["data"]["beforeEventId"] == 10
     assert results["compare_events"]["data"]["afterEventId"] == 30

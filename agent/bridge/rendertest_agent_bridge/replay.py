@@ -87,7 +87,7 @@ class ReplayRunner(object):
                 if force_restore:
                     if box["before"] is None:
                         raise AgentBridgeError("INVALID_EVENT", "The UI has no event to restore "
-                                               "after replay counter sampling.")
+                                               "after replay work.")
                     moved = True
                 if event_id is not None:
                     moved = True
@@ -99,7 +99,7 @@ class ReplayRunner(object):
                     context.check_cancelled()
                     if (self.state.snapshot().get("captureSessionId") or "") != session:
                         raise AgentBridgeError("CAPTURE_CHANGED", "The capture changed during "
-                                               "replay counter sampling.")
+                                               "replay work.")
             except BaseException as error:
                 box["error"] = error
                 box["trace"] = traceback.format_exc()
@@ -174,7 +174,7 @@ class ReplayRunner(object):
         manager.BlockInvoke(follow)
         if force_restore and (not status["ran"] or status["error"] is not None):
             raise AgentBridgeError("REPLAY_ERROR", "Could not force replay back to the latest "
-                                   "UI event after counter sampling.")
+                                   "UI event after replay work.")
         return latest
 
 

@@ -1,6 +1,6 @@
 ---
 name: rendertest-shader-debug
-description: Inspect shaders bound at a RenderTest event - embedded source, generated HLSL/GLSL, reflection, resource bindings, constant buffer values and disassembly - to explain calculations or parameters. Use for shader source or logic, compute-thread debugging, CBuffer, sampler or binding questions about a RenderDoc capture.
+description: Inspect shaders bound at a RenderTest event - embedded source, generated HLSL/GLSL, reflection, resource bindings, constant buffer values and disassembly - to explain calculations or parameters. Use for shader source or logic, finding events that bind a shader, compute-thread debugging, CBuffer, sampler or binding questions about a RenderDoc capture.
 ---
 
 # Inspect shaders
@@ -19,6 +19,14 @@ Follow `rendertest-core`.
    HLSL tessellation output is unsupported by this release; auto selects GLSL for hull/domain. Auto already tries GLSL after an HLSL backend rejection. Only when an explicit HLSL request fails at SPIRV-Cross can one GLSL attempt help. A missing/modified release, invalid bytecode or timeout calls for the reported remedy or disassembly, not repeated conversions. OpenGL GLSL, OpenGLSPIRV and other encodings are not accepted by this tool.
 7. If generation is unavailable, or exact instructions are needed, read disassembly with `get_shader(stage=..., event_id=..., include_disassembly=true, target=...)`. Output over 256 KiB is written to `disassemblyArtifact`; use `read_artifact` for the relevant parts. Do not present disassembly or inferred pseudocode as recovered source.
 8. Verify sampled texture content with `pick_pixel` or `export_texture`, not from texture names.
+
+## Finding shader references
+
+- Obtain the exact Shader ResourceId from `get_shader`, `inspect_event` or `get_pipeline_state`, then call `find_shader_references(resource_id="...", stages=["pixel"])`. Omit `stages` to check all supported stages, or pass the relevant nonempty stage list. A ResourceId may identify several stage/entry-point uses; keep every returned `matches` stage and `entryPoint` with the EID. Missing reflection does not negate a confirmed binding.
+- Omission of `parent_event_id` searches the whole capture. Pass an actual action/marker EID to search it and its descendants. The tool scans leaf draw/compute/mesh actions and filters their applicable stages, avoiding stale shaders at copy/clear/marker events. Ray shader tables are unsupported and reported as a coverage gap. These are bound references, not proof of invocation, nonzero work or source/bytecode equivalence.
+- `limit` bounds returned event rows; `scan_budget` bounds candidate visits per call, including cache hits. Follow `nextCursor` with the same resource, stages and parent until exhausted. A page can contain zero references and still have more candidates to examine. Inspect `coverage.processedCandidateCount`, `candidateEventCount`, `scanComplete` and `complete`; an unfinished or unsupported scope cannot prove there are no other uses.
+- A capture-scoped binding cache avoids replaying already inspected events, including when searching another shader or stage. Keep `scanId` and `scanStartedAtUtc`; this is a progressive observation, not one atomic capture-wide read. Use `refresh=true` without a cursor after in-session shader/resource edits. A successful refresh starts a new shared cache generation and invalidates all older reference-search cursors; do not mix their pages. Native replay calls cannot be instantly cancelled.
+- Use a useful pass/subtree when the question is local. Scanning preserves the UI selection and restores replay after each batch. Follow matching events with `inspect_event`, `get_shader` or `compare_events`; navigate with `set_event` only when requested.
 
 ## Stepping a pixel shader
 
@@ -62,5 +70,5 @@ Use `debug_compute(event_id=..., group=[gx,gy,gz], thread=[tx,ty,tz])` to inspec
 
 - Disassembly (DXIL, DXBC, SPIR-V...) is not source code; do not call it source. Names may be missing, so cite registers or byte offsets together with your inferred meaning.
 - For "which parameters affect the colour", trace back from the output write: which inputs, texture samples and constant fields feed it. Then list their actual values and anything suspicious: 0, NaN, Inf, extreme values, mismatches with similar draws, sRGB formats read as data.
-- To check a suspicious parameter, locate similar draws with `find_actions` and confirm their Shader ResourceIds with `get_shader`; `find_actions` does not filter by Shader ResourceId. Use `compare_events(before_event_id=..., after_event_id=..., stages=["pixel"], cbuffers=[{"stage":"pixel","index":0,"member_path":"viewProjMat","max_depth":0}])` for the selected member plus pipeline changes. Check actual block names/indices first and read `coverage`/warnings: a truncated or unavailable member cannot prove equality. Different layout or Shader identity can change the meaning of the same ordinal path. See `rendertest-event-analysis` for diff paging and scope.
+- To check a suspicious parameter, use `find_shader_references` to locate events binding the same Shader ResourceId, or `find_actions` for name/flag similarities. Confirm stage and entry point with `get_shader`; a common shader alone does not make other bindings or state equal. Use `compare_events(before_event_id=..., after_event_id=..., stages=["pixel"], cbuffers=[{"stage":"pixel","index":0,"member_path":"viewProjMat","max_depth":0}])` for the selected member plus pipeline changes. Check actual block names/indices first and read `coverage`/warnings: a truncated or unavailable member cannot prove equality. Different layout or Shader identity can change the meaning of the same ordinal path. See `rendertest-event-analysis` for diff paging and scope.
 - Editing constant buffers and editing or replacing shaders are not available. When a conclusion needs an experiment, describe the experiment instead of claiming it was run.

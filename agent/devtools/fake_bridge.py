@@ -80,6 +80,7 @@ class FakeRenderTestBridge:
         self._resources = self._build_resources()
         self._usage = self._build_usage()
         self._gpu_duration_sample: dict[str, Any] | None = None
+        self._shader_reference_scan: dict[str, Any] | None = None
         self._poll_stop = threading.Event()
         self._poll_thread: threading.Thread | None = None
         self.server = MailboxServer(
@@ -596,6 +597,98 @@ class FakeRenderTestBridge:
                 details={"event_id": event_id, "stage": stage},
             )
         return event_id, shader_id
+
+    def _method_find_shader_references(self, params: dict[str, Any]) -> BridgeResult:
+        resource_id = params["resource_id"]
+        resource = self._resources.get(resource_id)
+        if resource is None or resource.get("kind") != "shader":
+            raise AgentBridgeError("INVALID_RESOURCE", "An exact Shader ResourceId is required.")
+        all_stages = ["vertex", "hull", "domain", "geometry", "pixel", "compute", "amplification", "mesh"]
+        stages = [stage for stage in all_stages if params.get("stages") is None or stage in params["stages"]]
+        parent = params.get("parent_event_id")
+        if parent is not None:
+            self._event_id({"event_id": parent}, required=True)
+        cursor, refresh = params.get("cursor"), params.get("refresh", False)
+        if refresh and cursor is not None:
+            raise AgentBridgeError("INVALID_REQUEST", "refresh cannot be combined with a cursor.")
+        scan = self._shader_reference_scan
+        if scan is not None and scan["session"] != self.capture_session_id:
+            scan = None
+        if scan is None or refresh:
+            if cursor is not None:
+                raise AgentBridgeError("INVALID_REQUEST", "The shader reference scan expired.")
+            scan = {"session": self.capture_session_id, "id": uuid.uuid4().hex, "bindings": {},
+                    "startedAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+            self._shader_reference_scan = scan
+        prefix = "shader-references:%s:%s:%s:%s:%s:" % (
+            self.capture_session_id, scan["id"], resource_id, parent, ",".join(stages))
+        if cursor is not None and (not cursor.startswith(prefix) or not cursor[len(prefix):].isdigit()):
+            raise AgentBridgeError("INVALID_REQUEST", "The shader reference scan or query cursor does not match.")
+        offset = int(cursor[len(prefix):]) if cursor else 0
+        scope = list(self._actions) if parent is None else [parent]
+        if parent is not None:
+            for event_id in scope:
+                scope.extend(self._actions[event_id]["children"])
+        candidates, unsupported, stage_excluded, excluded = [], [], 0, 0
+        for event_id in scope:
+            action = self._actions[event_id]
+            flags = action["flags"]
+            if action["children"]:
+                excluded += 1
+                continue
+            if "rayDispatch" in flags or "dispatchRay" in flags:
+                unsupported.append(event_id)
+                continue
+            if "meshDispatch" in flags:
+                relevant = ["amplification", "mesh", "pixel"]
+            elif "draw" in flags:
+                relevant = ["vertex", "hull", "domain", "geometry", "pixel"]
+            elif "dispatch" in flags:
+                relevant = ["compute"]
+            else:
+                excluded += 1
+                continue
+            if not set(relevant).intersection(stages):
+                stage_excluded += 1
+                continue
+            candidates.append((event_id, relevant))
+        if offset > len(candidates):
+            raise AgentBridgeError("INVALID_REQUEST", "The shader reference cursor is beyond the candidates.")
+        rows, examined, reads, hits = [], 0, 0, 0
+        limit, budget = params.get("limit", 200), params.get("scan_budget", 200)
+        for event_id, relevant in candidates[offset:]:
+            if examined >= budget or len(rows) >= limit:
+                break
+            examined += 1
+            action = self._actions[event_id]
+            if event_id in scan["bindings"]:
+                bindings = scan["bindings"][event_id]
+                hits += 1
+            else:
+                bindings = {stage: shader for stage, shader in action.get("shaders", {}).items() if stage in relevant}
+                scan["bindings"][event_id] = bindings
+                reads += 1
+            matches = [{"stage": stage, "resourceId": resource_id, "entryPoint": "main", "entryPointKnown": True}
+                       for stage in stages if bindings.get(stage) == resource_id]
+            if matches:
+                rows.append({"eventId": event_id, "name": action["name"], "flags": action["flags"],
+                             "parentEventId": action["parentEventId"], "matches": matches})
+        end = offset + examined
+        complete = end == len(candidates)
+        coverage = {"scopeActionCount": len(scope), "candidateEventCount": len(candidates),
+                    "processedCandidateCount": end, "examinedThisPage": examined,
+                    "nativeReadsThisPage": reads, "cacheHitsThisPage": hits,
+                    "excludedActionCount": excluded, "stageExcludedActionCount": stage_excluded,
+                    "unsupportedActionCount": len(unsupported), "unsupportedActionExamples": unsupported[:16],
+                    "unsupportedStages": [], "scanComplete": complete,
+                    "complete": complete and not unsupported}
+        return BridgeResult(_payload({"resourceId": resource_id, "resourceName": resource["name"],
+                                      "stages": stages, "parentEventId": parent, "scanId": scan["id"],
+                                      "scanStartedAtUtc": scan["startedAt"], "references": rows, "coverage": coverage},
+                                     next_cursor=prefix + str(end) if not complete else None,
+                                     truncated=not coverage["complete"],
+                                     warnings=["Synthetic bound references do not prove shader execution."]),
+                            self._read_meta(self.current_event_id))
 
     def _method_get_shader(self, params: dict[str, Any]) -> BridgeResult:
         event_id, shader_id = self._shader_id(params)
