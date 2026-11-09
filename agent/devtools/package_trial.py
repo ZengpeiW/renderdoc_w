@@ -7,6 +7,7 @@ symbols or editable venv paths are copied. AI provider CLIs remain user-installe
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import html
 import importlib.metadata as metadata
@@ -32,6 +33,41 @@ NATIVE_FILES = (
     'Qt5Core.dll', 'Qt5Gui.dll', 'Qt5Network.dll', 'Qt5Svg.dll', 'Qt5Widgets.dll',
     'd3dcompiler_47.dll', 'dbghelp.dll', 'symsrv.dll', 'symsrv.yes',
 )
+ANDROID_ABIS = {'arm64': ('arm64-v8a', 2, 183), 'arm32': ('armeabi-v7a', 1, 40)}
+
+
+def validate_android_apk(path, abi, host_commit, host_version_code):
+    """Reject missing payloads and wrong ELF architecture before distributing an APK.
+
+    Cryptographic signature verification is performed by build_android.ps1.
+    """
+    native_abi, elf_class, machine = ANDROID_ABIS[abi]
+    info = json.loads(path.with_suffix('.apk.json').read_text(encoding='utf-8'))
+    expected = {'packageName': f'org.renderdoc.renderdoccmd.{abi}', 'abi': native_abi,
+                'versionName': host_commit, 'versionCode': host_version_code, 'sha256': sha(path)}
+    if any(info.get(key) != value for key, value in expected.items()):
+        raise RuntimeError('Android APK metadata/hash does not match the PC library; rebuild both: ' + str(path))
+    with zipfile.ZipFile(path) as archive:
+        if archive.testzip() is not None:
+            raise RuntimeError('Corrupt Android APK: ' + str(path))
+        for name in ('AndroidManifest.xml', 'classes.dex', f'lib/{native_abi}/wrap.sh'):
+            if not archive.read(name):
+                raise RuntimeError('Empty APK entry: ' + name)
+        for library in ('librenderdoccmd.so', 'libVkLayer_GLES_RenderDoc.so'):
+            with archive.open(f'lib/{native_abi}/{library}') as stream:
+                header = stream.read(20)
+            if (len(header) != 20 or header[:4] != b'\x7fELF' or header[4] != elf_class
+                    or header[5] != 1 or int.from_bytes(header[18:20], 'little') != machine):
+                raise RuntimeError(f'Wrong ELF architecture in {path}: {library}')
+    return info
+
+
+def native_version(path):
+    library = ctypes.CDLL(str(path))
+    library.RENDERDOC_GetCommitHash.restype = ctypes.c_char_p
+    library.RENDERDOC_GetVersionString.restype = ctypes.c_char_p
+    return (library.RENDERDOC_GetCommitHash().decode('ascii'),
+            library.RENDERDOC_GetVersionString().decode('ascii'))
 
 
 def sha(path):
@@ -193,11 +229,23 @@ def main():
         parser.error('Use the tested Windows Python 3.14.7 MCP venv')
     if sha(args.python_zip) != PYTHON_SHA256:
         raise RuntimeError('Python archive does not match the official release SHA-256')
+    release = REPO / 'x64/Release'
+    host_commit, host_version = native_version(release / 'rendertest.dll')
+    if not re.fullmatch(r'\d+\.\d+', host_version):
+        raise RuntimeError('Unexpected PC library version: ' + host_version)
+    android_metadata = []
+    android_apks = [release / 'plugins/android' / f'org.renderdoc.renderdoccmd.{abi}.apk'
+                    for abi in ANDROID_ABIS]
+    for abi, apk in zip(ANDROID_ABIS, android_apks):
+        if not apk.is_file():
+            raise RuntimeError('Missing Android APK; run build_android.bat both first: ' + str(apk))
+        android_metadata.append(validate_android_apk(apk, abi, host_commit, host_version.replace('.', '')))
     target = REPO / 'package' / args.name
     target.mkdir(parents=True, exist_ok=False)  # Never remove or overwrite a previous delivery.
-    release = REPO / 'x64/Release'
     for name in NATIVE_FILES:
         copy(release / name, target / name)
+    for apk in android_apks:
+        copy(apk, target / 'plugins/android' / apk.name)
     for folder in ('qtplugins', 'pymodules'):
         for path in (release / folder).rglob('*'):
             if path.is_file() and path.suffix in ('.dll', '.pyd'):
@@ -283,6 +331,7 @@ RenderDoc upstream: https://github.com/baldurk/renderdoc
             raise RuntimeError('Unexpected development/private artifact: ' + relative)
         files.append({'path': relative, 'size': path.stat().st_size, 'sha256': sha(path)})
     text(target / 'PACKAGE_MANIFEST.json', json.dumps({'name': args.name, 'sourceCommit': revision,
+         'nativeCommit': host_commit, 'nativeVersion': host_version, 'androidPackages': android_metadata,
          'platform': 'windows-x86_64', 'archiveRoot': 'RenderTest', 'pythonSource': PYTHON_URL, 'pythonArchiveSha256': PYTHON_SHA256,
          'toolCount': 35, 'skillCount': 4, 'dependencies': versions, 'files': files}, ensure_ascii=False, indent=2) + '\n')
     print('Staged:', target, flush=True)

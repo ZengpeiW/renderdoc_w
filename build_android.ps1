@@ -1,6 +1,7 @@
 param(
     [ValidateSet('arm64', 'arm32', 'both', 'setup', 'clean', 'help')]
-    [string]$Target = 'both'
+    [string]$Target = 'both',
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'x64\Release\plugins\android')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -296,10 +297,13 @@ Include = /etc/pacman.d/mirrorlist.msys
 
 function Test-AndroidApk($Toolchain, [string]$Abi) {
     $apkPath = Join-Path $repoRoot "build-android-$Abi\bin\org.renderdoc.renderdoccmd.$Abi.apk"
+    $nativeAbi = if ($Abi -eq 'arm64') { 'arm64-v8a' } else { 'armeabi-v7a' }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [IO.Compression.ZipFile]::OpenRead($apkPath)
     try {
-        foreach ($entryName in @('AndroidManifest.xml', 'classes.dex')) {
+        foreach ($entryName in @('AndroidManifest.xml', 'classes.dex',
+            "lib/$nativeAbi/librenderdoccmd.so", "lib/$nativeAbi/libVkLayer_GLES_RenderDoc.so",
+            "lib/$nativeAbi/wrap.sh")) {
             $entry = $archive.GetEntry($entryName)
             if ($null -eq $entry -or $entry.Length -eq 0) {
                 throw "APK is incomplete: '$entryName' is missing or empty in '$apkPath'."
@@ -312,6 +316,25 @@ function Test-AndroidApk($Toolchain, [string]$Abi) {
     $java = Join-Path $Toolchain.JavaHome 'bin\java.exe'
     $signer = Join-Path $Toolchain.AndroidSdk "build-tools\$buildToolsVersion\lib\apksigner.jar"
     Invoke-Checked $java @('-jar', $signer, 'verify', '--verbose', $apkPath)
+    $badging = & (Join-Path $Toolchain.AndroidSdk "build-tools\$buildToolsVersion\aapt.exe") dump badging $apkPath
+    if ($LASTEXITCODE -ne 0) { throw "Cannot read APK metadata: $apkPath" }
+    $packageLine = $badging | Where-Object { $_ -match '^package: ' }
+    if ($packageLine -notmatch "name='([^']+)' versionCode='([^']+)' versionName='([^']+)'") {
+        throw "Cannot parse APK package version: $apkPath"
+    }
+    $metadata = [ordered]@{
+        packageName = $Matches[1]
+        versionCode = $Matches[2]
+        versionName = $Matches[3]
+        abi = $nativeAbi
+        sha256 = (Get-FileHash -LiteralPath $apkPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    if ($metadata.packageName -ne "org.renderdoc.renderdoccmd.$Abi" -or
+        $badging -notcontains "native-code: '$nativeAbi'") {
+        throw "Unexpected APK package or ABI: $apkPath"
+    }
+    [IO.File]::WriteAllText("$apkPath.json", ($metadata | ConvertTo-Json) + "`n", [Text.UTF8Encoding]::new($false))
+    Write-Host $packageLine
     Write-Host "[OK] APK contents and signature verified: $apkPath"
 }
 
@@ -402,7 +425,8 @@ function Invoke-AndroidBuild($Toolchain, [bool]$BuildArm64, [bool]$BuildArm32) {
 
 try {
     if ($Target -eq 'help') {
-        Write-Host 'Usage: build_android.bat [arm64|arm32|both|setup|clean]'
+        Write-Host 'Usage: build_android.bat [arm64|arm32|both|setup|clean] [-OutputDirectory PATH]'
+        Write-Host '  Verified APKs are copied to x64\Release\plugins\android by default.'
         Write-Host ''
         Write-Host '  setup  Download and configure dependencies without building.'
         Write-Host '  clean  Remove build-android-arm32 and build-android-arm64.'
@@ -438,6 +462,16 @@ try {
 
     if ($Target -in @('arm64', 'both')) { Test-AndroidApk $toolchain 'arm64' }
     if ($Target -in @('arm32', 'both')) { Test-AndroidApk $toolchain 'arm32' }
+
+    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+    foreach ($abi in @('arm64', 'arm32')) {
+        if ($Target -in @($abi, 'both')) {
+            $apkName = "org.renderdoc.renderdoccmd.$abi.apk"
+            Copy-Item -LiteralPath (Join-Path $repoRoot "build-android-$abi\bin\$apkName") -Destination (Join-Path $OutputDirectory $apkName) -Force
+            Copy-Item -LiteralPath (Join-Path $repoRoot "build-android-$abi\bin\$apkName.json") -Destination (Join-Path $OutputDirectory "$apkName.json") -Force
+        }
+    }
+    Write-Host "Verified APKs staged in $OutputDirectory"
 
     Write-Section 'Build completed successfully'
     if ($Target -in @('arm64', 'both')) {

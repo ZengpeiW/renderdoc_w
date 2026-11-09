@@ -4,13 +4,13 @@
 
 ## 构包
 
-1. 准备已验证的 `x64/Release` 程序、Bridge、Skill 和 release 反编译器。
+1. 准备已验证的 `x64/Release` 程序、Bridge、Skill 和 release 反编译器。先构建配套 Android APK（见下文），打包器要求同时存在 ARM64/ARM32 包及构建元数据，并核对 APK 与 PC DLL 的版本一致。
 2. 使用安装了项目及 Claude 可选依赖的 Windows Python **3.14.7 x64** 开发环境。打包器从 `pyproject.toml` 验证依赖约束并复制完整运行依赖闭包，包括依赖所要求的 extras。
 3. 下载 [Python 3.14.7 Windows x64 embeddable release](https://www.python.org/downloads/release/python-3147/) 到 `package/_inputs/python-3.14.7-embed-amd64.zip`。打包器会核对代码中固定的官方 SHA-256。
 4. 指定本机 Visual Studio 安装附带的 x64 CRT Redistributable 目录：
 
 ```powershell
-agent\mcp_server\.venv\Scripts\python.exe agent\devtools\package_trial.py --msvc-redist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT"
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\package_trial.py --name RenderTest-AI-Assistant-2026.11.09-android-win64 --msvc-redist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT"
 ```
 
 默认输出 `package/RenderTest-AI-Assistant-2026.11.09-win64/`、同名 ZIP 和 `.zip.sha256`；ZIP 内顶层统一为短目录 `RenderTest`，降低默认解压时的路径长度。发布下一版时传 `--name`。已有同名目录会拒绝覆盖。`--no-zip` 只生成目录。
@@ -19,11 +19,21 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\package_trial.py --msvc
 
 `PACKAGE_MANIFEST.json` 记录源码基准提交、Python 来源、依赖版本，以及每个文件的大小和 SHA-256（不含该清单自身）；ZIP 哈希另存于压缩包旁。没有模型账号、用户配置、历史、日志或 capture。
 
+## Android 截帧服务
+
+在仓库根运行 `build_android.bat both`（需要 PowerShell 7 和 MSYS2；脚本会准备 SDK/NDK/JDK）。也可分别传 `arm64`、`arm32`。已有工具链可通过 `RENDERDOC_ANDROID_DEPS`、`ANDROID_SDK_ROOT`、`RENDERDOC_JAVA_HOME`、`MSYS2_ROOT` 指定。
+
+构建输出为 `build-android-arm64/bin/org.renderdoc.renderdoccmd.arm64.apk` 和 `build-android-arm32/bin/org.renderdoc.renderdoccmd.arm32.apk`。脚本检查 Manifest、DEX、截帧库、启动库、wrap.sh、包名、ABI 和 APK 签名，通过后复制到 `x64/Release/plugins/android/`；可用 `-OutputDirectory` 改变复制位置。每个 APK 的 `.apk.json` 记录 aapt 读取的版本和 SHA-256，仅供构包输入使用，不包含签名私钥。
+
+PC 端按上述原始包名发现服务。不要只将文件改名为 rendertestcmd，也不要混用其他 RenderDoc 版本的 APK。打包器还校验 ELF 架构，并对比 PC DLL 实际导出的提交哈希、版本号与 APK 元数据；不匹配时拒绝构包。更新源码提交后需重建 PC 原生库与 Android 服务，不能仅修改版本标签。`PACKAGE_MANIFEST.json` 记录 `nativeCommit`、`nativeVersion`、`androidPackages` 和所有 APK 文件哈希。
+
+新试用包可用 `--name RenderTest-AI-Assistant-2026.11.09-android-win64` 生成，保留此前 PC-only 包。包内携带两种 ARM APK，Android SDK/ADB/JDK 由使用者配置；手机安装、连接及实际捕获需另做真机验收。
+
 ## 验证
 
 ```powershell
-package\RenderTest-AI-Assistant-2026.11.09-win64\runtime\python\python.exe -B package\RenderTest-AI-Assistant-2026.11.09-win64\tools\check_environment.py --verify-files
-agent\mcp_server\.venv\Scripts\python.exe agent\devtools\trial_package_smoke.py --package package/RenderTest-AI-Assistant-2026.11.09-win64.zip --capture E:/Captures/pragmata1.rdc --parent-event 7726
+package\RenderTest-AI-Assistant-2026.11.09-android-win64\runtime\python\python.exe -B package\RenderTest-AI-Assistant-2026.11.09-android-win64\tools\check_environment.py --verify-files
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\trial_package_smoke.py --package package/RenderTest-AI-Assistant-2026.11.09-android-win64.zip --capture E:/Captures/pragmata1.rdc --parent-event 7726 --work-dir E:/Captures/TrialValidation
 ```
 
 第二条会解压到新建的含空格目录，使用包内隔离 Python、独立临时配置和自建隐藏 GUI，验证真实 stdio MCP、35 个工具、4 个 Skill、Bridge 和有界 capture 查询；只关闭自建进程。它不启动 AI harness、不调用在线模型。实际机器仍需符合 capture 的 GPU/驱动要求；该验证不等于覆盖所有干净 Windows 安装。

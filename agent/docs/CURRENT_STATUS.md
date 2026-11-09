@@ -6,10 +6,10 @@
 
 - 工作目录：`E:\PersonalWorkSpace\git_repo\renderdoc`。
 - 当前分支：`local_test`。
-- 本轮基于 `2439ca6b5`，补齐面向试用者的使用文档、Windows x64 打包脚本及迁移验证脚本；分析工具功能保持该提交的版本。
+- PC 试用包文档与分发链路已提交为 `cea0664bb`；本轮在其基础上补齐 Android ARM64/ARM32 截帧服务构建、分发和版本校验，分析工具功能不变。
 - MVP/M0–M4、M5a–M5d 已实现，已有可使用的内嵌 AI 助手；目前有 **35 个 MCP 工具、4 个 Skill、Codex 和 Claude 两种 harness**。
 - DeepSeek harness 未接入。最近完成的 `get_pass_resources` 提供 Pass/事件范围的资源用途与前后使用查询，读取原生 GetUsage 元数据，不移动回放；结果不代表像素/字节级依赖或引擎原生 RDG。
-- 已生成约 80 MB 的试用 ZIP，包含独立 Python/MCP、Bridge、Skill 和 release 反编译器；Codex/Claude CLI 及账号由试用者自行安装和登录。ZIP、运行库和验证产物不提交 Git。
+- 已保留约 80 MB 的旧 PC 试用 ZIP；本轮新包额外携带 Android ARM64/ARM32 截帧 APK 和配套 PC DLL。独立 Python/MCP、Bridge、Skill 和 release 反编译器仍随包提供；Codex/Claude CLI、账号及 Android SDK/ADB/JDK 由试用者自行配置。ZIP、运行库和验证产物不提交 Git。
 - 原有未跟踪文件 `renderdoc/data/renderdoc.rc.bak` 未修改、删除或纳入提交。
 
 面向试用者的使用说明见 [AI Assistant 使用指南](AI_ASSISTANT_USER_GUIDE.md)，构包与复验说明见 [试用包维护](../distribution/README.md)，开发接口说明见 [agent/README.md](../README.md)。[MVP_DESIGN.md](MVP_DESIGN.md) 和 [M5_DESIGN.md](M5_DESIGN.md) 保留设计过程，部分早期范围和界面示例不代表当前实现，例如最初 M5 不包含 Claude、示例工具数量少于现在。
@@ -30,7 +30,8 @@
 | `2348074f8` / `794c88579` | Claude Windows 启动修复，长系统提示通过文件传递，短提示保留内联 |
 | `9a4a88089` | Shader 引用搜索、候选扫描预算、跨查询绑定缓存和覆盖状态 |
 | `2439ca6b5` | Pass 资源用途、真实事件边界、前后相邻使用及共享用途缓存 |
-| 本次（2026-11-09） | 使用指南、Windows x64 试用包构建/环境检查/迁移验证脚本；二进制产物不入库 |
+| `cea0664bb` | 使用指南、Windows x64 试用包构建/环境检查/迁移验证脚本 |
+| 本次（2026-11-09） | Android ARM64/ARM32 截帧 APK 分发、PC/APK 版本匹配校验与配套试用包；二进制产物不入库 |
 
 ## 2. 架构、面板与历史
 
@@ -188,7 +189,7 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 | 反编译 release | `<exe目录>/integrations/rendertest_agent/tools/shader_decompiler/` |
 | 默认 IPC/日志/历史根 | `%LOCALAPPDATA%/RenderTest/agent`，可用 `RENDERTEST_AGENT_ROOT` 覆盖 |
 
-最新 Bridge、Skill 和反编译 release 部署在上述原路径。使用新版本需重启 RenderTest，并新建 AI 对话刷新工具/指令。GPU 扩展已重新构建并部署原生 DLL/PDB，包含 D3D12 默认不锁频的逻辑；后续 Shader 引用和 Pass 资源用途扩展只涉及 Python/Skill。本轮文档与分发脚本未重新编译原生程序。
+最新 Bridge、Skill 和反编译 release 部署在上述原路径。使用新版本需重启 RenderTest，并新建 AI 对话刷新工具/指令。GPU 扩展已重新构建并部署原生 DLL/PDB，包含 D3D12 默认不锁频的逻辑；后续 Shader 引用和 Pass 资源用途扩展只涉及 Python/Skill。本轮为匹配 Android APK 重新构建 PC 原生 DLL：实际导出的版本为 `1.47`、提交 `cea0664bb9a781c8df28de6bb98c023ce87060e6`，与两种 APK 一致。此前 DLL 内嵌提交仍为 `9851069ef`，不能直接配用新 APK。
 
 正常构建 `qrenderdoc/qrenderdoc_local.vcxproj` 会部署 Bridge 和 Skill；反编译 release 单独安装。非空安装目录只校验、不覆盖；损坏时先改名保留，再重新安装。其他安装位置用 `--output`，运行时配 `RENDERTEST_SHADER_DECOMPILER_DIR`，仍执行固定哈希检查。
 
@@ -196,15 +197,25 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 
 - 使用指南源码：`agent/docs/AI_ASSISTANT_USER_GUIDE.md`，包含安装/登录、模型设置、Ask AI、历史续聊、35 个工具速查、4 个 Skill、提问示例及排障。打包时生成离线 `README.html`，无需访问网站即可阅读。
 - 构包入口：`agent/devtools/package_trial.py`；启动与检查模板在 `agent/distribution/`，具体命令见其 README。使用已验证的 Release 白名单和官方 Python 3.14.7 x64 embeddable 包，不复制开发 venv。依赖从项目约束解析，包括传递 extras；当前 MCP 1.30.0、Claude SDK 0.2.152，共 32 个第三方 Python distribution。保留 pywin32 的相对路径初始化，排除 editable、缓存、符号和 SDK 内置 Claude CLI。
-- 随包包括 app-local MSVC CRT、原生 Python 3.6、独立 MCP Python、两份 Skill 目录、6 个反编译组件及对应许可。`PACKAGE_MANIFEST.json` 记录基准源码提交、依赖版本、文件大小和 SHA-256；ZIP 总哈希单独提供。不含用户配置、认证、历史、日志或 capture，也没有 Android/32 位捕获配套文件。
-- 当前交付：`package/RenderTest-AI-Assistant-2026.11.09-win64.zip`，**79,960,014 字节**，ZIP 内顶层为短目录 `RenderTest`，共 1762 个文件。SHA-256：`2c3bac52965e03579db0cb9f7fc730321ef56cf72648b2b31e3c5b2bc2ae7d94`。同名展开目录、`.zip.sha256` 和下载输入均为本地产物；`/package/` 已被 Git 忽略，不纳入本次提交。该包清单的基准功能提交为 `2439ca6b5`，本次提交保存其构包脚本与文档，不更改已交付 ZIP。
+- 随包包括 app-local MSVC CRT、原生 Python 3.6、独立 MCP Python、两份 Skill 目录、6 个反编译组件及对应许可，以及 Android ARM64/ARM32 APK。`PACKAGE_MANIFEST.json` 记录源码提交、原生 DLL 实际版本、APK 元数据、依赖版本、文件大小和 SHA-256；ZIP 总哈希单独提供。不含用户配置、认证、历史、日志、capture 或 Windows 32 位捕获配套文件。
+- 旧 PC-only 交付保留：`package/RenderTest-AI-Assistant-2026.11.09-win64.zip`，**79,960,014 字节**，共 1762 个文件，SHA-256 为 `2c3bac52965e03579db0cb9f7fc730321ef56cf72648b2b31e3c5b2bc2ae7d94`。其清单基准功能提交为 `2439ca6b5`。新交付为 `package/RenderTest-AI-Assistant-2026.11.09-android-win64.zip`，仍以短目录 `RenderTest` 为 ZIP 顶层；同名展开目录、`.zip.sha256` 和下载输入均为本地产物，`/package/` 已被 Git 忽略。
 - 试用者完整解压到 `D:\Tools\RenderTest` 等短目录，双击 `Start-RenderTest.cmd`；它指定随包 MCP Python 和运行库路径。`Check-Environment.cmd` 做离线导入/目录检查，`tools/check_environment.py --verify-files` 可再验证全量哈希。直接运行 EXE 时需在 Settings 指定随包 MCP Python。历史仍默认写入当前用户 `%LOCALAPPDATA%/RenderTest/agent`。
 - 首次启动可能出现原生统计选项提示，按用户偏好完成后继续。每人自行安装并认证 Codex 或 Claude 原生 CLI；包内没有账号。文档明确模型会收到问题、上下文和返回的 capture 数据。
 - 已确认旧 GUI 内嵌 Python 的 Windows 长路径限制：迁移测试中 266 字符的 `cbuffer_members.py` 路径加载失败，而 259 字符的相邻模块仍可读取；短路径通过。最终 ZIP 缩短顶层名称，并在指南中建议短解压目录，未修改底层长路径实现。
 
+### Android 截帧 APK（2026-11-09 补齐）
+
+- `build_android.bat both` 构建 ARM64/ARM32，经内容、包名、ABI 和 v1/v2 签名校验后，默认复制到 `x64/Release/plugins/android/`。该目录是 PC 端安装服务的首选查找位置；此前旧 APK 只存在于构建目录，试用包未收录。
+- 保留协议包名 `org.renderdoc.renderdoccmd.arm64.apk` / `org.renderdoc.renderdoccmd.arm32.apk` 和手机显示名 RenderDocCmd。原生库仍为 `librenderdoccmd.so`、`libVkLayer_GLES_RenderDoc.so`，不要单独改名。
+- 本机工具链：NDK `26.3.11579264`、build-tools `26.0.1`、JDK `8u432-b06`，API 21 原生目标，Manifest target SDK 26；版本 code `147`、name `cea0664bb9a781c8df28de6bb98c023ce87060e6`。使用现有 SDK/JDK 缓存完成构建。
+- 打包器要求两种 APK 及构建产生的 `.apk.json`，校验哈希、ELF 架构以及与 PC DLL 实际导出版本的匹配。元数据不随 APK 裸复制给使用者，已汇总进总包 `PACKAGE_MANIFEST.json`；签名私钥不分发。
+- 新 ZIP **94,487,678 字节**，SHA-256：`eb30247590cfa65fafd1d03e6f6c745de96b4bb5162f9a71e5fae6a6124cc2e1`。构建日志在 `package/android-build-2026.11.09.log` 和 `package/android-host-build-2026.11.09.log`。Windows 构建需显式指定 `CLToolPath` / `LinkToolPath` 为 MSVC `HostX64/x64`；仅 `PreferredToolArchitecture=x64` 在此旧工程中仍选中 HostX86，曾触发编译器堆耗尽，最终 HostX64 构建 exit 0。
+- 两种 APK 的内容与签名、总包全量文件哈希及 7 项针对性回归已通过。当前 ADB 只发现首选 ABI 为 x86_64 的环境，未安装或修改设备；ARM 真机安装、连接、启动目标应用及实际截帧尚未验收。包内不包含 x86/x64 Android APK 或 SDK/ADB/JDK，主窗口手动截帧流程不等于新增 AI 自动 Android 工具。
+- 新包迁移验证通过：`E:/Captures/TrialValidation/Trial Smoke e5406aa83fb0/report.json`，1764 个文件，独立 Python、35 个工具、4 个 Skill、真实 `pragmata1.rdc` 的有界 Pass 查询均通过，测试进程已退出，用户配置哈希保持一致，在线模型调用为零。该记录验证 PC 回放及包迁移，不替代 ARM 真机截帧验收。
+
 ## 6. 已有验证记录与复现
 
-本轮验证试用包文件完整性、独立依赖和迁移后的真实 capture 工具调用，未调用在线模型，也未重新运行无改动的分析工具全套测试；其最新全套结果来自 `2439ca6b5`。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 和下列 `E:/Captures/TrialValidation/` 证据不跟踪到 Git，换机器后可能不存在。
+本轮增加 Android 构建、签名/内容/架构/版本匹配检查和 7 项打包回归测试。分析工具未改动，其最新全套结果来自 `2439ca6b5`；试用包迁移检查不调用在线模型。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 和下列 `E:/Captures/TrialValidation/` 证据不跟踪到 Git，换机器后可能不存在。
 
 | 范围 | 已有结果与边界 |
 | --- | --- |

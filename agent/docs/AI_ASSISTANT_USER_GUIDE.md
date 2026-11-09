@@ -14,7 +14,7 @@ AI Assistant 可以读取 RenderTest 当前打开的 RenderDoc capture，用自�
 
 压缩包包含 RenderTest、Bridge、MCP 所需的 Python 和依赖、4 个 Skill，以及 Shader 反编译工具。**不需要另外安装 Python**。Codex CLI、Claude Code CLI、模型账号和登录凭据不随包提供。
 
-本包聚焦 **x64 环境下已有 capture 的回放与分析**，未包含 Android 或 32 位应用捕获所需的支持文件。
+本包包含 Windows x64 回放与分析程序，以及 Android ARM64/ARM32 截帧服务 APK（`plugins/android/`）。不包含 Windows 32 位应用捕获所需的支持文件。Android SDK/ADB 和 JDK 需自行配置。
 
 模型会接收到你的提问、随问题附带的上下文，以及工具返回的 capture 数据；需要看图时也可能收到导出的图片。请使用允许发送给所选 AI 服务的 capture。
 
@@ -32,6 +32,17 @@ AI Assistant 可以读取 RenderTest 当前打开的 RenderDoc capture，用自�
 第一次发问时会启动后端并连接工具。面板顶部显示 `Ready`，连接正常时会显示 `rendertest` 和工具数量；生成回答时显示 `Working`。工具卡片出现实际调用结果，说明 AI 已开始读取 capture。
 
 根目录的 `README.html` 可直接用浏览器阅读；本文件是 Markdown 原稿。若直接双击 `qrendertest.exe`，需要在 Settings 的 **MCP Python executable** 中指定解压目录里的 `runtime\python\python.exe`。推荐始终使用启动脚本。
+
+### Android 设备截帧
+
+1. 准备已开启 USB 调试并授权本机的 ARM Android 设备，确认 `adb devices` 显示为 `device`。目标应用应为可调试的开发包。
+2. 在 RenderTest 的 **Settings → Android** 配置 Android SDK root path 和 JDK 路径（也可使用已配置的环境变量）。SDK 需要包含 platform-tools 和 build-tools。
+3. 在主窗口左下角的远程上下文下拉框中选择设备。RenderTest 会从 `plugins/android/` 查找对应 APK 并安装、启动截帧服务；按手机提示授予所需权限。
+4. 连接后选择目标应用并启动，按正常截帧流程触发捕获。把 capture 保存到本地后，可用 AI Assistant 继续分析；回放仍取决于图形 API 和设备/驱动支持。
+
+APK 文件名仍为 `org.renderdoc.renderdoccmd.arm64.apk` 和 `org.renderdoc.renderdoccmd.arm32.apk`，这是 PC 端查找与安装协议使用的名称，请保留原名及目录结构。手机上应用显示名仍为 RenderDocCmd。这批只提供两种 ARM 包，不包含 x86/x64 Android 模拟器包。
+
+APK 与 PC DLL 必须来自配套构建，程序会严格校验版本。AI Assistant 当前没有自动连接 Android 或自动截帧工具；设备连接和捕获通过主窗口完成。
 
 ## 2. 选择后端并登录
 

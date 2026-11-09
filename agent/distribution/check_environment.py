@@ -30,6 +30,10 @@ def main():
                 raise RuntimeError('Missing Skill: ' + name)
         if not (root / 'qrendertest.exe').is_file() or not (root / 'rendertest.dll').is_file():
             raise RuntimeError('Incomplete native application files')
+        for abi in ('arm64', 'arm32'):
+            apk = root / 'plugins/android' / f'org.renderdoc.renderdoccmd.{abi}.apk'
+            if not apk.is_file() or apk.stat().st_size == 0:
+                raise RuntimeError('Missing Android capture server: ' + apk.name)
         if args.verify_files:
             manifest = json.loads((root / 'PACKAGE_MANIFEST.json').read_text(encoding='utf-8'))
             for entry in manifest['files']:
