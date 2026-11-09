@@ -1,6 +1,6 @@
 ---
 name: rendertest-shader-debug
-description: Inspect shaders bound at a RenderTest event - embedded source, generated HLSL/GLSL, reflection, resource bindings, constant buffer values and disassembly - to explain calculations or parameters. Use for shader source or logic, CBuffer, sampler or binding questions about a RenderDoc capture.
+description: Inspect shaders bound at a RenderTest event - embedded source, generated HLSL/GLSL, reflection, resource bindings, constant buffer values and disassembly - to explain calculations or parameters. Use for shader source or logic, compute-thread debugging, CBuffer, sampler or binding questions about a RenderDoc capture.
 ---
 
 # Inspect shaders
@@ -38,6 +38,16 @@ Use `debug_vertex(event_id=..., vertex=..., instance=...)` for wrong positions, 
 - `instance` defaults to 0 and must be below `numInstances`; `view` is only for multiview.
 - `outputs` include `SV_Position` (clip space; divide xyz by w for NDC) and the other outputs passed to later stages. `inputs` are the fetched vertex attributes and system values.
 - Find which vertices to debug with `get_mesh_data` first; `vertex` there is the same row number.
+
+## Stepping a compute shader
+
+Use `debug_compute(event_id=..., group=[gx,gy,gz], thread=[tx,ty,tz])` to inspect one invocation of a compute Dispatch. Both coordinate arrays are required, zero-based and exactly three unsigned integers.
+
+- Locate an actual compute dispatch with `find_actions(flags=["dispatch"])` and `inspect_event`. Use its exact action EID; a setup API call, marker, indirect container, mesh dispatch or ray dispatch is not a valid substitute. An executed indirect child compute dispatch is supported when its dimensions are known.
+- `group` is the workgroup coordinate, bounded by `dispatchDimensions`; `thread` is local to that workgroup, bounded by `threadGroupSize`. `globalThread = group * threadGroupSize + thread` component by component, not the group coordinate alone. The group size comes from an action override or shader reflection, recorded in `threadGroupSizeSource`. Unknown sizes and nonzero dispatch base offsets are unsupported; do not guess a size of 1.
+- Read `inputs`, `lastChanges`, `nanOrInfSteps` and `sampleSteps`. System-value inputs may be omitted when unused. Search/page `traceArtifact` with `read_artifact` for relevant instructions and register changes. `max_steps` defaults to 20000 (maximum 200000); `executionComplete=false` describes a partial trace, and `traceComplete=false` means the artifact omitted later steps. Native debug calls are not immediately cancellable, so do not promise instant Stop.
+- Compute shaders generally have no output signature: an empty `outputs` list does not mean no resource write occurred. `lastChanges` contains debugger variable/register state, not a list of committed UAV writes. Inspect actual bound textures/buffers with `get_pipeline_state`, `pick_pixel`, `export_texture` or `get_buffer_data` to validate a suspected write. A single invocation trace does not establish cross-thread ordering, race freedom, whole-dispatch results or GPU timing.
+- `debugged=false` means RenderDoc did not create a usable trace for that invocation. `UNSUPPORTED` can mean the API/shader cannot be debugged; use the reported reason and shader source/disassembly instead of repeating the same request. This writes an artifact and restores replay without moving the UI selection.
 
 ## Post-transform geometry
 

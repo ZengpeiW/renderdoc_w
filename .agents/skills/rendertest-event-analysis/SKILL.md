@@ -46,6 +46,7 @@ Start with `inspect_event(event_id=...)`: action parameters, shaders per stage, 
 - Diagnostic coverage: `export_overlay(resource_id=..., event_id=..., overlay="Wireframe", include_image=true)` visualizes one exact raster draw. Choose its bound color/depth target and matching mip/slice. `Drawcall`, `Depth`, `Stencil`, `BackfaceCull` and `ViewportScissor` answer different coverage/state questions; use the returned legend. `QuadOverdrawDraw` and `TriangleSizeDraw` are heatmaps, not GPU timings or exact pixel-write counts. Overdraw on MSAA and mesh-shader draw overlays are currently unsupported. There is no pass-wide or clear-before mode. Do not scan the entire frame with overlays for an ordinary event question.
 - What this event changed: compare `get_texture_stats` or a few `pick_pixel` reads at this EID and at the previous write event of the same resource. For one pixel, `pixel_history` at this EID shows whether this event's fragments passed and what they wrote.
 - Where a resource comes from and where it goes: `get_resource_usage(resource_id=...)` lists writers and readers.
+- Compute invocation arithmetic: `debug_compute(event_id=..., group=[...], thread=[...])` traces one ordinary compute Dispatch thread. Check exact dispatch/group/local-thread dimensions first; see `rendertest-shader-debug` for coordinate semantics, trace limits and how to verify UAV contents. A trace is not a GPU timing measurement.
 - Shader arithmetic: see `rendertest-shader-debug`.
 
 ## Answer

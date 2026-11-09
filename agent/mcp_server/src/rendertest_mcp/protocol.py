@@ -77,6 +77,7 @@ METHOD_SPECS: dict[str, dict[str, Any]] = {
     "pixel_history": _method(EFFECT_READ),
     "debug_pixel": _method(EFFECT_ARTIFACT),
     "debug_vertex": _method(EFFECT_ARTIFACT),
+    "debug_compute": _method(EFFECT_ARTIFACT),
     "get_mesh_data": _method(EFFECT_READ),
 }
 
@@ -110,7 +111,7 @@ P0_TOOL_NAMES = (
     "get_debug_messages",
 )
 
-P1_TOOL_NAMES = ("pixel_history", "debug_pixel", "debug_vertex", "get_mesh_data")
+P1_TOOL_NAMES = ("pixel_history", "debug_pixel", "debug_vertex", "debug_compute", "get_mesh_data")
 
 LOCAL_TOOL_NAMES = ("read_artifact",)
 

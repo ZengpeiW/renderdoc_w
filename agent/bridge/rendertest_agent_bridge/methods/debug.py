@@ -74,7 +74,11 @@ class _TraceWriter(object):
         self.digest = hashlib.sha256()
         self.bytes = 0
         self.full = False
-        self.write(header, reserve=False)
+        try:
+            self.write(header, reserve=False)
+        except BaseException:
+            self.abort()
+            raise
 
     def write(self, record, reserve=True):
         if self.full:
@@ -128,6 +132,7 @@ def _run(context, controller, trace, max_steps, lines, writer):
     steps = 0
     events = {"GeneratedNanOrInf": [], "SampleLoadGather": 0, "DebugBreak": []}
     stopped = False
+    context.check_cancelled()
     batch = controller.ContinueDebug(trace.debugger)
     while batch and not stopped:
         context.check_cancelled()
@@ -167,6 +172,7 @@ def _run(context, controller, trace, max_steps, lines, writer):
                           "changes": changes})
             steps += 1
         if not stopped:
+            context.check_cancelled()
             batch = controller.ContinueDebug(trace.debugger)
     last = [variables[name] for name in order[-LAST_CHANGES:] if name in variables]
     return variables, steps, stopped, events, list(reversed(last))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import struct
 import sys
@@ -887,6 +888,48 @@ class FakeRenderTestBridge:
             ),
             self._read_meta(event_id),
         )
+
+    def _method_debug_compute(self, params: dict[str, Any]) -> BridgeResult:
+        event_id = self._event_id(params)
+        action = self._actions[event_id]
+        shader = (action.get("shaders") or {}).get("compute")
+        if shader is None or "dispatch" not in action["flags"]:
+            raise AgentBridgeError("INVALID_EVENT", "The event is not a compute dispatch.")
+        group, thread = params.get("group"), params.get("thread")
+        dimensions, thread_size = action["dispatchDimensions"], [4, 4, 1]
+        for field, coordinates, size in (("group", group, dimensions), ("thread", thread, thread_size)):
+            if (not isinstance(coordinates, list) or len(coordinates) != 3 or
+                    any(type(value) is not int or not 0 <= value < bound
+                        for value, bound in zip(coordinates, size))):
+                raise AgentBridgeError("INVALID_REQUEST", field + " is outside the compute dispatch.")
+        global_thread = [group[index] * thread_size[index] + thread[index] for index in range(3)]
+        directory = artifact_directory(str(self.root), self.instance_id, self.capture_session_id, "replay")
+        path = Path(directory) / f"debug-compute-e{event_id}-{uuid.uuid4().hex}.jsonl"
+        invocation = {"stage": "compute", "eventId": event_id, "group": group, "thread": thread,
+                      "globalThread": global_thread, "dispatchDimensions": dimensions,
+                      "threadGroupSize": thread_size, "threadGroupSizeSource": "shader_reflection"}
+        header = {"record": "header", "schema": "rendertest-shader-debug-trace/v1",
+                  "invocation": invocation, "shader": {"resourceId": shader, "entryPoint": "main"},
+                  "files": []}
+        summary = {"record": "summary", "steps": 1, "executionComplete": True, "traceComplete": True}
+        path.write_text(json.dumps(header) + "\n" + json.dumps(summary) + "\n", encoding="utf-8")
+        artifact = describe_artifact(str(path), "shader-debug-trace", "application/x-ndjson",
+                                     source={"event_id": event_id, "stage": "compute",
+                                             "group": group, "thread": thread, "globalThread": global_thread,
+                                             "dispatchDimensions": dimensions, "threadGroupSize": thread_size,
+                                             "threadGroupSizeSource": "shader_reflection"})
+        return BridgeResult(_payload({
+            "eventId": event_id, "stage": "compute", "group": group, "thread": thread,
+            "globalThread": global_thread, "dispatchDimensions": dimensions, "threadGroupSize": thread_size,
+            "threadGroupSizeSource": "shader_reflection",
+            "shader": {"resourceId": shader, "entryPoint": "main"},
+            "debugged": True, "steps": 1, "executionComplete": True, "traceComplete": True,
+            "inputs": [], "outputs": [],
+            "lastChanges": [{"name": "dispatchThreadId", "type": "UInt", "value": global_thread}],
+            "nanOrInfSteps": [], "sampleSteps": 0, "debugBreakSteps": [],
+            "traceArtifact": artifact["path"],
+        }, artifacts=[artifact], warnings=["Synthetic single-invocation trace; not a UAV write log."]),
+            self._read_meta(event_id))
 
     def _method_get_mesh_data(self, params: dict[str, Any]) -> BridgeResult:
         event_id = self._event_id(params)

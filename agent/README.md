@@ -9,7 +9,7 @@ RenderTest Agent 让 Codex 等 AI Agent 通过 MCP 读取 qrenderdoc 当前打�
 - M2：接入 replay，提供全部 P0 工具。
 - M3：4 个 Skills（`.agents/skills/rendertest-*`）、Codex 配置脚本、端到端验收脚本；MCP 工具按效果标注 `readOnlyHint`。
 - M4：`pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data`。
-- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数和事件差异；当前共 30 个 MCP 工具，Codex 和 Claude 共用。
+- 分析工具扩展：Shader 内嵌源码读取与 release 反编译、资源大小统计、事件统计、CBuffer 成员查询、单 EID Overlay、API 调用参数、事件差异和 Compute 线程调试；当前共 31 个 MCP 工具，Codex 和 Claude 共用。
 
 ## P0 工具
 
@@ -89,14 +89,28 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\install_shader_decompil
 
 反编译为 `artifact` 操作：先短暂回放并复制字节码、恢复事件，再在 Bridge worker 执行固定参数的进程。UI 选择和 capture 保持不变；总转换硬超时 60 秒，输入/中间产物/生成文本上限 16 MiB、单步日志上限 1 MiB，结束时清理临时文件及进程。该实例的其他 MCP 请求会排队；面板 Stop 不保证立即中断已开始的转换，Bridge 退出或请求超时会终止进程。
 
-## P1 工具（M4）
+## Shader 调试与几何工具（P1）
 
 | 工具 | 说明 |
 | --- | --- |
 | `pixel_history` | 截至目标 EID 修改过某个像素的事件，默认新到旧，按事件分组：片元数、通过数、失败原因计数（深度/模板/discard/裁剪…）、通过片元的 primitive、`preMod`/`shaderOut`/`postMod`（color/depth/stencil）。`summary` 给出最后通过和最后改变值的 EID；`include_fragments=true` 每个事件附最多 64 个片元。RenderDoc 的像素历史不含 `Discard`，这类事件放在 `discardEventIds` 里并给出 warning。结果按 capture session 缓存，翻页不会重放。 |
 | `debug_pixel` | 用 RenderDoc Shader 调试器跑某个 Draw 在某像素的 Pixel Shader（`primitive` 选重叠片元，可取自 `pixel_history` 的 `primitiveIds`）。返回 Shader、插值输入、最终输出（`SV_Target*`，混合和格式转换之前）、最后改变的变量、产生 NaN/Inf 的步骤（指令和行号）；完整逐步 trace 写成 JSONL artifact（每步 `instruction`、`line`、变量 `changes`，上限 64 MiB）。`max_steps` 默认 20000。没有片元覆盖该像素时返回 `debugged=false`。 |
 | `debug_vertex` | 调试某个 Draw 的某个顶点的 Vertex Shader。`vertex` 是 Draw 内 0 起的序号（Mesh Viewer 的 VTX 列，小于 `numIndices`），`instance` 默认 0。Indexed Draw 由 Bridge 读 index buffer，按 Mesh Viewer 的算法加 base vertex 得到 `index`（另返回原始 `indexBufferValue`，遇到 primitive restart 报错）。返回字段与 `debug_pixel` 相同，`outputs` 含 `SV_Position`（裁剪空间）。 |
+| `debug_compute` | 调用原生 `DebugThread` 调试一个 Compute Dispatch invocation，必填三维 `group`（工作组坐标）和 `thread`（组内线程坐标）。返回全局线程坐标、dispatch/线程组大小及其来源、输入、最后寄存器变化和 JSONL trace。普通及已解析的 indirect 子 Dispatch 可用；严格核对坐标和可调试性，不支持 ray/mesh dispatch、非零 dispatch base 或未知线程组大小。 |
 | `get_mesh_data` | 读 Draw 变换后的顶点，对应 Mesh Viewer 的 VS Out（`stage="vs_out"`，默认）/ GS Out（`stage="gs_out"`）表。返回输出列（位置在前，布局与 Mesh Viewer 相同）、全 Draw 的每列 min/max 和非有限值行数、位置的 NDC 范围和 w≤0 的顶点数；`rows` 每行含 `vertex`、`index`（实际取的顶点，已加 base vertex）和各列值，用 `start`/`limit` 或 `cursor` 翻页（默认 50 行）。一次回放后按 capture session 缓存。暂不支持 Mesh Shader。 |
+
+`debug_compute(group, thread, event_id=None, max_steps=20000)` 的两个坐标都是从 0 开始的三元素 UInt32 数组；不是像素坐标。`group[i] < dispatchDimensions[i]`，`thread[i] < threadGroupSize[i]`，全局坐标 `globalThread[i] = group[i] * threadGroupSize[i] + thread[i]`。线程组大小按 GUI 的规则优先读取 action override，否则读取 Shader 反射，结果中用 `threadGroupSizeSource` 标明来源。必须指定实际执行的 Dispatch action EID，不能用前面的 setup API EID 或 indirect 父容器替代。
+
+- `inputs` 可包含 Shader 使用的 `SV_DispatchThreadID` 等系统输入；未使用的系统值可能被省略。`lastChanges` 是调试器变量/寄存器，`nanOrInfSteps` 和 `sampleSteps` 汇总执行过程中观察到的相关事件。
+- Compute 通常没有 output signature，`outputs=[]` 不表示没有资源写入。轨迹不是 UAV 写入清单，也不能证明整次 Dispatch 输出、跨线程次序、无竞争或 GPU 耗时。需要核对实际资源时，结合绑定与 `pick_pixel` / `get_buffer_data` 等工具读取结果。
+- `max_steps` 为 1–200000；`executionComplete=false` 表示仅完成有界调试，结果为部分状态。`traceArtifact` 使用现有 JSONL schema，上限 64 MiB；`traceComplete=false` 表示文件省略了后续步。用 `read_artifact` 按行或寄存器搜索。`debugged=false` 表示原生调试器没有提供可用轨迹，API/Shader 不支持时明确报错，不伪造成功。
+- 调试是 `artifact` 操作，trace 在 `finally` 释放，回放事件随后恢复，不改变 UI 选择或修改 capture。MCP 等待时间为 120 秒；底层 `DebugThread` / `ContinueDebug` 调用不可立即抢占，不能把它理解为硬超时或即时 Stop。
+
+本机样本可直接问：“调试 EID 3120 的 group `[0,1,0]`、thread `[1,0,0]`，解释这条线程的计算。”该样本组数为 `[1,2,1]`，线程组大小为 `[64,1,1]`，全局线程 ID 应为 `[1,1,0]`；其他 capture 需重新定位。专项验收使用独立原生 DebugThread 参考，并检查零/非零坐标、步数截断、无效调用拒绝及 trace 读取：
+
+```powershell
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\compute_debug_live.py --launch E:/Captures/pragmata1.rdc --event 3120
+```
 
 约定：
 
@@ -135,7 +149,7 @@ agent/
 
 - `rendertest-core`：目标选择、capture/session 身份、工具效果、实测与推断的区分。
 - `rendertest-event-analysis`：解释 EID/pass 的输入、计算和输出，统计 frame/pass 事件及纹理/缓冲大小。
-- `rendertest-shader-debug`：Shader 内嵌源码、生成 HLSL/GLSL、反射、绑定、CBuffer 和反汇编，`debug_pixel` / `debug_vertex` 单步调试。
+- `rendertest-shader-debug`：Shader 内嵌源码、生成 HLSL/GLSL、反射、绑定、CBuffer 和反汇编，`debug_pixel` / `debug_vertex` / `debug_compute` 单线程调试。
 - `rendertest-pixel-investigation`：像素取值、用 `pixel_history` 找最后改变它的事件和失败原因，必要时 `debug_pixel` 看 Shader 计算；不支持时退回资源用途比较。
 
 ## 环境

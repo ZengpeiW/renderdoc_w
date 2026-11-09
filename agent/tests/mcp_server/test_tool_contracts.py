@@ -48,7 +48,7 @@ def test_tool_annotations_follow_effects() -> None:
 
     read_only = {name for name, tool in tools.items() if tool.annotations.readOnlyHint}
     assert read_only == set(TOOL_NAMES) - {"set_event", "export_texture", "debug_pixel",
-                                              "debug_vertex", "get_shader_source", "export_overlay",
+                                              "debug_vertex", "debug_compute", "get_shader_source", "export_overlay",
                                               "decompile_shader"}
     for tool in tools.values():
         assert tool.annotations.destructiveHint is False
@@ -85,6 +85,7 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
             "pixel_history": {"resource_id": "1001", "x": 1, "y": 2, "event_id": 30},
             "debug_pixel": {"x": 1, "y": 2, "event_id": 30},
             "debug_vertex": {"vertex": 2, "event_id": 30},
+            "debug_compute": {"group": [0, 0, 0], "thread": [1, 2, 0], "event_id": 20},
             "get_mesh_data": {"event_id": 10, "limit": 4},
             "get_buffer_data": {"resource_id": "2001", "offset": 4, "size": 4},
             "get_debug_messages": {},
@@ -100,6 +101,9 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
         decompiled = structured(call_tool(server, "read_artifact", {
             "path": results["decompile_shader"]["data"]["decompiledArtifact"],
             "search": "float4", "limit": 1,
+        }))
+        compute_trace = structured(call_tool(server, "read_artifact", {
+            "path": results["debug_compute"]["data"]["traceArtifact"], "limit": 1,
         }))
 
     assert set(results) == set(TOOL_NAMES)
@@ -123,6 +127,13 @@ def test_all_p0_tools_work_against_fake_bridge(tmp_path: Path) -> None:
     assert Path(results["debug_pixel"]["artifacts"][0]["path"]).is_file()
     assert results["debug_vertex"]["data"]["outputs"][0]["name"] == "SV_Position"
     assert Path(results["debug_vertex"]["artifacts"][0]["path"]).is_file()
+    assert results["debug_compute"]["effect"] == "artifact"
+    assert results["debug_compute"]["data"]["group"] == [0, 0, 0]
+    assert results["debug_compute"]["data"]["thread"] == [1, 2, 0]
+    assert results["debug_compute"]["data"]["outputs"] == []
+    assert results["debug_compute"]["meta"]["eventIdBefore"] == 20
+    assert results["debug_compute"]["meta"]["eventIdAfter"] == 20
+    assert json.loads(compute_trace["data"]["lines"][0]["text"])["invocation"]["stage"] == "compute"
     assert results["get_mesh_data"]["data"]["columns"][0]["systemValue"] == "Position"
     assert len(results["get_mesh_data"]["data"]["rows"]) == 4
     assert results["get_mesh_data"]["nextCursor"]

@@ -6,9 +6,9 @@
 
 - 工作目录：`E:\PersonalWorkSpace\git_repo\renderdoc`。
 - 当前分支：`local_test`。
-- 本轮基于交接提交 `3bf1bdbad`，新增 `get_api_calls`、`compare_events`，同步 Skill、文档与真实 capture 验证脚本。
-- MVP/M0–M4、M5a–M5d 已实现，已有可使用的内嵌 AI 助手；目前有 **30 个 MCP 工具、4 个 Skill、Codex 和 Claude 两种 harness**。
-- DeepSeek harness 未接入。本轮只实现 API 参数浏览与事件比较；Compute 调试、GPU counters 等仍是后续候选。
+- 本轮基于 `01fbe87e0`，新增 `debug_compute`，同步 Skill、文档与真实 capture 验证脚本。
+- MVP/M0–M4、M5a–M5d 已实现，已有可使用的内嵌 AI 助手；目前有 **31 个 MCP 工具、4 个 Skill、Codex 和 Claude 两种 harness**。
+- DeepSeek harness 未接入。本轮只增加 Compute 线程调试，并修复共用轨迹写入失败/取消清理时序；GPU counters 等仍是后续候选。
 - 本轮开始时，唯一未跟踪文件是 `renderdoc/data/renderdoc.rc.bak`，属于已有文件，未修改、删除或纳入提交。
 
 详细使用说明见 [agent/README.md](../README.md)。[MVP_DESIGN.md](MVP_DESIGN.md) 和 [M5_DESIGN.md](M5_DESIGN.md) 保留设计过程，部分早期范围和界面示例不代表当前实现，例如最初 M5 不包含 Claude、示例工具数量少于现在。
@@ -23,7 +23,8 @@
 | `7f6481637` | 内嵌 Shader 源码、资源统计、事件统计 |
 | `37325000c` | CBuffer 成员查询/分页、单事件 Overlay 导出 |
 | `d40a3ec89` | 使用预编译 release 反编译 Shader，支持 HLSL/GLSL 与自动回退 |
-| 本次（2026-11-09） | 原始 API 调用/参数分页、同 capture 管线及选定 CBuffer 差异比较 |
+| `01fbe87e0` | 原始 API 调用/参数分页、同 capture 管线及选定 CBuffer 差异比较 |
+| 本次（2026-11-09） | Compute 单线程调试，工作组/组内坐标验证、JSONL 轨迹与异常清理 |
 
 ## 2. 架构、面板与历史
 
@@ -49,7 +50,7 @@
 - Claude 会从用户级 `settings.json` 补充连接环境白名单，尊重 `CLAUDE_CONFIG_DIR`，已有进程环境优先；不加载项目配置，不执行 `apiKeyHelper`。
 - Codex 浏览器 OAuth 完整流程仍缺人工验收；已有 fake 登录状态流和真实 app-server 的本地 fixture 验证。不要把这项待验收误读为“Claude 从未在线验证”。
 
-## 3. 已暴露的 30 个 MCP 工具
+## 3. 已暴露的 31 个 MCP 工具
 
 以 [protocol.py](../mcp_server/src/rendertest_mcp/protocol.py) 的 `TOOL_NAMES` 和 [server.py](../mcp_server/src/rendertest_mcp/server.py) 为准。
 
@@ -61,7 +62,7 @@
 | 资源 | `list_resources`、`get_resource`、`get_resource_usage`、`get_resource_stats` |
 | 纹理/诊断图 | `export_texture`、`export_overlay`、`pick_pixel`、`get_texture_stats` |
 | Buffer | `get_buffer_data` |
-| 历史/调试/几何 | `pixel_history`、`debug_pixel`、`debug_vertex`、`get_mesh_data` |
+| 历史/调试/几何 | `pixel_history`、`debug_pixel`、`debug_vertex`、`debug_compute`、`get_mesh_data` |
 | 消息 | `get_debug_messages` |
 | 文本产物 | `read_artifact` |
 
@@ -77,7 +78,17 @@
 
 ## 4. 分析扩展的实际边界
 
-### API 参数与事件比较（本轮）
+### Compute 线程调试（本轮）
+
+- `debug_compute(group, thread, event_id=None, max_steps=20000)` 复用原生 `DebugThread` / `ContinueDebug` / `FreeTrace` 和现有 JSONL 轨迹 schema。两个必填坐标均为 0 起的三元素 UInt32 数组，分别表示工作组坐标和组内线程坐标；`globalThread = group * threadGroupSize + thread`，逐分量计算。
+- 只接受实际执行的普通 Compute Dispatch action，包含已解析且维度已知的 indirect 子 Dispatch。非 action API EID、marker、父容器、ray/mesh dispatch、空 dispatch 均不代替有效线程。ActionIndex 新保留 `dispatchBase`，非零/未知 base 当前明确不支持，避免 native Vulkan 的 base 解释差异造成错误坐标。
+- `dispatchDimensions` 来自 action；`threadGroupSize` 按 GUI 规则优先采用 action override，否则采用 reflection，记录 `threadGroupSizeSource`。未知/零维、坐标越界、全局线程 ID 超出 UInt32、API 或 Shader 不可调试均明确拒绝。
+- 返回 Shader/入口身份、坐标与维度、`inputs`、`lastChanges`、NaN/Inf 和采样事件摘要、`traceArtifact`。Compute 通常没有输出签名，`outputs=[]` 不意味着没有 UAV 写入；寄存器变化不等于最终资源内容，也不能证明跨线程时序、竞争或 GPU 耗时。
+- `max_steps` 为 1–200000；`executionComplete=false` 是部分状态，`traceComplete=false` 表示 64 MiB artifact 预算使后续轨迹缺失。使用 `read_artifact` 分页/搜索。`debugged=false` 表示原生没有可用轨迹，不伪造成功。
+- `effect=artifact`，不改变 UI 或修改 capture。所有返回的 trace 在 finally 释放，失败清理 `.part`；本轮也补上共享 writer 初始化失败清理，以及每次 native continuation 前的取消检查。MCP 采用 120 秒等待，但 native 调用本身不可立即抢占，不能承诺硬超时或即时 Stop。
+- Codex/Claude 自动使用 31 工具目录。更新 shader-debug 和 event-analysis Skill，保持原四份 Skill；不增加额外 harness 或 C++ UI 改动。
+
+### API 参数与事件比较
 
 - `get_api_calls(event_id=...)` 列出该 EID 所属 action 的 API 调用；`api_event_id=...` 查询精确 API EID 的参数。`ActionIndex` 保存每条 API 事件的 `chunkIndex`，真实 API EID 与 owner action EID 分开返回，不能混用。
 - `parameter_path` 只接受返回的 ordinal 路径（如 `[2][0][1]`），支持数组随机访问与同级分页，不遍历整块大数组。单页 4096 节点/256 KiB、深度 0–4、路径最多 64 层；ResourceId 和大整数保留精度。NoChunk/缺失 chunk 明确不可用，原始 Buffer payload 不导出。RenderDoc 序列化记录可能包含内部字段和返回值，不能一概称为应用原始实参。
@@ -85,7 +96,7 @@
 - `comparison` 区分 `different`、`equal-in-scope`、`indeterminate`。有截断、反射/解码缺失或预算限制时，不把零差异判为相等；`totalDifferencesExact=false` 表示差异数为下界，`coverage.differencesComplete` 单独标识差异预算是否完整。
 - 覆盖只含 viewport/scissor 0、constant block 数组元素 0、已使用的绑定和现有管线摘要；阶段按 owner graphics/compute 类型筛选，CBuffer 选择独立指定阶段。列表按位置匹配，Shader/布局/绑定差异也会报告；相同 ordinal 不保证跨布局语义相同。资源内容、Shader 文本、未选常量值均不参与。
 - 单侧快照上限 32768 节点/2 MiB，差异上限 8192 条/2 MiB，单页 256 KiB，单 CBuffer 反射大小上限 1 MiB；底层实际 buffer 读取长度也限定到反射范围，绑定范围过短/为零时标为未知，push/root constants 不误拒绝。只缓存最近两组比较；不带 cursor 读取新快照，续页才用缓存；重启相同查询或淘汰后旧游标失效。
-- 两工具均为 `read`，不改变 UI。MCP 的 nullable 参数路径保留为字符串（例如 `[1]`），避免 FastMCP 预解析成数组；Codex/Claude 都使用更新后的 30 工具目录。core、event-analysis、shader-debug 三份 Skill 已更新，仍保持四份 Skill 总数。
+- 两工具均为 `read`，不改变 UI。MCP 的 nullable 参数路径保留为字符串（例如 `[1]`），避免 FastMCP 预解析成数组；Codex/Claude 共用同一工具目录。core、event-analysis、shader-debug 三份 Skill 已反映这两工具的行为。
 
 ### 内嵌源码、统计、CBuffer 和 Overlay
 
@@ -116,7 +127,7 @@
 | `rendertest-core` | 实例/session、目标选择、工具效果和证据边界 |
 | `rendertest-event-analysis` | 事件/pass、输入输出、API 参数、事件比较、资源及事件统计 |
 | `rendertest-pixel-investigation` | 像素取值、写入历史、失败原因与像素调试 |
-| `rendertest-shader-debug` | 内嵌源码、反编译、反射/绑定/CBuffer、Shader 调试 |
+| `rendertest-shader-debug` | 内嵌源码、反编译、反射/绑定/CBuffer、Pixel/Vertex/Compute 单线程调试 |
 
 Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要时回退 cwd `.agents/skills`。Claude 适配器把四份受信任 Skill 正文注入启动指令，不开放任意文件读取；不能假设 Claude 每次只自动选择一份 Skill。
 
@@ -145,12 +156,13 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 
 ## 6. 已有验证记录与复现
 
-本轮重跑 Python 全套及两个新工具的真实 capture 验证，未重新调用在线模型。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 中的证据不跟踪到 Git，换机器后可能不存在。
+本轮重跑 Python 全套及 Compute 调试的真实 capture 验证，未重新调用在线模型。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 中的证据不跟踪到 Git，换机器后可能不存在。
 
 | 范围 | 已有结果与边界 |
 | --- | --- |
-| 最新 Python 全套 | `963 passed`（33.19 秒）；在宿主环境运行，测试临时文件限定在工作区。不是对所有 GPU/API 的保证 |
-| Skill | 四份 Skill 均通过 validator；本轮更新 core/event-analysis/shader-debug，部署两份 Skill 副本并逐字节核对 |
+| 最新 Python 全套 | `1118 passed`（46.42 秒）；在宿主环境运行，测试临时文件限定在工作区。不是对所有 GPU/API 的保证 |
+| Skill | 四份 Skill 均通过 validator；本轮更新 event-analysis/shader-debug，部署两份 Skill 副本并逐字节核对 |
+| Compute 调试实际 capture | `pragmata1.rdc` EID 3120，DXIL Compute Shader 6237/main；组数 `[1,2,1]`、线程组大小 `[64,1,1]`。零坐标完整 67 步，group `[0,1,0]` / thread `[1,0,0]` 完整 46 步，`SV_DispatchThreadID=[1,1,0]` 与独立原生 DebugThread 一致；max_steps=1 正确截断，越界及 Draw/非 action EID 被拒绝。三份 trace 的 SHA/大小/来源/读取及 UI/config 保持通过。只验证了该 D3D12 样本，不代表所有 API/Shader |
 | API/事件比较实际 capture | `pragmata1.rdc`：EID 3820 的 16 条 API 调用，Clear 7646、Copy 7702、Barrier 7705、Draw 3820 的 33 个标量及数组分页与独立原生 SDObject 读取一致；3803→3820 的 83 项管线差异与独立 get_pipeline_state 一致。SceneInfo.viewProjMat 两处值相同、Shader 身份不同，已核对 get_cbuffer；同 EID 完整范围为 equal-in-scope，绑定截断时为 indeterminate。UI EID、用户配置保持不变 |
 | 第一批分析工具 | `327 passed, 2 skipped`；实际 capture 验证资源/事件统计。所测 Shader 无内嵌源码，源码导出由 fixture 验证 |
 | 第二批 | `577 passed, 2 skipped`；`pragmata1.rdc` EID 3820 的 CBuffer 分页/成员值核对，10 种 Overlay 均实际导出并返回图片 |
@@ -166,6 +178,7 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 - 反编译 capture：`agent/.agent-data/decompile-live-512d72279ae4491b88b139a739432ea7/report.json`。
 - 反编译三种输入样本：`agent/.agent-data/decompiler-offline-check/report.json`。目录内另保留修复前失败和参数对照报告，不应当成最终结果。
 - API/事件比较：`agent/.agent-data/event-inspection-live-31df81b69f554e3e8bb32d44ee11b38e/report.json`；同目录 `native-reference.json` 是独立原生读取结果。此报告对应缓存刷新顺序、底层 CBuffer 读取预算均已修复的最终版本。
+- Compute 调试：`agent/.agent-data/compute-debug-live-abd5c8f6ef944a6c9f01e749dc1015c8/report.json`；同目录 `native-reference.json` 保留独立原生 DebugThread 输入和维度参考。报告对应共享取消检查、写入失败清理和严格 schema 均已完成的最终部署版本。
 
 从仓库根目录运行：
 
@@ -182,27 +195,29 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --analysi
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\smoke_live.py --second-batch --launch "E:\Captures\pragmata1.rdc" --event-id 3820
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\decompile_live.py --launch "E:\Captures\pragmata1.rdc" --event 3820
 
-# 本轮 API 调用/参数与事件比较；同样只启动、关闭自建隐藏进程
+# API 调用/参数与事件比较；同样只启动、关闭自建隐藏进程
 agent\mcp_server\.venv\Scripts\python.exe agent\devtools\event_inspection_live.py --launch E:/Captures/pragmata1.rdc --before 3803 --after 3820 --cbuffer-stage pixel --cbuffer-name SceneInfo --member viewProjMat
+
+# 本轮 Compute 单线程调试；完整轨迹、步数截断和无效调用验证
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\compute_debug_live.py --launch E:/Captures/pragmata1.rdc --event 3120
 ```
 
-`decompile_live.py` 和 `event_inspection_live.py` 会创建独立隐藏 GUI 进程、关闭该进程的配置写入、固定实例/session、校验产物/结果及用户配置哈希，最后只关闭自己启动的进程。不要把用户正在使用的 GUI 当成测试进程关闭。在线 Claude/Codex 验证命令及环境配置见 README；已有通过记录不代表当前账号登录状态无需检查。
+`decompile_live.py`、`event_inspection_live.py` 和 `compute_debug_live.py` 会创建独立隐藏 GUI 进程、关闭该进程的配置写入、固定实例/session、校验产物/结果及用户配置哈希，最后只关闭自己启动的进程。不要把用户正在使用的 GUI 当成测试进程关闭。在线 Claude/Codex 验证命令及环境配置见 README；已有通过记录不代表当前账号登录状态无需检查。
 
 ## 7. 已知问题及尚不支持的能力
 
 - 在 `pragmata1.rdc` 的更广泛 `--all-p0` 检查中，曾出现 pixel_history 与 pick_pixel 结果不一致，以及 EID 3014 的 mesh/debug_vertex 对比不一致。已用扩展前的旧 Bridge 复现，未在这几批工具中修复。基线证据为 `agent/.agent-data/analysis-live-fef62ba077cd4171bc4bb05b5e580f7b/report.json`；不要把专项通过描述为这些旧问题已解决。
-- 当前没有 Compute 单线程调试、GPU counter/timing 工具、Shader 引用搜索或 pass 资源流工具。API 参数浏览和结构化事件差异本轮已加入。
+- 当前没有 GPU counter/timing 工具、Shader 引用搜索或 pass 资源流工具。API 参数、结构化事件差异和 Compute 单线程调试已加入；Compute 不支持非零 dispatch base、ray/mesh Shader 调试。
 - `find_actions` 目前只按名称/EID 和操作 flags 搜索，不支持 Shader ResourceId 过滤；不能假设 `GetUsage(shaderId)` 能找 Shader 引用。
 - 尚无 Shader 编辑/替换、CBuffer 修改、任意 Python/shell 执行、自动 Android 抓帧或远程连接管理工具。外部 `renderdoc-mcp` 的这些能力不会自动出现在内嵌助手。
 - Shader 可调试性、Overlay 及 counter 支持都与具体 API/驱动/Shader 有关；反编译成功也不保证可重新编译或与原程序等价。
 
 ## 8. 下一批候选（未实现）
 
-`get_api_calls` 与 `compare_events` 已完成。接下来可优先考虑 `debug_compute`；以下仍是候选，并未开始开发，以用户下一轮确定的范围为准。
+`get_api_calls`、`compare_events` 和 `debug_compute` 已完成。以下仍是候选，并未开始开发，以用户下一轮确定的范围为准。
 
 | 候选 | 价值与已有基础 | 接手时注意 |
 | --- | --- | --- |
-| `debug_compute` | 原生 `ReplayController.DebugThread(groupid, threadid)`；可复用 `methods/debug.py` 的 ContinueDebug/FreeTrace 和 trace artifact | 检查 dispatch、group/thread 边界及 debuggable；现有实际 capture 尚未验收该能力，不能承诺所有 Shader 均支持 |
 | GPU counters | `EnumerateCounters` / `DescribeCounter` / `FetchCounters`，先做 GPU duration 与支持的计数器 | 测的是回放；可能重放整帧，Top N 只限制结果；原生无取消参数，需强制恢复事件，失败值不能按 0 处理 |
 | `find_shader_references` | 找同 Shader 的 draw/dispatch，为事件比较提供目标 | 需要有界管线扫描与 session 缓存，不是简单调用资源 GetUsage |
 | `get_pass_resources` | 指定 marker/EID 范围的资源读写及前后使用，复用 GetUsage 和 ActionIndex | 资源级用途是关联证据，不证明某个像素被写入；不能宣称还原了引擎原生 RDG |

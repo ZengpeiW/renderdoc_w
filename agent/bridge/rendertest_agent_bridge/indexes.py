@@ -110,6 +110,7 @@ class ActionIndex(object):
             "drawIndex": int(action.drawIndex),
             "dispatchDimension": _dims(action.dispatchDimension),
             "dispatchThreadsDimension": _dims(action.dispatchThreadsDimension),
+            "dispatchBase": _dims(getattr(action, "dispatchBase", (0, 0, 0))),
             "copySource": resource_id(action.copySource),
             "copyDestination": resource_id(action.copyDestination),
             "outputs": [item for item in (resource_id(rid) for rid in action.outputs) if item],

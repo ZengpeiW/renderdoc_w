@@ -69,6 +69,12 @@ StrictOptionalParentId = Annotated[
 StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 StrictEventId = Annotated[int, Field(strict=True, ge=0, le=0xFFFFFFFF)]
 StrictNullableEventId = Annotated[int | None, Field(strict=True, ge=0, le=0xFFFFFFFF)]
+ComputeCoordinate = Annotated[
+    list[Annotated[int, Field(strict=True, ge=0, le=0xFFFFFFFF)]],
+    Field(strict=True, min_length=3, max_length=3,
+          description="Three zero-based integer coordinates: x, y, z."),
+]
+StrictMaxSteps = Annotated[int, Field(strict=True, ge=1, le=200000)]
 StrictLimit = Annotated[
     int, Field(strict=True, ge=1, le=1000, description="Maximum number of items to return.")
 ]
@@ -93,7 +99,8 @@ class ComparisonCBuffer(BaseModel):
         return self
 
 _LONG_RUNNING_METHODS = frozenset({"export_texture", "export_overlay", "get_buffer_data", "pixel_history",
-                                   "debug_pixel", "debug_vertex", "get_mesh_data", "decompile_shader"})
+                                   "debug_pixel", "debug_vertex", "debug_compute", "get_mesh_data",
+                                   "decompile_shader"})
 _IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg"}
 _ANNOTATIONS = {
     EFFECT_READ: ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
@@ -113,13 +120,13 @@ def _clean_params(**params: Any) -> dict[str, Any]:
     return {key: value for key, value in params.items() if value is not None}
 
 
-class _LiteralPathMetadata(FuncMetadata):
+class _LiteralFieldMetadata(FuncMetadata):
     literal_fields: tuple[str, ...] = ()
 
     def pre_parse_json(self, data: dict[str, Any]) -> dict[str, Any]:
-        # FastMCP 1.x JSON-decodes nullable strings before Pydantic validation. Member
-        # paths such as [1], ["name"] and null must remain literal strings; actual
-        # JSON arrays/objects still go through the unchanged string field validator.
+        # FastMCP 1.x JSON-decodes some string inputs before Pydantic validation.
+        # Preserve path strings such as [1], ["name"] and null, and prevent strict
+        # compute coordinate arrays from accepting a JSON-encoded string instead.
         other = {key: value for key, value in data.items() if key not in self.literal_fields}
         parsed = super().pre_parse_json(other)
         for key in self.literal_fields:
@@ -190,13 +197,14 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
             annotations = _ANNOTATIONS[tool_effect(function.__name__)]
             registered = server.tool(annotations=annotations, **options)(function)
             literal_fields = {"get_cbuffer": ("member_path",),
-                              "get_api_calls": ("parameter_path",)}.get(function.__name__)
+                              "get_api_calls": ("parameter_path",),
+                              "debug_compute": ("group", "thread")}.get(function.__name__)
             if literal_fields:
                 # FastMCP exposes no per-argument pre-parser option. Keep this adapter
-                # local to path-bearing tools, retaining generated input/output schemas.
+                # local to these fields, retaining generated input/output schemas.
                 entry = server._tool_manager.get_tool(function.__name__)
                 metadata = entry.fn_metadata
-                entry.fn_metadata = _LiteralPathMetadata(literal_fields=literal_fields, **{
+                entry.fn_metadata = _LiteralFieldMetadata(literal_fields=literal_fields, **{
                     key: getattr(metadata, key) for key in type(metadata).model_fields
                 })
             return registered
@@ -797,6 +805,31 @@ def create_server(client: BridgeClient | None = None) -> FastMCP:
                 view=view,
                 max_steps=max_steps,
             ),
+            instance_id=instance_id,
+        )
+
+    @tool()
+    async def debug_compute(
+        group: ComputeCoordinate,
+        thread: ComputeCoordinate,
+        event_id: StrictNullableEventId = None,
+        max_steps: StrictMaxSteps = 20000,
+        instance_id: InstanceId = None,
+    ) -> dict[str, Any]:
+        """Debug one compute invocation of a dispatch in RenderDoc's shader debugger.
+
+        group is the zero-based workgroup coordinate; thread is the local coordinate within
+        that group, not a global dispatch-thread ID. Each is [x, y, z]. Select an actual
+        dispatch EID; coordinates must fit its group counts and effective thread-group size.
+        Returns debugger inputs, observed changes and completion metadata, with the detailed
+        trace in a JSONL artifact readable through read_artifact. Debugger output variables
+        are not a complete log of UAV writes or proof of final resource contents. Inspect
+        executionComplete, traceComplete, truncation and warnings before drawing conclusions.
+        Unsupported shaders/APIs return an explicit error. The UI event is preserved.
+        """
+        return await invoke(
+            "debug_compute",
+            _clean_params(group=group, thread=thread, event_id=event_id, max_steps=max_steps),
             instance_id=instance_id,
         )
 
