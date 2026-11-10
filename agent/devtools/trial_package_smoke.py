@@ -7,7 +7,9 @@ Expected layout: qrendertest.exe, runtime/python/python.exe, and
 integrations/rendertest_agent/{python/rendertest_agent_bridge,skills/<four skills>}.
 The package is copied/extracted into a fresh path containing spaces. Its own isolated Python
 runs the checks, including a real stdio MCP server and one bounded get_pass_resources call.
-The test closes only its own GUI process. No harness is started and no credentials are read.
+Direct EXE launch resolves bundled Python with no environment or settings override; an offline
+catalog fixture verifies the Claude Settings flow. No real harness or credentials are used.
+The test closes only its own GUI process.
 Temporary profile variables isolate Python/agent data; Windows Qt known-folder configuration
 is additionally protected with Config.Close() before capture loading and before/after hashes.
 """
@@ -165,10 +167,9 @@ def isolated_environment(package, work):
     temporary_config.parent.mkdir(parents=True, exist_ok=True)
     temporary_config.write_text(json.dumps({'rdocConfigData': 1, 'Analytics_TotalOptOut': True,
                                             'CheckUpdate_AllowChecks': False}), encoding='utf-8')
-    env['PATH'] = os.pathsep.join(str(path) for path in (package, package / 'runtime/python',
+    env['PATH'] = os.pathsep.join(str(path) for path in (package,
                                                        windows / 'System32', windows, windows / 'System32/Wbem'))
     env['RENDERTEST_AGENT_ROOT'] = str(work / 'Private Agent Data')
-    env['RENDERTEST_MCP_PYTHON'] = str(package / 'runtime/python/python.exe')
     env['RENDERTEST_AGENT_BRIDGE'] = '1'
     env['PYTHONNOUSERSITE'] = '1'
     return env
@@ -310,9 +311,25 @@ def worker(args):
                            "pathlib.Path(%r).write_text(json.dumps(data), encoding='utf-8')\n" % str(native_report), encoding='utf-8')
         startup_info = subprocess.STARTUPINFO()
         startup_info.dwFlags, startup_info.wShowWindow = subprocess.STARTF_USESHOWWINDOW, 0
+        # Exercise the GUI resolver, not just a Python path supplied by the test runner.
+        # An offline catalog fixture avoids reading credentials or contacting a provider.
+        gui_env = dict(os.environ)
+        require('RENDERTEST_MCP_PYTHON' not in gui_env, 'Direct launch must not override MCP Python.')
+        settings_transcript = work / 'direct-settings.json'
+        catalog_log = work / 'catalog.jsonl'
+        gui_env['RENDERTEST_AGENT_CLAUDE_COMMAND'] = subprocess.list2cmdline([
+            str(package / 'runtime/python/python.exe'), str(work / 'fake_app_server.py'),
+            '--backend', 'claude', '--scenario', 'model-pages', '--log', str(catalog_log),
+            '--state-dir', str(work)])
+        gui_env['RENDERTEST_AGENT_CHAT_AUTOTEST'] = json.dumps({
+            'questions': [], 'waitForCapture': True,
+            'settings': {'backend': 'claude', 'mcpPython': '', 'claudePath': '',
+                         'claudeModel': '', 'claudeReasoningEffort': ''},
+            'settingsScreenshot': str(work / 'direct-settings.png'),
+            'transcript': str(settings_transcript)})
         with (work / 'gui.log').open('w', encoding='utf-8') as log:
             process = subprocess.Popen([str(package / 'qrendertest.exe'), '--python', str(startup), str(args.capture)],
-                                       cwd=str(package), env=dict(os.environ), startupinfo=startup_info,
+                                       cwd=str(work), env=gui_env, startupinfo=startup_info,
                                        stdout=log, stderr=subprocess.STDOUT)
             report['ownedPid'] = process.pid
             write_json(work / 'owned-gui.json', {'pid': process.pid, 'executable': str(package / 'qrendertest.exe')})
@@ -340,6 +357,26 @@ def worker(args):
                         'Native binding is not builtin or packaged: ' + name)
             report['native'] = native
             report['mcp'] = asyncio.run(asyncio.wait_for(check_mcp(package, work, instance, args.parent_event), timeout=90))
+            settings_deadline = time.monotonic() + 40
+            while not settings_transcript.is_file() and time.monotonic() < settings_deadline:
+                require(process.poll() is None, 'GUI exited before direct-launch settings verification.')
+                time.sleep(.1)
+            require(settings_transcript.is_file(), 'Direct-launch settings transcript is missing.')
+            transcript = json.loads(settings_transcript.read_text(encoding='utf-8'))
+            dialog = transcript.get('autotest', {}).get('settingsDialog', {})
+            report['directLaunchSettings'] = dialog
+            require(dialog.get('catalogState') == 'ready' and dialog.get('modelCount') == 3
+                    and not dialog.get('timedOut'), 'Direct-launch Claude model discovery failed: ' + str(dialog))
+            records = [json.loads(line) for line in catalog_log.read_text(encoding='utf-8').splitlines()]
+            starts = [entry for entry in records if entry.get('event') == 'start']
+            require(len(starts) == 1, 'Expected one offline model catalog process.')
+            argv = starts[0]['argv']
+            require('--mcp-python' in argv, 'Model discovery did not resolve MCP Python.')
+            resolved_python = Path(argv[argv.index('--mcp-python') + 1]).resolve()
+            require(resolved_python == (package / 'runtime/python/python.exe').resolve(),
+                    'GUI selected a runtime outside the relocated package.')
+            report['directLaunchMcpPython'] = str(resolved_python)
+            report['modelCatalogBoundary'] = 'Offline fixture; real GUI resolver, no provider credentials or model requests.'
     except BaseException as error:
         report['errors'].append(type(error).__name__ + ': ' + str(error))
     finally:
@@ -396,6 +433,7 @@ def main():
         require(' ' in str(package), 'Relocation did not exercise a path containing spaces.')
         script = work / 'smoke worker.py'
         shutil.copy2(Path(__file__).resolve(), script)
+        shutil.copy2(Path(__file__).with_name('fake_app_server.py'), work / 'fake_app_server.py')
         command = [str(python), '-I', str(script), '--worker', '--package', str(package),
                    '--capture', str(args.capture), '--parent-event', str(args.parent_event),
                    '--work-dir', str(work), '--wait', str(args.wait)]

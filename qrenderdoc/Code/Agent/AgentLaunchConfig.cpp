@@ -180,6 +180,13 @@ QString AgentLaunchConfig::FindMcpPython(const PersistentConfig &settings, QStri
   }
 
 #if defined(Q_OS_WIN32)
+  // Portable distributions carry their own MCP runtime. Resolve it relative to the
+  // executable so direct launches and moved installations do not need a launcher or venv.
+  python = QDir(QCoreApplication::applicationDirPath())
+               .absoluteFilePath(lit("runtime/python/python.exe"));
+  if(QFileInfo(python).isFile())
+    return Posix(python);
+
   python = FindUpwards(lit("agent/mcp_server/.venv/Scripts/python.exe"));
 #else
   python = FindUpwards(lit("agent/mcp_server/.venv/bin/python"));
@@ -188,9 +195,10 @@ QString AgentLaunchConfig::FindMcpPython(const PersistentConfig &settings, QStri
     return python;
 
   error =
-      tr("The RenderTest MCP server Python was not found. Create agent/mcp_server/.venv (see "
-         "agent/README.md) or set RENDERTEST_MCP_PYTHON to a Python with rendertest_mcp "
-         "installed.");
+      tr("The RenderTest MCP Python was not found. Extract the complete package, including "
+         "runtime/python/python.exe, or select a Python with rendertest_mcp installed in "
+         "MCP Python executable. Source builds can create agent/mcp_server/.venv (see "
+         "agent/README.md). RENDERTEST_MCP_PYTHON can also specify the runtime.");
   return QString();
 }
 

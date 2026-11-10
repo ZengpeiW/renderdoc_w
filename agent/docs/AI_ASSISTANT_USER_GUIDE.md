@@ -1,6 +1,6 @@
 # RenderTest AI Assistant 使用指南
 
-适用于 Windows x64 试用包，功能说明更新于 **2026-11-09**。当前提供 Codex、Claude Code 两种 AI 后端、35 个分析工具和 4 个分析 Skill。
+适用于 Windows x64 试用包，功能说明更新于 **2026-11-10**。当前提供 Codex、Claude Code 两种 AI 后端、35 个分析工具和 4 个分析 Skill。
 
 AI Assistant 可以读取 RenderTest 当前打开的 RenderDoc capture，用自然语言解释事件、Shader、资源和像素问题。你可以继续使用熟悉的 Event Browser、Texture Viewer 和 Mesh Viewer，再把选中的对象交给 AI 分析。
 
@@ -21,7 +21,7 @@ AI Assistant 可以读取 RenderTest 当前打开的 RenderDoc capture，用自�
 ### 解压并启动
 
 1. 将压缩包完整解压到较短的本地目录，例如 `D:\Tools\RenderTest`。ZIP 内的顶层目录叫 `RenderTest`，保留其中的文件和子目录结构；避免多层长文件夹名，旧 GUI 内嵌运行时可能受 Windows 长路径限制影响。
-2. 双击根目录的 **`Start-RenderTest.cmd`**。该脚本会指定随包的 `runtime\python\python.exe` 供 AI 工具使用。
+2. 双击根目录的 **`qrendertest.exe`**，程序自动发现随包的 `runtime\python\python.exe`。也可用 **`Start-RenderTest.cmd`**，它会先进行离线环境检查再启动。
 3. 在 RenderTest 中打开 `.rdc`，等 capture 加载完成，确认能正常选择事件和查看纹理。
 4. 从 **Window → AI Assistant** 打开面板。
 5. 点击 **Settings**，选择已安装并认证的后端；模型先保留默认即可。
@@ -31,7 +31,7 @@ AI Assistant 可以读取 RenderTest 当前打开的 RenderDoc capture，用自�
 
 第一次发问时会启动后端并连接工具。面板顶部显示 `Ready`，连接正常时会显示 `rendertest` 和工具数量；生成回答时显示 `Working`。工具卡片出现实际调用结果，说明 AI 已开始读取 capture。
 
-根目录的 `README.html` 可直接用浏览器阅读；本文件是 Markdown 原稿。若直接双击 `qrendertest.exe`，需要在 Settings 的 **MCP Python executable** 中指定解压目录里的 `runtime\python\python.exe`。推荐始终使用启动脚本。
+根目录的 `README.html` 可直接用浏览器阅读；本文件是 Markdown 原稿。2026-11-10 修复包支持直接打开 EXE，Settings 中 **MCP Python executable** 保持 `Automatic detection` 即可。显式配置的路径或 `RENDERTEST_MCP_PYTHON` 环境变量仍优先；如保存过失效的旧路径，请清空后使用自动发现。旧的 2026-11-09 包需要通过 `Start-RenderTest.cmd` 启动，或手动选择包内的 `runtime\python\python.exe`。
 
 ### Android 设备截帧
 

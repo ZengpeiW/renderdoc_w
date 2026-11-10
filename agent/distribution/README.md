@@ -10,7 +10,7 @@
 4. 指定本机 Visual Studio 安装附带的 x64 CRT Redistributable 目录：
 
 ```powershell
-agent\mcp_server\.venv\Scripts\python.exe agent\devtools\package_trial.py --name RenderTest-AI-Assistant-2026.11.09-android-win64 --msvc-redist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT"
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\package_trial.py --name RenderTest-AI-Assistant-2026.11.10-android-win64 --msvc-redist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT"
 ```
 
 默认输出 `package/RenderTest-AI-Assistant-2026.11.09-win64/`、同名 ZIP 和 `.zip.sha256`；ZIP 内顶层统一为短目录 `RenderTest`，降低默认解压时的路径长度。发布下一版时传 `--name`。已有同名目录会拒绝覆盖。`--no-zip` 只生成目录。
@@ -27,13 +27,13 @@ agent\mcp_server\.venv\Scripts\python.exe agent\devtools\package_trial.py --name
 
 PC 端按上述原始包名发现服务。不要只将文件改名为 rendertestcmd，也不要混用其他 RenderDoc 版本的 APK。打包器还校验 ELF 架构，并对比 PC DLL 实际导出的提交哈希、版本号与 APK 元数据；不匹配时拒绝构包。更新源码提交后需重建 PC 原生库与 Android 服务，不能仅修改版本标签。`PACKAGE_MANIFEST.json` 记录 `nativeCommit`、`nativeVersion`、`androidPackages` 和所有 APK 文件哈希。
 
-新试用包可用 `--name RenderTest-AI-Assistant-2026.11.09-android-win64` 生成，保留此前 PC-only 包。包内携带两种 ARM APK，Android SDK/ADB/JDK 由使用者配置；手机安装、连接及实际捕获需另做真机验收。
+新试用包可用 `--name RenderTest-AI-Assistant-2026.11.10-android-win64` 生成，保留此前交付。2026-11-10 GUI 支持直接启动 EXE 自动发现随包 Python，查找顺序为环境变量、Settings 显式路径、EXE 同目录下的 `runtime/python/python.exe`、源码开发 venv。此次仅重建 GUI，继续使用已验证且版本匹配的 PC DLL 和 ARM APK。包内携带两种 ARM APK，Android SDK/ADB/JDK 由使用者配置；手机安装、连接及实际捕获需另做真机验收。
 
 ## 验证
 
 ```powershell
-package\RenderTest-AI-Assistant-2026.11.09-android-win64\runtime\python\python.exe -B package\RenderTest-AI-Assistant-2026.11.09-android-win64\tools\check_environment.py --verify-files
-agent\mcp_server\.venv\Scripts\python.exe agent\devtools\trial_package_smoke.py --package package/RenderTest-AI-Assistant-2026.11.09-android-win64.zip --capture E:/Captures/pragmata1.rdc --parent-event 7726 --work-dir E:/Captures/TrialValidation
+package\RenderTest-AI-Assistant-2026.11.10-android-win64\runtime\python\python.exe -B package\RenderTest-AI-Assistant-2026.11.10-android-win64\tools\check_environment.py --verify-files
+agent\mcp_server\.venv\Scripts\python.exe agent\devtools\trial_package_smoke.py --package package/RenderTest-AI-Assistant-2026.11.10-android-win64.zip --capture E:/Captures/pragmata1.rdc --parent-event 7726 --work-dir E:/Captures/TrialValidation
 ```
 
-第二条会解压到新建的含空格目录，使用包内隔离 Python、独立临时配置和自建隐藏 GUI，验证真实 stdio MCP、35 个工具、4 个 Skill、Bridge 和有界 capture 查询；只关闭自建进程。它不启动 AI harness、不调用在线模型。实际机器仍需符合 capture 的 GPU/驱动要求；该验证不等于覆盖所有干净 Windows 安装。
+第二条会解压到新建的含空格目录，使用包内隔离 Python、独立临时配置和自建隐藏 GUI，验证真实 stdio MCP、35 个工具、4 个 Skill、Bridge 和有界 capture 查询；只关闭自建进程。从 2026-11-10 起，还验证直接启动 EXE、MCP Python 配置留空且没有 `RENDERTEST_MCP_PYTHON` 时的自动发现：用离线模型目录 fixture 打开 Claude Settings，检查目录加载成功以及 GUI 解析的 Python 确实来自新解压目录。fixture 不启动真实 AI harness、不读取模型账号、不调用在线模型。此前脚本主动注入 Python 路径，仅验证了启动器场景，遗漏直接启动问题。实际机器仍需符合 capture 的 GPU/驱动要求；该验证不等于覆盖所有干净 Windows 安装。

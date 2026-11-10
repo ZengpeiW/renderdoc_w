@@ -1,12 +1,12 @@
 # RenderTest AI 当前现状与交接
 
-更新日期：2026-11-09（Asia/Shanghai）。本文记录已经落地的功能、验证边界和后续候选，供新对话接手。
+更新日期：2026-11-10（Asia/Shanghai）。本文记录已经落地的功能、验证边界和后续候选，供新对话接手。
 
 ## 1. 快照与范围
 
 - 工作目录：`E:\PersonalWorkSpace\git_repo\renderdoc`。
 - 当前分支：`local_test`。
-- PC 试用包文档与分发链路已提交为 `cea0664bb`；本轮在其基础上补齐 Android ARM64/ARM32 截帧服务构建、分发和版本校验，分析工具功能不变。
+- PC 试用包文档与分发链路已提交为 `cea0664bb`，Android 截帧服务打包已提交为 `262d9b016`。本轮修复试用包直接启动 EXE 时未发现随包 MCP Python 的问题，分析工具功能不变。
 - MVP/M0–M4、M5a–M5d 已实现，已有可使用的内嵌 AI 助手；目前有 **35 个 MCP 工具、4 个 Skill、Codex 和 Claude 两种 harness**。
 - DeepSeek harness 未接入。最近完成的 `get_pass_resources` 提供 Pass/事件范围的资源用途与前后使用查询，读取原生 GetUsage 元数据，不移动回放；结果不代表像素/字节级依赖或引擎原生 RDG。
 - 已保留约 80 MB 的旧 PC 试用 ZIP；本轮新包额外携带 Android ARM64/ARM32 截帧 APK 和配套 PC DLL。独立 Python/MCP、Bridge、Skill 和 release 反编译器仍随包提供；Codex/Claude CLI、账号及 Android SDK/ADB/JDK 由试用者自行配置。ZIP、运行库和验证产物不提交 Git。
@@ -31,7 +31,8 @@
 | `9a4a88089` | Shader 引用搜索、候选扫描预算、跨查询绑定缓存和覆盖状态 |
 | `2439ca6b5` | Pass 资源用途、真实事件边界、前后相邻使用及共享用途缓存 |
 | `cea0664bb` | 使用指南、Windows x64 试用包构建/环境检查/迁移验证脚本 |
-| 本次（2026-11-09） | Android ARM64/ARM32 截帧 APK 分发、PC/APK 版本匹配校验与配套试用包；二进制产物不入库 |
+| `262d9b016` | Android ARM64/ARM32 截帧 APK 分发、PC/APK 版本匹配校验与配套试用包 |
+| 本次（2026-11-10） | 直接启动 EXE 自动发现随包 MCP Python，补齐无环境变量/无配置路径的迁移回归；二进制产物不入库 |
 
 ## 2. 架构、面板与历史
 
@@ -214,6 +215,15 @@ Codex 使用原生 Skill 发现/加载，设置部署目录 extraRoots，必要�
 - 新包迁移验证通过：`E:/Captures/TrialValidation/Trial Smoke e5406aa83fb0/report.json`，1764 个文件，独立 Python、35 个工具、4 个 Skill、真实 `pragmata1.rdc` 的有界 Pass 查询均通过，测试进程已退出，用户配置哈希保持一致，在线模型调用为零。该记录验证 PC 回放及包迁移，不替代 ARM 真机截帧验收。
 
 ## 6. 已有验证记录与复现
+
+### 2026-11-10 直接启动试用包修复
+
+- 用户反馈 Claude Settings 报 `The RenderTest MCP server Python was not found`。旧 GUI 自动发现只查源码 `.venv`，未检查随包 `runtime/python/python.exe`；旧迁移脚本注入了 `RENDERTEST_MCP_PYTHON`，因此没有覆盖直接启动 EXE 的故障。旧包通过 `Start-RenderTest.cmd` 或手动配置包内 Python 可规避。
+- `AgentLaunchConfig::FindMcpPython` 现按环境变量、Settings 显式路径、EXE 同目录的随包运行时、源码 venv 的顺序查找。显式失效路径仍报错，不静默忽略配置。修复包支持直接双击 EXE，保留 Automatic detection；错误提示也增加完整解压与 Settings 指引。
+- 已重建 `qrenderdoc_local.vcxproj` Release x64（HostX64，`BuildProjectReferences=false`），构建 exit 0，日志为 `package/direct-launch-build-2026.11.10.log`。PC DLL 与 ARM APK 继续使用已验证的 `1.47` / `cea0664bb9a781c8df28de6bb98c023ce87060e6` 配套产物。
+- 新包为 `package/RenderTest-AI-Assistant-2026.11.10-android-win64.zip`，**94,488,104 字节**，SHA-256 为 `50450a3fcbb0af5a13acb2a46356d74ddd3125f6932daca8735f58de1191f91f`。使用指南已改为支持直接打开 EXE；这轮没有新增 Android 真机验收。
+- 加强 `trial_package_smoke.py`：不注入 MCP Python 环境变量，不将运行时加入 PATH，在无关工作目录启动 GUI，MCP Python 配置留空。使用离线 Claude 模型目录 fixture 验证实际 GUI 查找结果和 Settings 目录加载；另保留真实 stdio MCP、capture 查询及全量文件校验。该 fixture 不验证真实账号、网络和在线模型。
+- 旧包复现证据：`E:/Captures/TrialValidation/Trial Smoke eebdd2b98e74/report.json`，目录状态为 error，报错与用户截图一致。新包证据：`E:/Captures/TrialValidation/Trial Smoke e41c9d13690f/report.json`，`passed=true`、目录状态 ready、3 个条目（含默认项），解析路径位于新解压包中。两轮用户配置哈希保持一致，测试进程已退出。截图分别在对应目录的 `direct-settings.png`。
 
 本轮增加 Android 构建、签名/内容/架构/版本匹配检查和 7 项打包回归测试。分析工具未改动，其最新全套结果来自 `2439ca6b5`；试用包迁移检查不调用在线模型。其他功能沿用对应提交时的验证记录。本地 `agent/.agent-data/` 和下列 `E:/Captures/TrialValidation/` 证据不跟踪到 Git，换机器后可能不存在。
 
